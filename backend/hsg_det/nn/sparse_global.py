@@ -160,7 +160,10 @@ class SparseGlobalBlockGated(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.gate * self.block(x)
+        # Use _attention_delta() (not block.forward) to avoid double-residual:
+        # block.forward() = x + delta, so x + gate*(x+delta) would be wrong.
+        # Correct form: x + gate*delta  → identity when gate=0, full correction as gate→1
+        return x + self.gate * self.block._attention_delta(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

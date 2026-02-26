@@ -86,8 +86,8 @@ class SparseGlobalBlock(nn.Module):
         self.norm = nn.LayerNorm(c)
         self._scale = c ** -0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, H, W]
+    def _attention_delta(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute sparse-attention delta (no residual). Used by both forward() and SparseGlobalBlockGated."""
         B, C, H, W = x.shape
         N = H * W
         k_actual = min(self.k, N)
@@ -124,6 +124,9 @@ class SparseGlobalBlock(nn.Module):
         out = out.view(B, C, H, W)
         return self.out_proj(out)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self._attention_delta(x)
+
 
 class SparseGlobalBlockGated(nn.Module):
     """Gated variant to stabilize warm-starts."""
@@ -133,7 +136,9 @@ class SparseGlobalBlockGated(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))  # starts as identity
 
     def forward(self, x):
-        return x + self.gate * self.block(x)
+        # Call _attention_delta (not block.forward) to avoid double-residual:
+        # block.forward = x+delta, so x + gate*(x+delta) would corrupt features.
+        return x + self.gate * self.block._attention_delta(x)
 
 
 # -----------------------------
