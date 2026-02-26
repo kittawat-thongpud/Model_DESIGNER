@@ -21,6 +21,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [weightName, setWeightName] = useState('');
+  const [createScale, setCreateScale] = useState<string>('n');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -164,6 +165,25 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="block text-[10px] text-slate-500 mb-1">Model Scale</label>
+                  <div className="flex gap-1.5">
+                    {['n', 's', 'm', 'l', 'x'].map(sc => (
+                      <button
+                        key={sc}
+                        onClick={() => setCreateScale(sc)}
+                        className={`flex-1 py-1.5 rounded-lg border text-xs font-medium transition-all ${
+                          createScale === sc
+                            ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
+                            : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        {sc.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">Affects channel width / depth of the generated weights</p>
+                </div>
                 {createError && (
                   <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
                     {createError}
@@ -183,10 +203,11 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                     setCreating(true);
                     setCreateError(null);
                     try {
-                      await api.createEmptyWeight(selectedModelId, weightName);
+                      await api.createEmptyWeight(selectedModelId, weightName, createScale);
                       setShowCreateModal(false);
                       setSelectedModelId('');
                       setWeightName('');
+                      setCreateScale('n');
                       load();
                     } catch (e) {
                       setCreateError((e as Error).message);

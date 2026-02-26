@@ -182,9 +182,9 @@ export const api = {
   getWeight: (id: string) => get<WeightRecord>(`/api/weights/${id}`),
   getWeightLineage: (id: string) => get<WeightRecord[]>(`/api/weights/${id}/lineage`),
   deleteWeight: (id: string) => del<{ message: string }>(`/api/weights/${id}`),
-  createEmptyWeight: (modelId: string, name?: string) =>
+  createEmptyWeight: (modelId: string, name?: string, scale?: string) =>
     post<{ weight_id: string; model_id: string; model_name: string; key_count: number; file_size_bytes: number }>(
-      '/api/weights/create-empty', { model_id: modelId, name: name || '' },
+      '/api/weights/create-empty', { model_id: modelId, name: name || '', model_scale: scale || null },
     ),
   inspectWeightKeys: (id: string) => get<{ key: string; node_id: string; shape: number[]; dtype: string; numel: number }[]>(`/api/weights/${id}/keys`),
   extractPartialWeight: (id: string, nodeIds: string[]) =>

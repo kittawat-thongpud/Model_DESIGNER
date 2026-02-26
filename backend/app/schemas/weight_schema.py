@@ -64,3 +64,4 @@ class CreateEmptyRequest(BaseModel):
     """Create an empty (randomly-initialized) weight from a model architecture."""
     model_id: str = Field(..., description="Model to instantiate")
     name: str = Field(default="", description="Optional display name for the weight")
+    model_scale: str | None = Field(default=None, description="Scale variant: n, s, m, l, x")

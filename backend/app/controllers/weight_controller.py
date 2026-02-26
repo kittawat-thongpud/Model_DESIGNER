@@ -47,8 +47,10 @@ async def create_empty_weight(body: CreateEmptyRequest):
         if arch_plugin:
             arch_plugin.register_modules()
         
+        # Use explicit scale from request, fallback to model record scale
+        effective_scale = body.model_scale or record.get("scale")
         # Prepare YAML with scale patching and validation
-        patched_yaml = prepare_model_yaml(yaml_path, scale=record.get("scale"))
+        patched_yaml = prepare_model_yaml(yaml_path, scale=effective_scale)
         model = YOLO(str(patched_yaml), task=record.get("task", "detect"))
         sd = model.model.state_dict()
         
