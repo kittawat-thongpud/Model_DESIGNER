@@ -120,27 +120,74 @@ def generate_partition_txt_splits(
         if not selected_indices:
             continue
 
+        # Fast path: if the txt file already exists for this exact config hash,
+        # reuse it — avoids re-globbing 100k+ files on Docker overlay FS.
+        txt_path = splits_dir / f"{split_name}_{config_hash}.txt"
+        if txt_path.exists() and txt_path.stat().st_size > 0:
+            result[split_name] = txt_path
+            continue
+
         # Find source images directory
         images_dir = _find_images_dir(ds_path, split_name)
         if not images_dir:
             continue
 
-        image_files = sorted(images_dir.glob("*.*"))
+        # Use a persistent sorted-filelist cache to avoid re-globbing large dirs.
+        # The cache file is invalidated when the image directory mtime changes.
+        filelist_cache_path = splits_dir / f".{split_name}_filelist.json"
+        image_files: list[Path] = _load_or_build_filelist_cache(
+            images_dir, filelist_cache_path
+        )
 
         # Collect absolute paths for selected indices
         paths: list[str] = []
         for idx in selected_indices:
             if idx < len(image_files):
-                paths.append(str(image_files[idx].resolve()))
+                paths.append(str(image_files[idx]))
 
         if not paths:
             continue
 
-        txt_path = splits_dir / f"{split_name}_{config_hash}.txt"
         txt_path.write_text("\n".join(paths) + "\n")
         result[split_name] = txt_path
 
     return result
+
+
+def _load_or_build_filelist_cache(images_dir: Path, cache_path: Path) -> list[Path]:
+    """Return sorted list of image paths, using a disk cache to avoid re-globbing.
+
+    The cache is keyed by ``images_dir`` mtime so it is automatically
+    invalidated when new files are added to the directory.
+    """
+    import os
+
+    try:
+        dir_mtime = os.path.getmtime(images_dir)
+    except OSError:
+        dir_mtime = 0.0
+
+    # Try loading existing cache
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            if abs(cached.get("mtime", 0.0) - dir_mtime) < 1.0:
+                return [Path(p) for p in cached["files"]]
+        except Exception:
+            pass
+
+    # Build fresh sorted list
+    files = sorted(str(p.resolve()) for p in images_dir.iterdir()
+                   if p.suffix.lower() in {
+                       ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+                       ".webp", ".gif",
+                   })
+    try:
+        cache_path.write_text(json.dumps({"mtime": dir_mtime, "files": files}))
+    except Exception:
+        pass
+
+    return [Path(p) for p in files]
 
 
 def generate_data_yaml(

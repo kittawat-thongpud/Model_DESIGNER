@@ -447,7 +447,22 @@ def _training_worker(
             
             partition_info = "custom partitions" if partition_configs else "all partitions"
             job_storage.append_job_log(job_id, "INFO", f"Configuring dataset '{data_arg}' with {partition_info}")
-            
+
+            # Auto-convert COCO JSON → YOLO .txt labels if needed (idempotent)
+            try:
+                from . import coco_converter
+                conv_result = coco_converter.auto_convert_if_needed(data_arg)
+                if conv_result:
+                    if conv_result.get("status") == "success":
+                        job_storage.append_job_log(job_id, "INFO",
+                            f"COCO→YOLO label conversion: {conv_result['message']}")
+                    elif conv_result.get("status") == "error":
+                        job_storage.append_job_log(job_id, "WARNING",
+                            f"COCO→YOLO conversion failed: {conv_result['error']} — training may find no labels")
+            except Exception as _conv_err:
+                job_storage.append_job_log(job_id, "WARNING",
+                    f"COCO→YOLO auto-conversion error: {_conv_err}")
+
             try:
                 # Delegate to service - it handles local dataset creation if needed
                 dataset_yaml.write_data_yaml(
@@ -767,6 +782,20 @@ def _training_worker(
         train_kwargs["exist_ok"] = True
         if resume_path:
             train_kwargs["resume"] = True  # tell Ultralytics to restore epoch/optimizer state
+
+        # Auto-tune workers: Docker CPU quota is often much lower than os.cpu_count()
+        # Over-subscribing workers causes thrashing and slows data loading.
+        if "workers" not in train_kwargs or train_kwargs.get("workers", 8) > 4:
+            optimal_workers = _get_optimal_workers()
+            train_kwargs["workers"] = optimal_workers
+            job_storage.append_job_log(job_id, "INFO",
+                f"Auto-tuned dataloader workers: {optimal_workers}")
+
+        # Enable Ultralytics disk cache (cache=True) so label scan results are
+        # stored in a .cache file and reused on subsequent runs — avoids rescanning
+        # 118k images every time.  Only set if user did not already configure it.
+        if "cache" not in train_kwargs:
+            train_kwargs["cache"] = True
 
         job_storage.append_job_log(
             job_id,
@@ -1160,6 +1189,49 @@ def _training_worker(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_optimal_workers() -> int:
+    """Return a safe dataloader worker count for the current environment.
+
+    In Docker containers the CPU quota (cpu.cfs_quota_us / cpu.cfs_period_us)
+    is often much lower than ``os.cpu_count()``.  Spawning more workers than
+    available CPU shares causes context-switch thrashing and *slows* data
+    loading.  We read the cgroup v1/v2 quota and clamp accordingly.
+
+    Safe defaults:
+      - Docker with CPU quota  → min(quota_cpus, 4)
+      - No quota / bare-metal  → min(os.cpu_count() // 2, 8), minimum 2
+    """
+    import os
+
+    def _read_int(path: str) -> int | None:
+        try:
+            return int(open(path).read().strip())
+        except Exception:
+            return None
+
+    # ── cgroup v2 ────────────────────────────────────────────────────────────
+    v2_max = "/sys/fs/cgroup/cpu.max"
+    try:
+        parts = open(v2_max).read().strip().split()
+        if len(parts) == 2 and parts[0] != "max":
+            quota, period = int(parts[0]), int(parts[1])
+            capped = max(1, quota // period)
+            return min(capped, 4)
+    except Exception:
+        pass
+
+    # ── cgroup v1 ────────────────────────────────────────────────────────────
+    quota = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota and period and quota > 0:
+        capped = max(1, quota // period)
+        return min(capped, 4)
+
+    # ── Bare-metal / no quota ────────────────────────────────────────────────
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(cpu_count // 2, 8))
+
 
 def _should_stop(job_id: str) -> bool:
     with _lock:

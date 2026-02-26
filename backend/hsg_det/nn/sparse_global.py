@@ -58,7 +58,13 @@ class SparseGlobalBlock(nn.Module):
 
         self._scale = c ** -0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _attention_delta(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the sparse-attention delta (no residual).
+
+        Returns a tensor of the same shape as ``x`` representing the
+        additive correction from sparse global self-attention.  Callers
+        are responsible for adding the residual (``x + delta``).
+        """
         B, C, H, W = x.shape
         N = H * W
         k_actual = min(self.k, N)  # guard: k must not exceed available tokens
@@ -120,10 +126,11 @@ class SparseGlobalBlock(nn.Module):
         out.scatter_(2, idx_exp, attended.transpose(1, 2))  # [B, C, N]
 
         out = out.view(B, C, H, W)
-        out = self.out_proj(out)
+        return self.out_proj(out)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Residual connection — block acts as additive refinement
-        return out
+        return x + self._attention_delta(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

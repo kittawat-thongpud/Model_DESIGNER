@@ -25,24 +25,28 @@ def has_coco_annotations(dataset_path: Path) -> bool:
 
 
 def is_already_converted(dataset_path: Path) -> bool:
-    """Check if COCO dataset has already been converted to YOLO format."""
-    # Check if labels directory exists with .txt files
+    """Check if COCO dataset has already been converted to YOLO format.
+
+    Requires that at least one .txt file has non-empty content (actual labels),
+    not just that .txt files exist — a broken conversion leaves all files empty.
+    """
     labels_dir = dataset_path / "labels"
     if not labels_dir.exists():
         return False
-    
-    # Check for train/val subdirectories with .txt files
-    for split in ["train", "val", "test"]:
+
+    for split in ["train2017", "val2017", "train", "val", "test"]:
         split_labels = labels_dir / split
-        if split_labels.exists() and any(split_labels.glob("*.txt")):
-            return True
-    
-    # Check for train2017/val2017 subdirectories (COCO format)
-    for split in ["train2017", "val2017"]:
-        split_labels = labels_dir / split
-        if split_labels.exists() and any(split_labels.glob("*.txt")):
-            return True
-    
+        if not split_labels.exists():
+            continue
+        # Check up to 200 files — if any has content, conversion is valid
+        checked = 0
+        for txt in split_labels.glob("*.txt"):
+            if txt.stat().st_size > 0:
+                return True
+            checked += 1
+            if checked >= 200:
+                break
+
     return False
 
 
@@ -53,125 +57,145 @@ def convert_coco_to_yolo(
     use_keypoints: bool = False,
     cls91to80: bool = True,
 ) -> dict[str, Any]:
-    """Convert COCO JSON annotations to YOLO format.
-    
-    Args:
-        dataset_name: Name of the dataset (e.g. 'coco')
-        use_segments: Convert segmentation masks instead of bounding boxes
-        use_keypoints: Convert keypoints for pose estimation
-        cls91to80: Map 91 COCO classes to 80 common ones
-    
+    """Convert COCO JSON annotations to YOLO .txt format.
+
+    Writes labels directly to ``labels/<split>/`` mirroring Ultralytics'
+    expected path convention (e.g. ``labels/train2017/000000000001.txt``).
+    Does NOT depend on Ultralytics' ``convert_coco()`` whose output path is
+    non-deterministic across versions.
+
+    COCO category_id (1-based, non-contiguous 1-90) is remapped to a
+    contiguous 0-based class index using the sorted category list from the
+    annotation JSON.  When ``cls91to80=True`` the standard 91→80 map is
+    applied first (images without a mapping are dropped).
+
     Returns:
-        Dictionary with conversion results
+        dict with keys: status, message, labels_dir, file_count (or error)
     """
-    from ultralytics.data.converter import convert_coco
-    import shutil
-    
     dataset_path = DATASETS_DIR / dataset_name
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_name}")
-    
+
     anno_dir = dataset_path / "annotations"
     if not anno_dir.exists():
         raise FileNotFoundError(f"Annotations directory not found: {anno_dir}")
-    
-    # Check if already converted
+
     if is_already_converted(dataset_path):
         return {
             "status": "already_converted",
             "message": "Dataset already has YOLO format labels",
             "labels_dir": str(dataset_path / "labels"),
         }
-    
-    # Create labels directory
-    labels_dir = dataset_path / "labels"
-    labels_dir.mkdir(exist_ok=True)
-    
-    # Create temp directory with only instances_*.json files
-    # This avoids converting captions, person_keypoints, etc.
-    temp_anno_dir = dataset_path / "_temp_annotations"
-    temp_anno_dir.mkdir(exist_ok=True)
-    
+
+    # Standard COCO 91-class → 80-class remapping (0-indexed output)
+    _CLS91TO80 = {
+        1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+        11: 10, 13: 11, 14: 12, 15: 13, 16: 14, 17: 15, 18: 16, 19: 17,
+        20: 18, 21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 27: 24, 28: 25,
+        31: 26, 32: 27, 33: 28, 34: 29, 35: 30, 36: 31, 37: 32, 38: 33,
+        39: 34, 40: 35, 41: 36, 42: 37, 43: 38, 44: 39, 46: 40, 47: 41,
+        48: 42, 49: 43, 50: 44, 51: 45, 52: 46, 53: 47, 54: 48, 55: 49,
+        56: 50, 57: 51, 58: 52, 59: 53, 60: 54, 61: 55, 62: 56, 63: 57,
+        64: 58, 65: 59, 67: 60, 70: 61, 72: 62, 73: 63, 74: 64, 75: 65,
+        76: 66, 77: 67, 78: 68, 79: 69, 80: 70, 81: 71, 82: 72, 84: 73,
+        85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79,
+    }
+
+    # Map: split name in annotation filename → output subdir name
+    # e.g. instances_train2017.json → labels/train2017/
+    SPLIT_MAP = {
+        "train2017": "train2017",
+        "val2017":   "val2017",
+        "train":     "train",
+        "val":       "val",
+        "test2017":  "test2017",
+        "test":      "test",
+    }
+
+    instances_files = list(anno_dir.glob("instances_*.json"))
+    if not instances_files:
+        return {
+            "status": "error",
+            "message": "No instances_*.json files found",
+            "error": "No detection annotations found",
+        }
+
+    total_written = 0
+    labels_root = dataset_path / "labels"
+
     try:
-        # Copy only instances_*.json files
-        instances_files = list(anno_dir.glob("instances_*.json"))
-        if not instances_files:
-            return {
-                "status": "error",
-                "message": "No instances_*.json files found in annotations directory",
-                "error": "No detection annotations found",
-            }
-        
-        for json_file in instances_files:
-            shutil.copy2(json_file, temp_anno_dir / json_file.name)
-        
-        # Convert COCO to YOLO using temp directory
-        # Note: Ultralytics creates numbered directories (coco2, coco3, etc.) in parent dir
-        parent_dir = dataset_path.parent
-        
-        convert_coco(
-            labels_dir=str(temp_anno_dir),
-            save_dir=str(dataset_path),
-            use_segments=use_segments,
-            use_keypoints=use_keypoints,
-            cls91to80=cls91to80,
-        )
-        
-        # Find the actual output directory created by Ultralytics
-        # It creates numbered directories like coco2, coco3, etc. in the parent directory
-        dataset_base_name = dataset_path.name
-        created_dirs = sorted(parent_dir.glob(f"{dataset_base_name}[0-9]*"))
-        
-        actual_labels_dir = None
-        temp_dataset_dir = None
-        
-        # Check created directories for labels
-        for created_dir in created_dirs:
-            labels_subdir = created_dir / "labels"
-            if labels_subdir.exists() and any(labels_subdir.rglob("*.txt")):
-                actual_labels_dir = labels_subdir
-                temp_dataset_dir = created_dir
-                break
-        
-        if not actual_labels_dir:
-            # Cleanup
-            shutil.rmtree(temp_anno_dir, ignore_errors=True)
-            for created_dir in created_dirs:
-                shutil.rmtree(created_dir, ignore_errors=True)
-            return {
-                "status": "error",
-                "message": "Conversion completed but no labels were generated",
-                "error": "No .txt files found in output",
-            }
-        
-        # Move the labels to the correct location
-        if actual_labels_dir != labels_dir:
-            if labels_dir.exists():
-                shutil.rmtree(labels_dir)
-            shutil.move(str(actual_labels_dir), str(labels_dir))
-        
-        # Count converted files
-        txt_files = list(labels_dir.rglob("*.txt"))
-        
-        # Cleanup temp directories
-        shutil.rmtree(temp_anno_dir, ignore_errors=True)
-        if temp_dataset_dir and temp_dataset_dir.exists():
-            shutil.rmtree(temp_dataset_dir, ignore_errors=True)
-        
+        for json_path in instances_files:
+            # Determine split subdir from filename, e.g. instances_train2017.json → train2017
+            stem = json_path.stem  # "instances_train2017"
+            split_key = stem.replace("instances_", "")
+            out_subdir = SPLIT_MAP.get(split_key, split_key)
+            out_dir = labels_root / out_subdir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(json_path) as f:
+                data = json.load(f)
+
+            # Build contiguous class map from this annotation file's categories
+            cats_sorted = sorted(data.get("categories", []), key=lambda c: c["id"])
+            if cls91to80:
+                cat_id_to_cls = _CLS91TO80
+            else:
+                cat_id_to_cls = {c["id"]: i for i, c in enumerate(cats_sorted)}
+
+            # Build image_id → {file_name, width, height}
+            img_info: dict[int, dict] = {}
+            for img in data.get("images", []):
+                img_info[img["id"]] = {
+                    "file": img["file_name"],
+                    "w": img["width"],
+                    "h": img["height"],
+                }
+
+            # Group annotations by image_id
+            ann_by_img: dict[int, list] = {img_id: [] for img_id in img_info}
+            for ann in data.get("annotations", []):
+                img_id = ann.get("image_id")
+                if img_id not in ann_by_img:
+                    continue
+                if ann.get("iscrowd", 0):
+                    continue
+                cat_id = ann.get("category_id")
+                cls_idx = cat_id_to_cls.get(cat_id)
+                if cls_idx is None:
+                    continue
+                ann_by_img[img_id].append((cls_idx, ann["bbox"]))
+
+            # Write one .txt per image (even empty = background, consistent with YOLO)
+            for img_id, info in img_info.items():
+                stem_name = Path(info["file"]).stem  # "000000000001"
+                txt_path = out_dir / f"{stem_name}.txt"
+                w, h = info["w"], info["h"]
+                lines: list[str] = []
+                for cls_idx, bbox in ann_by_img.get(img_id, []):
+                    # COCO bbox: [x_min, y_min, width, height] pixels
+                    bx, by, bw, bh = bbox
+                    # Convert to YOLO xywh normalised
+                    cx = (bx + bw / 2) / w
+                    cy = (by + bh / 2) / h
+                    nw = bw / w
+                    nh = bh / h
+                    # Clamp to [0, 1]
+                    cx = max(0.0, min(1.0, cx))
+                    cy = max(0.0, min(1.0, cy))
+                    nw = max(0.0, min(1.0, nw))
+                    nh = max(0.0, min(1.0, nh))
+                    if nw > 0 and nh > 0:
+                        lines.append(f"{cls_idx} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+                txt_path.write_text("\n".join(lines))
+                total_written += 1
+
         return {
             "status": "success",
-            "message": f"Converted {len(txt_files)} annotation files to YOLO format",
-            "labels_dir": str(labels_dir),
-            "file_count": len(txt_files),
+            "message": f"Converted {total_written} annotation files to YOLO format",
+            "labels_dir": str(labels_root),
+            "file_count": total_written,
         }
     except Exception as e:
-        # Cleanup temp directories on error
-        shutil.rmtree(temp_anno_dir, ignore_errors=True)
-        # Cleanup any numbered dataset directories created by Ultralytics
-        parent_dir = dataset_path.parent
-        dataset_base_name = dataset_path.name
-        for created_dir in parent_dir.glob(f"{dataset_base_name}[0-9]*"):
-            shutil.rmtree(created_dir, ignore_errors=True)
         return {
             "status": "error",
             "message": f"Conversion failed: {str(e)}",
