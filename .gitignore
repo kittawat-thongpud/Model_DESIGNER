@@ -25,7 +25,7 @@ runs/
 *.engine
 *.tflite
 *.torchscript
-datasets/
+data/
 ultralytics_cache/
 Legacy_/
 # ── Data / cache ──────────────────────────────────────────────────────────────
