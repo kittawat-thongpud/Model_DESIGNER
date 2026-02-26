@@ -11,7 +11,7 @@ build/
 .eggs/
 *.whl
 pip-wheel-metadata/
-
+.pytest_cache/
 # ── Virtual environment ───────────────────────────────────────────────────────
 venv/
 .venv/
@@ -27,7 +27,7 @@ runs/
 *.torchscript
 datasets/
 ultralytics_cache/
-
+Legacy_/
 # ── Data / cache ──────────────────────────────────────────────────────────────
 *.csv
 *.npy
