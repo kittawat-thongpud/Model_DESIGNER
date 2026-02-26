@@ -1,0 +1,27 @@
+graph LR
+    subgraph "Ground Truth Objects"
+        O1[🚗 Car]
+        O2[🚶 Person]
+        O3[🚲 Bicycle]
+    end
+    
+    subgraph "Predicted Queries"
+        Q1[Query 1]
+        Q2[Query 2]
+        Q3[Query 3]
+        Q4[Query 4]
+        Q5[Query 5]
+    end
+    
+    O1 -.->|Matched| Q2
+    O2 -.->|Matched| Q5
+    O3 -.->|Matched| Q1
+    
+    Q3 -.->|No object| N[∅]
+    Q4 -.->|No object| N
+    
+    style Q2 fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
+    style Q5 fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
+    style Q1 fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
+    style Q3 fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style Q4 fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px

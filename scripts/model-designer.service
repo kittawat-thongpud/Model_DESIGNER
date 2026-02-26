@@ -1,0 +1,28 @@
+[Unit]
+Description=Model DESIGNER service (run.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rase
+Group=rase
+WorkingDirectory=/home/rase/kittawat_ws/model_designer
+ExecStart=/usr/bin/bash /home/rase/kittawat_ws/model_designer/run.sh
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=45
+
+# Memory pressure mitigation
+Environment=MODEL_DESIGNER_TRAIN_WORKERS=4
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1
+MemoryHigh=24G
+MemoryMax=28G
+TasksMax=256
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

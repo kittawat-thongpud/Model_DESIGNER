@@ -1,0 +1,30 @@
+{
+  "job_id": "67e3c1ea6f3a",
+  "model_id": "5a455c274243",
+  "model_name": "CIFR-10 Digit",
+  "config": {
+    "model_id": "5a455c274243",
+    "dataset": "mnist",
+    "epochs": 5,
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "weight_record_enabled": false,
+    "weight_record_layers": [],
+    "weight_record_frequency": 5,
+    "lr0": 0.001,
+    "global_overrides": {}
+  },
+  "status": "failed",
+  "epoch": 0,
+  "total_epochs": 5,
+  "train_loss": 0.0,
+  "train_accuracy": 0.0,
+  "val_loss": null,
+  "val_accuracy": null,
+  "message": "Given groups=1, weight of size [32, 3, 3, 3], expected input[64, 1, 28, 28] to have 3 channels, but got 1 channels instead",
+  "history": [],
+  "weight_id": null,
+  "created_at": "2026-02-12T05:10:18.761210Z",
+  "started_at": "2026-02-12T05:10:19.524044Z",
+  "completed_at": "2026-02-12T05:10:21.392090Z"
+}

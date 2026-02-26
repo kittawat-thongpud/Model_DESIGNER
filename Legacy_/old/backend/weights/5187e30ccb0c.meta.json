@@ -1,0 +1,12 @@
+{
+  "weight_id": "5187e30ccb0c",
+  "model_id": "5a455c274243",
+  "model_name": "MNIST Digit",
+  "job_id": "b5f528bfcd56",
+  "dataset": "mnist",
+  "epochs_trained": 20,
+  "final_accuracy": 99.2,
+  "final_loss": 0.0257,
+  "file_size_bytes": 90835,
+  "created_at": "2026-02-11T11:59:25.772880Z"
+}

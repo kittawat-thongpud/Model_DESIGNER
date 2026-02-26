@@ -1,0 +1,60 @@
+{
+  "job_id": "e6bee20014b4",
+  "model_id": "3107eb9c4302",
+  "model_name": "Test2",
+  "config": {
+    "dataset": "mnist",
+    "epochs": 5,
+    "learning_rate": 0.001,
+    "batch_size": 64
+  },
+  "status": "completed",
+  "epoch": 5,
+  "total_epochs": 5,
+  "train_loss": 5.8817,
+  "train_accuracy": 10.59,
+  "val_loss": 3.2046,
+  "val_accuracy": 11.35,
+  "message": "Training complete",
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 5.9494,
+      "train_accuracy": 10.22,
+      "val_loss": 3.3002,
+      "val_accuracy": 9.8
+    },
+    {
+      "epoch": 2,
+      "train_loss": 5.8909,
+      "train_accuracy": 10.54,
+      "val_loss": 3.2281,
+      "val_accuracy": 10.28
+    },
+    {
+      "epoch": 3,
+      "train_loss": 5.9056,
+      "train_accuracy": 10.5,
+      "val_loss": 3.209,
+      "val_accuracy": 11.35
+    },
+    {
+      "epoch": 4,
+      "train_loss": 5.8825,
+      "train_accuracy": 10.79,
+      "val_loss": 3.2103,
+      "val_accuracy": 11.35
+    },
+    {
+      "epoch": 5,
+      "train_loss": 5.8817,
+      "train_accuracy": 10.59,
+      "val_loss": 3.2046,
+      "val_accuracy": 11.35
+    }
+  ],
+  "weight_id": "c2681085bfed",
+  "created_at": "2026-02-11T07:05:19.919099Z",
+  "started_at": "2026-02-11T07:05:21.257349Z",
+  "completed_at": "2026-02-11T07:07:00.480916Z"
+}

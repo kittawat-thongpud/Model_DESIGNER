@@ -1,0 +1,42 @@
+graph TB
+    subgraph "YOLO Paradigm"
+        A1[Grid-based] --> A2[Local Context]
+        A2 --> A3[One-to-Many]
+        A3 --> A4[Fast O&#40;HW&#41;]
+        A4 --> A5[NMS Required]
+    end
+    
+    subgraph "RF-DETR Paradigm"
+        B1[Set-based] --> B2[Global Context]
+        B2 --> B3[One-to-One]
+        B3 --> B4[Accurate O&#40;N²&#41;]
+        B4 --> B5[No NMS]
+    end
+    
+    subgraph "HSG-DET Paradigm"
+        C1[Hybrid] --> C2[Sparse Global]
+        C2 --> C3[One-to-Few]
+        C3 --> C4[Balanced O&#40;k²&#41;]
+        C4 --> C5[Optional NMS]
+    end
+    
+    A5 -.->|Combine| C1
+    B5 -.->|Combine| C1
+    
+    style A1 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style A2 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style A3 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style A4 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style A5 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    
+    style B1 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style B2 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style B3 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style B4 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style B5 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    
+    style C1 fill:#fff3e0,stroke:#f57c00,stroke-width:3px
+    style C2 fill:#fff3e0,stroke:#f57c00,stroke-width:3px
+    style C3 fill:#fff3e0,stroke:#f57c00,stroke-width:3px
+    style C4 fill:#fff3e0,stroke:#f57c00,stroke-width:3px
+    style C5 fill:#fff3e0,stroke:#f57c00,stroke-width:3px

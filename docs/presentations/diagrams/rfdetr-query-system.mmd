@@ -1,0 +1,24 @@
+graph TB
+    A[Input Image] --> B[Transformer Encoder<br/>Global Context]
+    B --> C[Object Queries<br/>M fixed embeddings]
+    
+    C --> Q1[Query 1<br/>Find 1 object]
+    C --> Q2[Query 2<br/>Find 1 object]
+    C --> Q3[Query 3<br/>Find 1 object]
+    C --> Q4[Query M<br/>Find 1 object]
+    
+    Q1 --> D[Hungarian Matching<br/>One-to-One]
+    Q2 --> D
+    Q3 --> D
+    Q4 --> D
+    
+    D --> E[Final Detections<br/>No NMS!]
+    
+    style B fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style C fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    style Q1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style Q2 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style Q3 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style Q4 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style D fill:#66bb6a,stroke:#388e3c,stroke-width:2px
+    style E fill:#4caf50,stroke:#388e3c,stroke-width:3px

@@ -1,0 +1,12 @@
+{
+  "weight_id": "5a8150633c19",
+  "model_id": "5a455c274243",
+  "model_name": "CIFR-10 Digit",
+  "job_id": "4e61e8855a7a",
+  "dataset": "cifar10",
+  "epochs_trained": 5,
+  "final_accuracy": 60.64,
+  "final_loss": 1.2713,
+  "file_size_bytes": 102099,
+  "created_at": "2026-02-12T05:11:21.387465Z"
+}

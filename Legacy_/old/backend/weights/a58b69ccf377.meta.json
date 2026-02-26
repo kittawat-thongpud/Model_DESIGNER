@@ -1,0 +1,12 @@
+{
+  "weight_id": "a58b69ccf377",
+  "model_id": "5b94c9ef88ae",
+  "model_name": "Test2",
+  "job_id": "c0d4bd4862f4",
+  "dataset": "mnist",
+  "epochs_trained": 5,
+  "final_accuracy": 11.36,
+  "final_loss": 3.0512,
+  "file_size_bytes": 27537,
+  "created_at": "2026-02-11T05:05:09.633335Z"
+}

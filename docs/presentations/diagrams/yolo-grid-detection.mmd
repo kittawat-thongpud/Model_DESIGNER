@@ -1,0 +1,22 @@
+graph TB
+    A[Input Image] --> B[Divide into Grid]
+    B --> C1[Cell 1<br/>Predict?]
+    B --> C2[Cell 2<br/>Predict?]
+    B --> C3[Cell 3<br/>Predict?]
+    B --> C4[Cell N<br/>Predict?]
+    
+    C1 --> D[Aggregate Results]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    
+    D --> E[NMS Filtering]
+    E --> F[Final Detections]
+    
+    style B fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style C1 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style C2 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style C3 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style C4 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style E fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style F fill:#c8e6c9,stroke:#388e3c,stroke-width:3px

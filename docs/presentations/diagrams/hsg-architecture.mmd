@@ -1,0 +1,19 @@
+graph LR
+    A[Input Image<br/>1920×1080] --> B[CNN Backbone<br/>CSP/C2f]
+    B --> C[Multi-scale Features<br/>P3, P4, P5]
+    C --> D[Token Selection<br/>Top-k=512]
+    D --> E[Sparse Global Attention<br/>O&#40;k²&#41;]
+    E --> F[Context Fusion<br/>Broadcast]
+    F --> G[Detection Head<br/>One-to-Few]
+    G --> H[Optional NMS<br/>Fallback]
+    H --> I[Final Detections]
+    
+    style A fill:#ffffff,stroke:#f57c00,stroke-width:3px
+    style B fill:#fff9c4,stroke:#f57c00,stroke-width:2px
+    style C fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    style D fill:#ffe0b2,stroke:#f57c00,stroke-width:2px
+    style E fill:#ffcc80,stroke:#f57c00,stroke-width:3px
+    style F fill:#ffb74d,stroke:#f57c00,stroke-width:2px
+    style G fill:#ffa726,stroke:#f57c00,stroke-width:2px
+    style H fill:#ff9800,stroke:#f57c00,stroke-width:2px
+    style I fill:#fb8c00,stroke:#f57c00,stroke-width:3px

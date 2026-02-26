@@ -1,0 +1,17 @@
+graph LR
+    A[Input Image] --> B[CNN Backbone<br/>Feature Extraction]
+    B --> C[Transformer Encoder<br/>Self-Attention]
+    C --> D[Object Queries<br/>M learnable embeddings]
+    D --> E[Transformer Decoder<br/>Cross-Attention]
+    E --> F[Linear Heads<br/>Box + Class]
+    F --> G[Hungarian Matching<br/>Optimal Assignment]
+    G --> H[Final Detections<br/>No NMS Required]
+    
+    style A fill:#ffffff,stroke:#388e3c,stroke-width:3px
+    style B fill:#f1f8e9,stroke:#388e3c,stroke-width:2px
+    style C fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style D fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    style E fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style F fill:#81c784,stroke:#388e3c,stroke-width:2px
+    style G fill:#66bb6a,stroke:#388e3c,stroke-width:2px
+    style H fill:#4caf50,stroke:#388e3c,stroke-width:3px

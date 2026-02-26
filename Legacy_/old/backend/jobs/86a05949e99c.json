@@ -1,0 +1,24 @@
+{
+  "job_id": "86a05949e99c",
+  "model_id": "96bb7a6c38aa",
+  "model_name": "Untitled",
+  "config": {
+    "dataset": "mnist",
+    "epochs": 5,
+    "learning_rate": 0.001,
+    "batch_size": 64
+  },
+  "status": "failed",
+  "epoch": 0,
+  "total_epochs": 5,
+  "train_loss": 0.0,
+  "train_accuracy": 0.0,
+  "val_loss": null,
+  "val_accuracy": null,
+  "message": "optimizer got an empty parameter list",
+  "history": [],
+  "weight_id": null,
+  "created_at": "2026-02-10T19:57:35.066854Z",
+  "started_at": null,
+  "completed_at": "2026-02-10T19:57:49.630348Z"
+}

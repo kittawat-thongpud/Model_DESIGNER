@@ -1,0 +1,18 @@
+graph TB
+    subgraph "Single Object (Car)"
+        A[Cell 1: Car detected!]
+        B[Cell 2: Car detected!]
+        C[Cell 3: Car detected!]
+        D[Cell 4: Car detected!]
+    end
+    
+    A --> E[NMS: Keep only 1]
+    B --> E
+    C --> E
+    D --> E
+    
+    style A fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style B fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style C fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style D fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style E fill:#c8e6c9,stroke:#388e3c,stroke-width:3px

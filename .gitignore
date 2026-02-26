@@ -1,0 +1,92 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-wheel-metadata/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Ultralytics / training output ────────────────────────────────────────────
+runs/
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.torchscript
+datasets/
+ultralytics_cache/
+
+# ── Data / cache ──────────────────────────────────────────────────────────────
+*.csv
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.db
+*.sqlite3
+data/
+*.cache
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+*.jsonl
+logs/
+
+# ── Backend runtime data (jobs, weights, models stored locally) ───────────────
+backend/data/
+
+# ── Secrets / env ─────────────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# ── Node (frontend) ───────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/.nuxt/
+frontend/out/
+*.lock
+# Keep package-lock.json / yarn.lock if you want reproducible installs
+# !package-lock.json
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Temporary / misc ──────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+.agent/
+convert.csv

@@ -1,0 +1,24 @@
+graph TB
+    A[All Tokens<br/>N=2040] --> B{Importance<br/>Scoring}
+    B --> C[Score Computation<br/>Per Token]
+    C --> D[Top-k Selection<br/>k=512]
+    D --> E[Selected Tokens<br/>262k ops]
+    E --> F[Sparse Self-Attention<br/>O&#40;k²&#41;]
+    F --> G[Attended Features]
+    G --> H[Broadcast to All<br/>N tokens]
+    H --> I[Global Context<br/>Integrated]
+    
+    J[Full Attention<br/>RF-DETR] -.->|4.1M ops| K[Too Slow]
+    E -.->|15× Faster| J
+    
+    style A fill:#ffffff,stroke:#333,stroke-width:2px
+    style B fill:#fff9c4,stroke:#f57c00,stroke-width:2px
+    style C fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    style D fill:#ffe0b2,stroke:#f57c00,stroke-width:3px
+    style E fill:#ffcc80,stroke:#f57c00,stroke-width:3px
+    style F fill:#ffb74d,stroke:#f57c00,stroke-width:3px
+    style G fill:#ffa726,stroke:#f57c00,stroke-width:2px
+    style H fill:#ff9800,stroke:#f57c00,stroke-width:2px
+    style I fill:#fb8c00,stroke:#f57c00,stroke-width:3px
+    style J fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    style K fill:#ef5350,stroke:#d32f2f,stroke-width:2px

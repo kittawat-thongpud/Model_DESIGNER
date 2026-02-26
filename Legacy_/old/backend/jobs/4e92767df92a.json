@@ -1,0 +1,319 @@
+{
+  "job_id": "4e92767df92a",
+  "model_id": "5a455c274243",
+  "model_name": "CIFR-10 Digit",
+  "config": {
+    "model_id": "5a455c274243",
+    "dataset": "cifar10",
+    "epochs": 5,
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "weight_record_enabled": true,
+    "weight_record_layers": [
+      "node_2",
+      "node_5",
+      "node_6",
+      "node_12"
+    ],
+    "weight_record_frequency": 1,
+    "lr0": 0.001,
+    "global_overrides": {}
+  },
+  "status": "completed",
+  "epoch": 5,
+  "total_epochs": 5,
+  "train_loss": 1.6281,
+  "train_accuracy": 40.54,
+  "val_loss": 1.2592,
+  "val_accuracy": 61.74,
+  "message": "Training complete",
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 1.9195,
+      "train_cls_loss": 1.9195,
+      "train_accuracy": 30.54,
+      "val_loss": 1.4684,
+      "val_cls_loss": 1.4684,
+      "val_accuracy": 50.67,
+      "precision": 0.5228,
+      "recall": 0.5067,
+      "f1": 0.4936,
+      "lr": 0.00039811,
+      "epoch_time": 8.97,
+      "gpu_memory_mb": 48.2
+    },
+    {
+      "epoch": 2,
+      "train_loss": 1.7155,
+      "train_cls_loss": 1.7155,
+      "train_accuracy": 37.94,
+      "val_loss": 1.3392,
+      "val_cls_loss": 1.3392,
+      "val_accuracy": 59.26,
+      "precision": 0.5876,
+      "recall": 0.5926,
+      "f1": 0.5869,
+      "lr": 0.00015849,
+      "epoch_time": 9.28,
+      "gpu_memory_mb": 48.2
+    },
+    {
+      "epoch": 3,
+      "train_loss": 1.6553,
+      "train_cls_loss": 1.6553,
+      "train_accuracy": 39.64,
+      "val_loss": 1.2994,
+      "val_cls_loss": 1.2994,
+      "val_accuracy": 60.66,
+      "precision": 0.607,
+      "recall": 0.6066,
+      "f1": 0.6017,
+      "lr": 6.31e-05,
+      "epoch_time": 9.26,
+      "gpu_memory_mb": 48.2
+    },
+    {
+      "epoch": 4,
+      "train_loss": 1.6392,
+      "train_cls_loss": 1.6392,
+      "train_accuracy": 40.05,
+      "val_loss": 1.2651,
+      "val_cls_loss": 1.2651,
+      "val_accuracy": 61.55,
+      "precision": 0.6086,
+      "recall": 0.6155,
+      "f1": 0.6103,
+      "lr": 2.512e-05,
+      "epoch_time": 9.28,
+      "gpu_memory_mb": 48.2
+    },
+    {
+      "epoch": 5,
+      "train_loss": 1.6281,
+      "train_cls_loss": 1.6281,
+      "train_accuracy": 40.54,
+      "val_loss": 1.2592,
+      "val_cls_loss": 1.2592,
+      "val_accuracy": 61.74,
+      "precision": 0.6122,
+      "recall": 0.6174,
+      "f1": 0.6124,
+      "lr": 1e-05,
+      "epoch_time": 9.13,
+      "gpu_memory_mb": 48.2
+    }
+  ],
+  "weight_id": "5082ad12d02a",
+  "created_at": "2026-02-12T05:35:32.623242Z",
+  "started_at": "2026-02-12T05:35:33.541946Z",
+  "completed_at": "2026-02-12T05:36:19.463111Z",
+  "best_val_loss": 1.2592,
+  "best_val_accuracy": 61.74,
+  "class_names": [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck"
+  ],
+  "confusion_matrix": [
+    [
+      667,
+      27,
+      56,
+      19,
+      12,
+      18,
+      12,
+      17,
+      109,
+      63
+    ],
+    [
+      30,
+      734,
+      7,
+      14,
+      6,
+      5,
+      13,
+      8,
+      31,
+      152
+    ],
+    [
+      82,
+      10,
+      430,
+      65,
+      124,
+      88,
+      108,
+      50,
+      27,
+      16
+    ],
+    [
+      26,
+      14,
+      73,
+      396,
+      58,
+      180,
+      136,
+      60,
+      22,
+      35
+    ],
+    [
+      41,
+      9,
+      76,
+      69,
+      490,
+      59,
+      122,
+      113,
+      11,
+      10
+    ],
+    [
+      19,
+      7,
+      69,
+      154,
+      57,
+      523,
+      66,
+      67,
+      21,
+      17
+    ],
+    [
+      7,
+      4,
+      42,
+      55,
+      45,
+      27,
+      784,
+      11,
+      10,
+      15
+    ],
+    [
+      18,
+      1,
+      38,
+      53,
+      58,
+      68,
+      20,
+      705,
+      9,
+      30
+    ],
+    [
+      87,
+      56,
+      14,
+      16,
+      7,
+      5,
+      12,
+      12,
+      749,
+      42
+    ],
+    [
+      42,
+      140,
+      9,
+      13,
+      5,
+      9,
+      25,
+      24,
+      37,
+      696
+    ]
+  ],
+  "per_class_metrics": [
+    {
+      "class": "airplane",
+      "precision": 0.6546,
+      "recall": 0.667,
+      "f1": 0.6607,
+      "support": 1000
+    },
+    {
+      "class": "automobile",
+      "precision": 0.7325,
+      "recall": 0.734,
+      "f1": 0.7333,
+      "support": 1000
+    },
+    {
+      "class": "bird",
+      "precision": 0.5283,
+      "recall": 0.43,
+      "f1": 0.4741,
+      "support": 1000
+    },
+    {
+      "class": "cat",
+      "precision": 0.4637,
+      "recall": 0.396,
+      "f1": 0.4272,
+      "support": 1000
+    },
+    {
+      "class": "deer",
+      "precision": 0.5684,
+      "recall": 0.49,
+      "f1": 0.5263,
+      "support": 1000
+    },
+    {
+      "class": "dog",
+      "precision": 0.5326,
+      "recall": 0.523,
+      "f1": 0.5277,
+      "support": 1000
+    },
+    {
+      "class": "frog",
+      "precision": 0.604,
+      "recall": 0.784,
+      "f1": 0.6823,
+      "support": 1000
+    },
+    {
+      "class": "horse",
+      "precision": 0.6607,
+      "recall": 0.705,
+      "f1": 0.6821,
+      "support": 1000
+    },
+    {
+      "class": "ship",
+      "precision": 0.73,
+      "recall": 0.749,
+      "f1": 0.7394,
+      "support": 1000
+    },
+    {
+      "class": "truck",
+      "precision": 0.6468,
+      "recall": 0.696,
+      "f1": 0.6705,
+      "support": 1000
+    }
+  ]
+}
