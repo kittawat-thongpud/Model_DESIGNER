@@ -90,11 +90,18 @@ class HSGDetPlugin(ModelArchPlugin):
                 log_fn(msg)
 
         # ── 0. Pick YOLOv8 scale matching model_scale ────────────────────────
+        # HSG-DET backbone is CSP/C2f — same family as YOLOv8.
+        # Always select the same scale so channel dims align exactly.
+        # If scale is unknown, skip warm-start rather than defaulting to a
+        # mismatched checkpoint (wrong channel dims = zero transfers anyway).
         _SCALE_MAP = {"n": "yolov8n", "s": "yolov8s", "m": "yolov8m",
                       "l": "yolov8l", "x": "yolov8x"}
-        scale = (model_scale or "n").lower()
-        yolo_key = _SCALE_MAP.get(scale, "yolov8n")
-        _log(f"Backbone warm-start: model_scale='{scale}' → source={yolo_key}.pt")
+        scale = (model_scale or "").lower()
+        yolo_key = _SCALE_MAP.get(scale)
+        if yolo_key is None:
+            _log(f"Backbone warm-start: no model_scale provided — skipping warm-start")
+            return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
+        _log(f"Backbone warm-start: HSG-DET scale='{scale}' → pretrain source={yolo_key}.pt (CSP/C2f family match)")
 
         # ── 1. Locate or download .pt ─────────────────────────────────────────
         cache_candidates = [
@@ -167,21 +174,26 @@ class HSGDetPlugin(ModelArchPlugin):
         skipped = 0
         matched_layers: set[str] = set()
         skipped_layers: set[str] = set()
+        # Detailed records for compatibility report
+        _compat: list[dict] = []  # {key, src_shape, tgt_shape, status}
 
         new_tgt: dict = dict(tgt_sd)
         for key, tgt_tensor in tgt_sd.items():
+            layer_id = key.split(".")[0]
             if key not in src_sd:
                 skipped += 1
+                _compat.append({"key": key, "src": None, "tgt": tuple(tgt_tensor.shape), "status": "not_in_src"})
                 continue
             src_tensor = src_sd[key]
             if src_tensor.shape == tgt_tensor.shape:
                 new_tgt[key] = src_tensor.to(tgt_tensor.dtype)
                 transferred += 1
-                # Layer index is first numeric segment (e.g. "0" from "0.conv.weight")
-                matched_layers.add(key.split(".")[0])
+                matched_layers.add(layer_id)
+                _compat.append({"key": key, "src": tuple(src_tensor.shape), "tgt": tuple(tgt_tensor.shape), "status": "ok"})
             else:
                 skipped += 1
-                skipped_layers.add(key.split(".")[0])
+                skipped_layers.add(layer_id)
+                _compat.append({"key": key, "src": tuple(src_tensor.shape), "tgt": tuple(tgt_tensor.shape), "status": "shape_mismatch"})
 
         # ── 5. Apply merged weights directly on tgt_nn ───────────────────────
         # warm_start() is called from on_pretrain_routine_end callback, AFTER
@@ -193,16 +205,42 @@ class HSGDetPlugin(ModelArchPlugin):
         }
         tgt_nn.load_state_dict(restored_sd, strict=False)
 
-        # ── 6. Log per-layer summary ──────────────────────────────────────────
-        _log(
-            f"Backbone warm-start: transferred {transferred} tensors "
-            f"({len(matched_layers)} layers), skipped {skipped} tensors "
-            f"({len(skipped_layers)} layers with shape mismatch)"
-        )
-        for layer in sorted(matched_layers, key=lambda x: int(x) if x.isdigit() else 999):
-            _log(f"  ✓ layer {layer} transferred")
-        for layer in sorted(skipped_layers, key=lambda x: int(x) if x.isdigit() else 999):
-            _log(f"  ✗ layer {layer} skipped (shape mismatch or not in source)")
+        # ── 6. Log detailed compatibility report ─────────────────────────────
+        total_tgt_keys = len(tgt_sd)
+        pct = transferred / total_tgt_keys * 100 if total_tgt_keys else 0
+        _log(f"")
+        _log(f"{'─'*60}")
+        _log(f" Warm-start Compatibility Report: {yolo_key}.pt → HSG-DET-{scale}")
+        _log(f"{'─'*60}")
+        _log(f" Source  : {yolo_key}.pt  ({len(src_sd)} tensors)")
+        _log(f" Target  : HSG-DET-{scale} ({total_tgt_keys} tensors)")
+        _log(f" Transferred : {transferred} tensors ({pct:.1f}%)")
+        _log(f" Skipped     : {skipped} tensors")
+        _log(f" Layers matched : {sorted(matched_layers, key=lambda x: int(x) if x.isdigit() else 999)}")
+        _log(f" Layers skipped : {sorted(skipped_layers, key=lambda x: int(x) if x.isdigit() else 999)}")
+        _log(f"{'─'*60}")
+
+        # Per-layer breakdown grouped by layer index
+        from itertools import groupby
+        sorted_compat = sorted(_compat, key=lambda r: (
+            int(r["key"].split(".")[0]) if r["key"].split(".")[0].isdigit() else 999,
+            r["key"]
+        ))
+        cur_layer = None
+        for r in sorted_compat:
+            layer_id = r["key"].split(".")[0]
+            if layer_id != cur_layer:
+                cur_layer = layer_id
+                _log(f" Layer {layer_id}:")
+            param_name = ".".join(r["key"].split(".")[1:])  # strip layer prefix
+            if r["status"] == "ok":
+                _log(f"   ✓ {param_name:40s}  {str(r['src']):20s} → matched")
+            elif r["status"] == "shape_mismatch":
+                _log(f"   ✗ {param_name:40s}  src={r['src']} tgt={r['tgt']} [SHAPE MISMATCH]")
+            else:
+                _log(f"   – {param_name:40s}  (not in source — HSG-DET only)")
+        _log(f"{'─'*60}")
+        _log(f"")
 
         return {
             "transferred": transferred,

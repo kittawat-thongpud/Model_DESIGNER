@@ -420,11 +420,8 @@ def _training_worker(
             job_storage.append_job_log(job_id, "INFO",
                 f"Arch YAML: {yaml_path}")
 
-            # Auto-inject warm-start if user hasn't specified one already
-            if not config.get("pretrained") and arch_plugin.pretrain_key():
-                config["pretrained"] = arch_plugin.pretrain_key()
-                job_storage.append_job_log(job_id, "INFO",
-                    f"Warm-start backbone from: {arch_plugin.pretrain_key()}")
+            # yolov8_backbone warm-start is opt-in — only when user explicitly selects it in UI
+            # (no auto-inject from pretrain_key() anymore)
 
         # Auto-detect arch plugin from yaml path if not set via model_arch key
         if arch_plugin is None and original_yaml_path:
@@ -889,6 +886,9 @@ def _training_worker(
         # so trainer.model is a live nn.Module — load_state_dict() will persist.
         _arch_plugin_ref = arch_plugin
         _pretrained_loaded_ref = pretrained_loaded
+        # yolov8_backbone: explicit user choice e.g. 'yolov8n', 'yolov8m'
+        # Falls back to model_scale if not set
+        _yolov8_backbone_ref = config.pop("yolov8_backbone", None)
         _model_scale_ref = model_scale
         _resume_requested_ref = bool(resume_path)
 
@@ -903,6 +903,21 @@ def _training_worker(
                 return
             if _arch_plugin_ref is None or _pretrained_loaded_ref:
                 return
+            # Determine scale for warm-start:
+            # _yolov8_backbone_ref is explicit user choice e.g. 'yolov8m' → extract scale char 'm'
+            # If user did not select a backbone → skip warm-start entirely (opt-in)
+            ws_scale: str | None = None
+            if _yolov8_backbone_ref:
+                # e.g. 'yolov8m' → 'm', 'yolov8n' → 'n'
+                _KNOWN = {"yolov8n": "n", "yolov8s": "s", "yolov8m": "m",
+                          "yolov8l": "l", "yolov8x": "x"}
+                ws_scale = _KNOWN.get(_yolov8_backbone_ref.lower(), _yolov8_backbone_ref[-1:])
+            elif _model_scale_ref:
+                ws_scale = _model_scale_ref
+            if not ws_scale:
+                job_storage.append_job_log(job_id, "INFO",
+                    "Backbone warm-start: no YOLOv8 backbone selected — skipping")
+                return
             try:
                 ws_log = lambda msg: job_storage.append_job_log(job_id, "INFO", msg)
                 # Pass trainer.model (the real nn.Module) wrapped as a shim
@@ -911,7 +926,7 @@ def _training_worker(
                     def __init__(self, nn_module):
                         self.model = nn_module
                 ws_result = _arch_plugin_ref.warm_start(
-                    _ModelShim(trainer.model), log_fn=ws_log, model_scale=_model_scale_ref
+                    _ModelShim(trainer.model), log_fn=ws_log, model_scale=ws_scale
                 )
                 # Temp .pt is no longer needed — state_dict was applied directly
                 temp_pt = ws_result.get("temp_pt")

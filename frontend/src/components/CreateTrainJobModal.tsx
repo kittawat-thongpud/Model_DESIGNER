@@ -113,6 +113,17 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
   const [searchQuery, setSearchQuery] = useState('');
   const [partitionSplitConfig, setPartitionSplitConfig] = useState<Record<string, {train: boolean; val: boolean; test: boolean}>>({});
   const [datasetPartitions, setDatasetPartitions] = useState<Record<string, any>>({});
+  // YOLOv8 backbone warm-start selector (for custom/arch models only)
+  const [yolov8Backbone, setYolov8Backbone] = useState<string>('');  // '' = disabled, 'yolov8n' etc = enabled
+
+  // Auto-select YOLOv8 backbone matching model scale when custom model is selected
+  useEffect(() => {
+    if (selectedModelId && !selectedModelId.startsWith('yolo:')) {
+      setYolov8Backbone(`yolov8${modelScale}`);
+    } else {
+      setYolov8Backbone('');
+    }
+  }, [selectedModelId, modelScale]);
   
   // Merge official YOLO models with custom models
   const models = [...OFFICIAL_YOLO_MODELS, ...customModels];
@@ -202,6 +213,9 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         // Use YOLOv8 with selected scale (e.g., 'yolov8n', 'yolov8s', 'yolov8m', 'yolov8l', 'yolov8x')
         finalConfig.yolo_model = `yolov8${modelScale}`;
         // use_yolo_pretrained is already set by user via radio buttons in UI
+      } else if (yolov8Backbone) {
+        // Custom model with YOLOv8 backbone warm-start — pass to backend
+        (finalConfig as any).yolov8_backbone = yolov8Backbone;
       }
       
       const res = await api.startTraining({
@@ -219,6 +233,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       setActiveTab('general');
       setSearchQuery('');
       setPartitionSplitConfig({});
+      setYolov8Backbone('');
     } catch (err) {
       alert(`Failed to start training: ${err}`);
     } finally {
@@ -734,14 +749,77 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
 
                         <div className="space-y-4">
                           <h4 className="text-sm font-semibold text-white border-b border-slate-800 pb-2">Advanced</h4>
+                          {/* YOLOv8 Backbone Warm-start — only for custom/arch models */}
+                          {selectedModelId && !selectedModelId.startsWith('yolo:') && (
+                            <div>
+                              <label className="block text-xs font-medium text-indigo-400 mb-1.5">
+                                YOLOv8 Backbone Warm-start
+                              </label>
+                              <div className="space-y-2">
+                                {/* None option */}
+                                <label className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all border-2 ${
+                                  yolov8Backbone === ''
+                                    ? 'bg-slate-700/50 border-slate-600'
+                                    : 'bg-slate-800/30 border-slate-700/50 hover:border-slate-600'
+                                }`}>
+                                  <input
+                                    type="radio"
+                                    checked={yolov8Backbone === ''}
+                                    onChange={() => setYolov8Backbone('')}
+                                    className="w-4 h-4 text-indigo-500 focus:ring-indigo-500"
+                                  />
+                                  <div>
+                                    <div className="text-sm font-medium text-white">None (Train from scratch)</div>
+                                    <div className="text-xs text-slate-400">Random weight initialization</div>
+                                  </div>
+                                </label>
+                                {/* YOLOv8 options — auto-highlight matching scale */}
+                                {(['n','s','m','l','x'] as const).map(sc => {
+                                  const key = `yolov8${sc}`;
+                                  const isMatchingScale = sc === modelScale;
+                                  return (
+                                    <label key={key} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all border-2 ${
+                                      yolov8Backbone === key
+                                        ? 'bg-indigo-500/10 border-indigo-500/50 shadow-[0_0_10px_rgba(99,102,241,0.15)]'
+                                        : 'bg-slate-800/30 border-slate-700/50 hover:border-slate-600'
+                                    }`}>
+                                      <input
+                                        type="radio"
+                                        checked={yolov8Backbone === key}
+                                        onChange={() => setYolov8Backbone(key)}
+                                        className="w-4 h-4 text-indigo-500 focus:ring-indigo-500"
+                                      />
+                                      <div className="flex-1">
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-sm font-medium text-white">YOLOv8{sc.toUpperCase()}</span>
+                                          {isMatchingScale && (
+                                            <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/30 font-medium">
+                                              matches model scale
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-xs text-slate-400">
+                                          Transfer CSP/C2f backbone layers — {isMatchingScale ? 'recommended' : 'channel dims may differ'}
+                                        </div>
+                                      </div>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                              <p className="text-[10px] text-slate-500 mt-2">
+                                💡 Select the same scale as your model for best channel alignment
+                              </p>
+                            </div>
+                          )}
+
                           <div>
-                            <label className="block text-xs font-medium text-slate-400 mb-1.5">Pretrained Weights</label>
+                            <label className="block text-xs font-medium text-slate-400 mb-1.5">Pretrained Weights (Custom .pt)</label>
                             <select
                               value={config.pretrained}
                               onChange={e => updateConfig('pretrained', e.target.value)}
                               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white focus:border-emerald-500 focus:outline-none"
                             >
-                              <option value="">None (Train from scratch)</option>
+                              <option value="">None</option>
                               {weights.map(w => (
                                 <option key={w.weight_id} value={w.weight_id}>
                                   {w.name || w.weight_id} — {w.model_name} — {(w.file_size_bytes / 1024 / 1024).toFixed(1)} MB
