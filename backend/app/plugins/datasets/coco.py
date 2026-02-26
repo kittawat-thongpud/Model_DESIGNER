@@ -355,6 +355,29 @@ class COCOPlugin(DatasetPlugin):
     def load_test(self, transform=None):
         return None
 
+    def clear_data(self) -> list[str]:
+        """Delete downloaded COCO2017 dataset files and return list of deleted directories."""
+        import shutil
+
+        deleted = []
+        if _COCO_ROOT.exists():
+            shutil.rmtree(_COCO_ROOT)
+            deleted.append(str(_COCO_ROOT))
+            with self._index_lock:
+                self._indices.clear()
+                self._split_counts = None
+                self._categories = None
+                self._cat_names = None
+
+        index_files = list(_INDEX_DIR.glob("*.json"))
+        for f in index_files:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+        return deleted
+
     def wrap_for_training(self, dataset) -> "_COCODetectionWrapper":
         """Wrap a raw COCORawDataset for training (normalized xywh tensors)."""
         return _COCODetectionWrapper(dataset, self._cat_id_to_contiguous())
