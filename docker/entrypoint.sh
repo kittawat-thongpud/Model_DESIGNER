@@ -49,19 +49,7 @@ else
     echo "[entrypoint] venv found at ${VENV_DIR} — skipping install."
 fi
 
-# ── 3. Build frontend dist if not present ────────────────────────────────────
-FRONTEND_DIST="${APP_DIR}/frontend/dist"
-if [ ! -d "${FRONTEND_DIST}" ]; then
-    echo "[entrypoint] Frontend dist not found — building..."
-    cd "${APP_DIR}/frontend"
-    npm install -q
-    npm run build -q
-    echo "[entrypoint] Frontend built."
-else
-    echo "[entrypoint] Frontend dist found — skipping build."
-fi
-
-# ── 4. Create persistent data directories (idempotent) ───────────────────────
+# ── 3. Create persistent data directories (idempotent) ───────────────────────
 for dir in \
     "${DATA_DIR}/datasets" \
     "${DATA_DIR}/models" \
