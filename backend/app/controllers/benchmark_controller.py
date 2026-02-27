@@ -38,12 +38,16 @@ class BenchmarkRequest(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _rewrite_yaml_paths(yaml_path: Path) -> Path:
-    """Rewrite absolute paths in a data.yaml to point to the current DATA_DIR.
+    """Ensure a data.yaml points to paths valid on the current machine.
 
-    Returns yaml_path unchanged if all paths already exist.
-    Returns a temp file with corrected paths if any path needs fixing.
+    Strategy (in priority order):
+    1. All paths already exist → return as-is.
+    2. Dataset name can be resolved under current DATA_DIR/datasets/<name> →
+       regenerate data.yaml from scratch using generate_data_yaml (best: fresh
+       paths, no stale .cache references).
+    3. Fallback: line-by-line remap of absolute paths via /datasets/<name> segment.
     """
-    import tempfile, re as _re
+    import tempfile
     import yaml as _yaml
 
     try:
@@ -57,7 +61,7 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
     for field in fields:
         val = data.get(field)
         if val and isinstance(val, str):
-            p = Path(val.split("#")[0].strip())  # strip inline comments
+            p = Path(val.split("#")[0].strip())
             if p.is_absolute() and not p.exists():
                 needs_fix = True
                 break
@@ -65,11 +69,29 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
     if not needs_fix:
         return yaml_path
 
-    datasets_dir = DATA_DIR / "datasets"
-    current_data_dir = str(DATA_DIR)
+    # ── Strategy 2: regenerate from current DATA_DIR ──────────────────────────
+    # Extract dataset name from the 'path' field (last component)
+    ds_path_str = str(data.get("path", "")).split("#")[0].strip()
+    if ds_path_str:
+        ds_name = Path(ds_path_str).name  # e.g. "coco", "coco128"
+        local_ds_path = DATA_DIR / "datasets" / ds_name
+        if local_ds_path.exists():
+            try:
+                from ..services.dataset_yaml import generate_data_yaml
+                yaml_str = generate_data_yaml(ds_name, custom_path=local_ds_path)
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix="_data.yaml", delete=False,
+                    dir=str(BENCHMARK_DIR)
+                )
+                tmp.write(yaml_str)
+                tmp.flush()
+                tmp.close()
+                return Path(tmp.name)
+            except Exception:
+                pass  # fall through to line-by-line remap
 
+    # ── Strategy 3: line-by-line remap ────────────────────────────────────────
     def _remap(val: str) -> str:
-        # Extract inline comment if any
         comment = ""
         if "#" in val:
             val, comment = val.split("#", 1)
@@ -78,14 +100,11 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
         p = Path(val)
         if not p.is_absolute() or p.exists():
             return val + comment
-        # Find /datasets/<name> segment and remap to current DATA_DIR
         parts = p.parts
         for i, part in enumerate(parts):
             if part == "datasets" and i + 1 < len(parts):
                 remapped = DATA_DIR / Path(*parts[i:])
                 return str(remapped) + comment
-        # Fallback: try replacing old data dir prefix with current one
-        # by finding the longest suffix that exists under DATA_DIR
         for i in range(1, len(parts)):
             candidate = DATA_DIR / Path(*parts[i:])
             if candidate.exists():
@@ -105,7 +124,7 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
         new_lines.append(line)
 
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix="_data.yaml", delete=False, dir=str(yaml_path.parent)
+        mode="w", suffix="_data.yaml", delete=False, dir=str(BENCHMARK_DIR)
     )
     tmp.write("\n".join(new_lines))
     tmp.flush()
