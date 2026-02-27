@@ -355,8 +355,47 @@ class CustomDetectionTrainer(DetectionTrainer):
     def _setup_train(self):
         """Override setup to add logging."""
         self.log("Setting up training...", "INFO")
-        result = super()._setup_train()
-        self.log(f"Training setup complete - {self.train_loader.dataset.ni} train images, {self.test_loader.dataset.ni} val images", "INFO")
+
+        import threading
+        import time as _time
+        import sys
+        import traceback
+
+        done = threading.Event()
+        start_t = _time.time()
+        timeout_s = 90
+
+        def _watchdog():
+            if not done.wait(timeout_s):
+                try:
+                    elapsed = _time.time() - start_t
+                    self.log(
+                        f"Training setup watchdog triggered after {elapsed:.1f}s - dumping thread stacks",
+                        "WARNING",
+                    )
+                    frames = sys._current_frames()
+                    for th in threading.enumerate():
+                        try:
+                            frame = frames.get(th.ident)
+                            if frame is None:
+                                continue
+                            stack = "".join(traceback.format_stack(frame))
+                            self.log(f"Thread stack | name={th.name} ident={th.ident}\n{stack}", "WARNING")
+                        except Exception:
+                            continue
+                except Exception as e:
+                    self.log(f"Training setup watchdog failed: {e}", "WARNING")
+
+        threading.Thread(target=_watchdog, daemon=True, name="setup_train_watchdog").start()
+        try:
+            result = super()._setup_train()
+        finally:
+            done.set()
+
+        self.log(
+            f"Training setup complete - {self.train_loader.dataset.ni} train images, {self.test_loader.dataset.ni} val images",
+            "INFO",
+        )
         return result
 
     def _load_checkpoint_state(self, ckpt):

@@ -31,6 +31,8 @@ sys.argv = []
 from ..config import JOBS_DIR, WEIGHTS_DIR
 from . import event_bus, job_storage
 from ..constants import job_channel, train_channel
+from . import dataset_yaml, dataset_registry
+from ..config import JOBS_DIR
 
 
 # ── Active jobs tracking ─────────────────────────────────────────────────────
@@ -327,6 +329,55 @@ def get_worker_health() -> dict[str, Any]:
 
 # ── Training Worker ──────────────────────────────────────────────────────────
 
+def _mount_fstype_for_path(path: str | Path) -> str | None:
+    """Best-effort filesystem type lookup for a given path using /proc/mounts."""
+    try:
+        p = Path(path).resolve()
+    except Exception:
+        p = Path(path)
+    best_match = None
+    best_len = -1
+    try:
+        mounts = Path("/proc/mounts").read_text().splitlines()
+    except Exception:
+        return None
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount_point = parts[1]
+        fstype = parts[2]
+        try:
+            mp = Path(mount_point)
+        except Exception:
+            continue
+        try:
+            if str(p).startswith(str(mp)) and len(str(mp)) > best_len:
+                best_match = fstype
+                best_len = len(str(mp))
+        except Exception:
+            continue
+    return best_match
+
+
+def _dataset_root_from_data_yaml(data_yaml_path: str | Path) -> Path | None:
+    """Parse Ultralytics data.yaml to get the dataset root path (the `path:` field)."""
+    try:
+        txt = Path(data_yaml_path).read_text().splitlines()
+    except Exception:
+        return None
+    for line in txt:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("path:"):
+            val = s.split(":", 1)[1].strip()
+            if val:
+                return Path(val)
+            return None
+    return None
+
+
 def _training_worker(
     job_id: str,
     yaml_path: str,
@@ -360,7 +411,8 @@ def _training_worker(
 
     try:
         from ultralytics import YOLO
-        from . import dataset_yaml, dataset_registry, module_registry
+        from . import dataset_yaml, dataset_registry
+        from . import module_registry
         from .custom_trainer import CustomDetectionTrainer
         from .custom_trainer import NaNLossError
 
@@ -783,19 +835,87 @@ def _training_worker(
         if resume_path:
             train_kwargs["resume"] = True  # tell Ultralytics to restore epoch/optimizer state
 
-        # Auto-tune workers: Docker CPU quota is often much lower than os.cpu_count()
-        # Over-subscribing workers causes thrashing and slows data loading.
-        if "workers" not in train_kwargs or train_kwargs.get("workers", 8) > 4:
-            optimal_workers = _get_optimal_workers()
-            train_kwargs["workers"] = optimal_workers
-            job_storage.append_job_log(job_id, "INFO",
-                f"Auto-tuned dataloader workers: {optimal_workers}")
+        # Detect dataset filesystem early (used to decide worker/cache strategy)
+        fstype = None
+        ds_root = None
+        is_remote_fs = False
+        try:
+            data_yaml = train_kwargs.get("data")
+            ds_root = _dataset_root_from_data_yaml(data_yaml) if data_yaml else None
+            if ds_root:
+                fstype = _mount_fstype_for_path(ds_root)
+                if fstype and fstype.lower() in {"fuse", "fuseblk", "nfs", "cifs", "sshfs", "overlay"}:
+                    is_remote_fs = True
+        except Exception as _fs_err:
+            job_storage.append_job_log(job_id, "DEBUG", f"Dataset filesystem detection failed: {_fs_err}")
+
+        # Auto-tune workers: Docker CPU quota is often much lower than os.cpu_count().
+        # NOTE: On remote filesystems (FUSE/NFS/etc.) we force workers=0 below.
+        if not is_remote_fs:
+            # Over-subscribing workers causes thrashing and slows data loading.
+            if "workers" not in train_kwargs or train_kwargs.get("workers", 8) > 4:
+                optimal_workers = _get_optimal_workers()
+                train_kwargs["workers"] = optimal_workers
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Auto-tuned dataloader workers: {optimal_workers}")
 
         # Enable Ultralytics disk cache (cache=True) so label scan results are
         # stored in a .cache file and reused on subsequent runs — avoids rescanning
         # 118k images every time.  Only set if user did not already configure it.
         if "cache" not in train_kwargs:
             train_kwargs["cache"] = True
+
+        # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
+        # due to heavy stat()/glob across 100k+ files and/or multiprocessing overhead.
+        # Mitigation: force workers=0 and disable Ultralytics dataset cache writing.
+        if ds_root:
+            job_storage.append_job_log(
+                job_id,
+                "DEBUG",
+                "Dataset filesystem | "
+                f"dataset_root={str(ds_root)!r}, fstype={fstype!r}",
+            )
+        if is_remote_fs:
+            # On remote filesystems we keep cache off, but we should NOT force workers=0.
+            # workers=0 avoids multiprocessing overhead but can drastically reduce throughput.
+            # Use a small worker count unless the user explicitly provided one.
+            if "workers" not in config:
+                train_kwargs["workers"] = 2
+            train_kwargs["cache"] = False
+
+            # Ultralytics label caching scans all images/labels using a ThreadPool(NUM_THREADS).
+            # On remote filesystems (FUSE/NFS/etc.) high parallelism can degrade performance
+            # dramatically. Reduce to single-thread for stability.
+            try:
+                import ultralytics.data.dataset as _ultra_ds
+                old_ds_threads = getattr(_ultra_ds, "NUM_THREADS", None)
+                _ultra_ds.NUM_THREADS = 1
+                try:
+                    import ultralytics.utils as _ultra_utils
+                    old_utils_threads = getattr(_ultra_utils, "NUM_THREADS", None)
+                    _ultra_utils.NUM_THREADS = 1
+                except Exception:
+                    old_utils_threads = None
+                job_storage.append_job_log(
+                    job_id,
+                    "WARNING",
+                    "Remote FS mitigation: reduced Ultralytics dataset scan threads | "
+                    f"ultralytics.data.dataset.NUM_THREADS: {old_ds_threads!r} -> 1, "
+                    f"ultralytics.utils.NUM_THREADS: {old_utils_threads!r} -> 1",
+                )
+            except Exception as _thr_err:
+                job_storage.append_job_log(
+                    job_id,
+                    "DEBUG",
+                    f"Remote FS mitigation: could not patch Ultralytics NUM_THREADS: {_thr_err}",
+                )
+            job_storage.append_job_log(
+                job_id,
+                "WARNING",
+                "Dataset filesystem mitigation applied | "
+                f"dataset_root={str(ds_root)!r}, fstype={fstype!r}, "
+                f"workers={train_kwargs.get('workers')!r}, cache={train_kwargs.get('cache')!r}",
+            )
 
         job_storage.append_job_log(
             job_id,
@@ -932,21 +1052,17 @@ def _training_worker(
                 return
             if _arch_plugin_ref is None or _pretrained_loaded_ref:
                 return
-            # Determine scale for warm-start:
-            # _yolov8_backbone_ref is explicit user choice e.g. 'yolov8m' → extract scale char 'm'
-            # If user did not select a backbone → skip warm-start entirely (opt-in)
-            ws_scale: str | None = None
-            if _yolov8_backbone_ref:
-                # e.g. 'yolov8m' → 'm', 'yolov8n' → 'n'
-                _KNOWN = {"yolov8n": "n", "yolov8s": "s", "yolov8m": "m",
-                          "yolov8l": "l", "yolov8x": "x"}
-                ws_scale = _KNOWN.get(_yolov8_backbone_ref.lower(), _yolov8_backbone_ref[-1:])
-            elif _model_scale_ref:
-                ws_scale = _model_scale_ref
-            if not ws_scale:
+            # Warm-start is opt-in ONLY: require explicit yolov8_backbone selection.
+            if not _yolov8_backbone_ref:
                 job_storage.append_job_log(job_id, "INFO",
                     "Backbone warm-start: no YOLOv8 backbone selected — skipping")
                 return
+
+            # Determine scale for warm-start:
+            # _yolov8_backbone_ref is explicit user choice e.g. 'yolov8m' → extract scale char 'm'
+            _KNOWN = {"yolov8n": "n", "yolov8s": "s", "yolov8m": "m",
+                      "yolov8l": "l", "yolov8x": "x"}
+            ws_scale = _KNOWN.get(_yolov8_backbone_ref.lower(), _yolov8_backbone_ref[-1:])
             try:
                 ws_log = lambda msg: job_storage.append_job_log(job_id, "INFO", msg)
                 # Pass trainer.model (the real nn.Module) wrapped as a shim

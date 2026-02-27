@@ -13,6 +13,25 @@ from typing import Any
 from ..config import DATASETS_DIR
 
 
+def _get_conversion_marker_path(dataset_path: Path) -> Path:
+    return dataset_path / "labels" / ".coco_yolo_conversion.json"
+
+
+def _annotations_fingerprint(dataset_path: Path) -> dict[str, Any]:
+    anno_dir = dataset_path / "annotations"
+    files = sorted(anno_dir.glob("instances_*.json"), key=lambda p: p.name)
+    return {
+        "files": [
+            {
+                "name": f.name,
+                "size": f.stat().st_size,
+                "mtime": f.stat().st_mtime,
+            }
+            for f in files
+        ]
+    }
+
+
 def has_coco_annotations(dataset_path: Path) -> bool:
     """Check if dataset has COCO JSON annotations."""
     anno_dir = dataset_path / "annotations"
@@ -33,6 +52,16 @@ def is_already_converted(dataset_path: Path) -> bool:
     labels_dir = dataset_path / "labels"
     if not labels_dir.exists():
         return False
+
+    marker_path = _get_conversion_marker_path(dataset_path)
+    if marker_path.exists():
+        try:
+            marker = json.loads(marker_path.read_text())
+            current_fp = _annotations_fingerprint(dataset_path)
+            if marker.get("annotations_fingerprint") == current_fp:
+                return True
+        except Exception:
+            pass
 
     for split in ["train2017", "val2017", "train", "val", "test"]:
         split_labels = labels_dir / split
@@ -121,6 +150,7 @@ def convert_coco_to_yolo(
         }
 
     total_written = 0
+    total_non_empty = 0
     labels_root = dataset_path / "labels"
 
     try:
@@ -188,6 +218,23 @@ def convert_coco_to_yolo(
                         lines.append(f"{cls_idx} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
                 txt_path.write_text("\n".join(lines))
                 total_written += 1
+                if lines:
+                    total_non_empty += 1
+
+        try:
+            marker_path = _get_conversion_marker_path(dataset_path)
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "annotations_fingerprint": _annotations_fingerprint(dataset_path),
+                        "total_written": total_written,
+                        "total_non_empty": total_non_empty,
+                    }
+                )
+            )
+        except Exception:
+            pass
 
         return {
             "status": "success",
