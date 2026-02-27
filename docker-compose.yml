@@ -1,0 +1,34 @@
+services:
+  model-designer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: model-designer:latest
+    container_name: model-designer
+
+    # ── Ports ──────────────────────────────────────────────────────────────────
+    ports:
+      - "8000:8000"
+
+    # ── RunPod Network Volume ──────────────────────────────────────────────────
+    # RunPod mounts the network volume at /workspace on the host.
+    # We bind-mount /workspace/data into the container so all datasets,
+    # weights, jobs, and logs persist across container restarts.
+    volumes:
+      - /workspace/data:/workspace/data
+
+    # ── Environment ────────────────────────────────────────────────────────────
+    environment:
+      - DATA_DIR=/workspace/data
+      - PYTHONUNBUFFERED=1
+
+    # ── GPU ────────────────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    restart: unless-stopped

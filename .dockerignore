@@ -1,0 +1,53 @@
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+
+# Node modules & frontend build artifacts (built in Docker stage 1)
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Backend runtime data (persisted on RunPod volume, not in image)
+backend/data/
+data/
+
+# Training artifacts
+runs/
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.torchscript
+*.cache
+*.npy
+*.npz
+
+# Git & IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+.agent/
+.windsurf/
+
+# Docs & misc
+docs/
+*.md
+*.log
+*.jsonl
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+Compress.md
+convert.csv
