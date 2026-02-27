@@ -37,6 +37,82 @@ class BenchmarkRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _rewrite_yaml_paths(yaml_path: Path) -> Path:
+    """Rewrite absolute paths in a data.yaml to point to the current DATA_DIR.
+
+    Returns yaml_path unchanged if all paths already exist.
+    Returns a temp file with corrected paths if any path needs fixing.
+    """
+    import tempfile, re as _re
+    import yaml as _yaml
+
+    try:
+        content = yaml_path.read_text()
+        data = _yaml.safe_load(content)
+    except Exception:
+        return yaml_path
+
+    fields = ["path", "train", "val", "test"]
+    needs_fix = False
+    for field in fields:
+        val = data.get(field)
+        if val and isinstance(val, str):
+            p = Path(val.split("#")[0].strip())  # strip inline comments
+            if p.is_absolute() and not p.exists():
+                needs_fix = True
+                break
+
+    if not needs_fix:
+        return yaml_path
+
+    datasets_dir = DATA_DIR / "datasets"
+    current_data_dir = str(DATA_DIR)
+
+    def _remap(val: str) -> str:
+        # Extract inline comment if any
+        comment = ""
+        if "#" in val:
+            val, comment = val.split("#", 1)
+            val = val.strip()
+            comment = " #" + comment
+        p = Path(val)
+        if not p.is_absolute() or p.exists():
+            return val + comment
+        # Find /datasets/<name> segment and remap to current DATA_DIR
+        parts = p.parts
+        for i, part in enumerate(parts):
+            if part == "datasets" and i + 1 < len(parts):
+                remapped = DATA_DIR / Path(*parts[i:])
+                return str(remapped) + comment
+        # Fallback: try replacing old data dir prefix with current one
+        # by finding the longest suffix that exists under DATA_DIR
+        for i in range(1, len(parts)):
+            candidate = DATA_DIR / Path(*parts[i:])
+            if candidate.exists():
+                return str(candidate) + comment
+        return val + comment
+
+    new_lines = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        for field in fields:
+            if stripped.startswith(f"{field}:"):
+                after_colon = line.split(":", 1)[1].strip()
+                if after_colon and after_colon[0] == "/":
+                    remapped = _remap(after_colon)
+                    line = f"{field}: {remapped}"
+                break
+        new_lines.append(line)
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix="_data.yaml", delete=False, dir=str(yaml_path.parent)
+    )
+    tmp.write("\n".join(new_lines))
+    tmp.flush()
+    tmp.close()
+    return Path(tmp.name)
+
+
 def _resolve_dataset_yaml(dataset: str, weight_meta: dict | None) -> Path | None:
     """
     Resolve dataset YAML path from multiple fallback locations:
@@ -191,6 +267,8 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
             f"Dataset YAML not found for '{req.dataset}'. "
             "Use GET /api/benchmark/datasets to see available options."
         )
+    # Rewrite absolute paths in data.yaml that may point to another machine
+    data_yaml = _rewrite_yaml_paths(data_yaml)
 
     try:
         model = YOLO(str(pt_path))

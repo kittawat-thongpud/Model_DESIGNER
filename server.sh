@@ -9,7 +9,9 @@
 #   ./server.sh status  — show if session is running
 
 SESSION="model-designer"
-APP_DIR="${APP_DIR:-/workspace/Model_DESIGNER}"
+# Auto-detect APP_DIR from script location; allow override via env var
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="${APP_DIR:-${SCRIPT_DIR}}"
 LOG_FILE="${APP_DIR}/server.log"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
 
