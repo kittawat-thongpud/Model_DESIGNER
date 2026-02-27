@@ -156,6 +156,23 @@ async def get_weight(weight_id: str):
     return record
 
 
+@router.get("/{weight_id}/download", summary="Download weight .pt file")
+async def download_weight(weight_id: str):
+    """Stream the weight.pt file as a file download."""
+    from fastapi.responses import FileResponse
+    pt_path = weight_storage.weight_pt_path(weight_id)
+    if not pt_path.exists():
+        raise HTTPException(status_code=404, detail=f"Weight file not found: {weight_id}")
+    meta = weight_storage.load_weight_meta(weight_id)
+    model_name = (meta or {}).get("model_name", "weight")
+    filename = f"{model_name}_{weight_id[:8]}.pt".replace(" ", "_")
+    return FileResponse(
+        path=str(pt_path),
+        media_type="application/octet-stream",
+        filename=filename,
+    )
+
+
 @router.get("/{weight_id}/lineage", summary="Get weight lineage chain")
 async def get_lineage(weight_id: str):
     """Walk the parent_weight_id chain and return from oldest ancestor to current."""

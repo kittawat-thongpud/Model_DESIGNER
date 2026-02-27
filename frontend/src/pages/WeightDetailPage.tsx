@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { WeightRecord, JobRecord } from '../types';
 import {
   ArrowLeft, Box, Layers, Activity, Terminal, Download,
   Cpu, Database, Clock, Zap, CheckCircle2, Copy, BarChart2,
-  GitBranch, RefreshCw, Play, X,
+  GitBranch, RefreshCw, Play, Upload, X,
 } from 'lucide-react';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -86,6 +86,11 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
   // Continue Training modal state
   const [showTrainModal, setShowTrainModal] = useState(false);
 
+  // Import weight state
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     setLoading(true);
     api.getWeight(weightId).then(async (w) => {
@@ -102,6 +107,29 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
       api.getWeightLineage(w.weight_id).then(setLineage).catch(() => {});
     }).catch(() => {}).finally(() => setLoading(false));
   }, [weightId]);
+
+  const handleExport = () => {
+    if (!weight) return;
+    const filename = `${weight.model_name}_${weight.weight_id.slice(0, 8)}.pt`.replace(/\s+/g, '_');
+    api.downloadWeight(weight.weight_id, filename);
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const result = await api.importWeight(file, file.name.replace(/\.pt[h]?$/, ''));
+      // Navigate to the newly imported weight
+      if (onOpenWeight) onOpenWeight(result.weight_id);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setImporting(false);
+      if (importFileRef.current) importFileRef.current.value = '';
+    }
+  };
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -221,13 +249,45 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
             </div>
           </div>
 
-          <div className="flex gap-3">
+          <div className="flex flex-wrap gap-2">
             <button
               onClick={handleOpenTrainModal}
               className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 cursor-pointer shadow-lg shadow-indigo-500/20"
             >
               <Play size={16} /> Continue Training
             </button>
+
+            {/* Export (Download) */}
+            <button
+              onClick={handleExport}
+              className="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 cursor-pointer shadow-lg shadow-emerald-500/10"
+              title="Download .pt file"
+            >
+              <Download size={16} /> Export .pt
+            </button>
+
+            {/* Import (Upload) */}
+            <label
+              className={`bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 cursor-pointer border border-slate-600 ${importing ? 'opacity-60 cursor-not-allowed' : ''}`}
+              title="Upload a .pt file to import as new weight"
+            >
+              {importing ? <RefreshCw size={16} className="animate-spin" /> : <Upload size={16} />}
+              {importing ? 'Importing…' : 'Import .pt'}
+              <input
+                ref={importFileRef}
+                type="file"
+                accept=".pt,.pth"
+                className="hidden"
+                disabled={importing}
+                onChange={handleImportFile}
+              />
+            </label>
+            {importError && (
+              <div className="w-full text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded px-3 py-1.5 flex items-center gap-2">
+                <X size={12} /> {importError}
+              </div>
+            )}
+
             {onEditWeight && (
               <button
                 onClick={() => onEditWeight(weightId)}
@@ -282,7 +342,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
           <TabItem label="Overview" icon={<Activity size={16} />} active={activeTab === 'overview'} onClick={() => setActiveTab('overview')} />
           <TabItem label="Metrics & Evaluation" icon={<BarChart2 size={16} />} active={activeTab === 'metrics'} onClick={() => setActiveTab('metrics')} />
           <TabItem label="Architecture" icon={<Layers size={16} />} active={activeTab === 'layers'} onClick={() => setActiveTab('layers')} />
-          <TabItem label="Usage Code" icon={<Terminal size={16} />} active={activeTab === 'code'} onClick={() => setActiveTab('code')} />
+          <TabItem label="Lineage" icon={<GitBranch size={16} />} active={activeTab === 'code'} onClick={() => setActiveTab('code')} />
         </div>
 
         {/* ── Tab Content ── */}
@@ -671,21 +731,120 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
             </div>
           )}
 
-          {/* ═══ TAB 4: USAGE CODE ═══ */}
+          {/* ═══ TAB 4: LINEAGE ═══ */}
           {activeTab === 'code' && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 font-mono text-sm relative group">
-              <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button
-                  onClick={() => handleCopy(usageCode)}
-                  className="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded flex items-center gap-2 text-xs border border-slate-700 cursor-pointer"
-                >
-                  <Copy size={14} /> {copied ? 'Copied!' : 'Copy'}
-                </button>
+            <div className="space-y-6">
+              {/* Lineage chain from API */}
+              <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                <h3 className="text-white font-semibold mb-5 flex items-center gap-2">
+                  <GitBranch size={18} className="text-cyan-400" /> Full Lineage Chain
+                </h3>
+                {lineage.length === 0 ? (
+                  <p className="text-slate-500 text-sm">No lineage data available.</p>
+                ) : (
+                  <div className="space-y-0">
+                    {lineage.map((w, i) => {
+                      const isCurrent = w.weight_id === weight.weight_id;
+                      return (
+                        <div key={w.weight_id} className={`flex gap-4 ${i < lineage.length - 1 ? 'pb-4' : ''}`}>
+                          {/* Connector */}
+                          <div className="flex flex-col items-center">
+                            <div className={`w-3 h-3 rounded-full shrink-0 mt-1 ${
+                              isCurrent ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.6)]' : 'bg-indigo-500'
+                            }`} />
+                            {i < lineage.length - 1 && (
+                              <div className="w-px flex-1 bg-slate-700 mt-1" />
+                            )}
+                          </div>
+
+                          {/* Card */}
+                          <div className={`flex-1 rounded-xl border p-4 mb-1 ${
+                            isCurrent
+                              ? 'border-emerald-500/30 bg-emerald-500/5'
+                              : 'border-slate-700/50 bg-slate-800/30'
+                          }`}>
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <div className="flex items-center gap-2 text-sm">
+                                  <span className={`font-semibold ${isCurrent ? 'text-emerald-400' : 'text-white'}`}>
+                                    {w.model_name}
+                                    {isCurrent && (
+                                      <span className="ml-2 text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 rounded px-1.5 py-0.5">Current</span>
+                                    )}
+                                  </span>
+                                  <span className="text-slate-500 font-mono text-xs">{w.weight_id.slice(0, 10)}</span>
+                                </div>
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 mt-1.5">
+                                  <span className="flex items-center gap-1"><Database size={11} /> {w.dataset}</span>
+                                  <span className="flex items-center gap-1"><Activity size={11} /> {w.epochs_trained} epochs{w.total_epochs && w.total_epochs > w.epochs_trained ? ` (${w.total_epochs} cum.)` : ''}</span>
+                                  {w.final_accuracy != null && (
+                                    <span className="text-emerald-400 font-mono">{w.final_accuracy.toFixed(2)}% acc</span>
+                                  )}
+                                  {w.final_loss != null && (
+                                    <span className="text-amber-400/70 font-mono">loss {w.final_loss.toFixed(4)}</span>
+                                  )}
+                                  <span className="flex items-center gap-1"><Clock size={11} /> {new Date(w.created_at).toLocaleDateString()}</span>
+                                </div>
+                              </div>
+                              <div className="flex gap-2 shrink-0">
+                                {!isCurrent && onOpenWeight && (
+                                  <button
+                                    onClick={() => onOpenWeight(w.weight_id)}
+                                    className="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded border border-slate-600 transition-colors cursor-pointer"
+                                  >
+                                    View
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => {
+                                    const fn = `${w.model_name}_${w.weight_id.slice(0, 8)}.pt`.replace(/\s+/g, '_');
+                                    api.downloadWeight(w.weight_id, fn);
+                                  }}
+                                  className="text-xs px-2 py-1 bg-emerald-700/40 hover:bg-emerald-700/60 text-emerald-400 rounded border border-emerald-600/30 transition-colors cursor-pointer flex items-center gap-1"
+                                  title="Download this weight"
+                                >
+                                  <Download size={11} /> .pt
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Training runs within this weight */}
+                            {w.training_runs && w.training_runs.length > 0 && (
+                              <div className="mt-3 pt-3 border-t border-slate-700/50 grid grid-cols-3 gap-2">
+                                {w.training_runs.map((r) => (
+                                  <div key={r.run} className="bg-slate-900/60 rounded-lg p-2 text-center">
+                                    <div className="text-[10px] text-slate-500">Run {r.run}</div>
+                                    <div className="text-xs font-mono text-white">{r.epochs}ep</div>
+                                    {r.accuracy != null && (
+                                      <div className="text-[10px] text-emerald-400 font-mono">{r.accuracy.toFixed(1)}%</div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-              <div className="text-slate-500 mb-4"># Python — Load and use this weight</div>
-              <pre className="text-indigo-300 whitespace-pre-wrap leading-relaxed overflow-x-auto">
-                {usageCode}
-              </pre>
+
+              {/* Usage code */}
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 font-mono text-sm relative group">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="text-slate-500"># Python — Load and use this weight</div>
+                  <button
+                    onClick={() => handleCopy(usageCode)}
+                    className="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded flex items-center gap-2 text-xs border border-slate-700 cursor-pointer"
+                  >
+                    <Copy size={14} /> {copied ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
+                <pre className="text-indigo-300 whitespace-pre-wrap leading-relaxed overflow-x-auto">
+                  {usageCode}
+                </pre>
+              </div>
             </div>
           )}
 

@@ -40,6 +40,8 @@ class TrainConfig(BaseModel):
     seed: int = 0
     deterministic: bool = True
     amp: bool = True                   # automatic mixed precision
+    ema: bool = True                   # exponential moving average of model weights
+    pin_memory: bool = False           # pin dataloader memory (disable in Docker: small /dev/shm)
     close_mosaic: int = 10             # disable mosaic in last N epochs
 
     # ── Optimizer ─────────────────────────────────────────────────────────────

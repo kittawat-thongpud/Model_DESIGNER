@@ -115,6 +115,8 @@ export interface TrainConfig {
   seed: number;
   deterministic: boolean;
   amp: boolean;
+  ema: boolean;
+  pin_memory: boolean;
   close_mosaic: number;
   optimizer: string;
   lr0: number;

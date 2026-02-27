@@ -6,7 +6,7 @@ import type { JobRecord, EpochMetrics } from '../types';
 import { 
   ArrowLeft, Square, Play, RefreshCw, ScrollText, Activity, 
   Timer, ChevronDown, AlertTriangle, Target, ImageIcon, Layers,
-  Zap, HardDrive, PlusCircle
+  Zap, HardDrive, PlusCircle, Download
 } from 'lucide-react';
 import { useWeightsStore } from '../store/weightsStore';
 import { useJobsStore } from '../store/jobsStore';
@@ -329,6 +329,18 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
                 {(job.status === 'completed' || job.status === 'stopped') && (
                   <button onClick={() => { setAppendError(null); setShowAppendModal(true); }} className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-400 border border-indigo-600/30 rounded text-xs font-medium transition-colors cursor-pointer">
                     <PlusCircle size={12} /> Append
+                  </button>
+                )}
+                {job.weight_id && (
+                  <button
+                    onClick={() => {
+                      const fn = `${job.model_name}_${job.weight_id!.slice(0, 8)}.pt`.replace(/\s+/g, '_');
+                      api.downloadWeight(job.weight_id!, fn);
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-600/30 rounded text-xs font-medium transition-colors cursor-pointer"
+                    title="Download trained weight (.pt)"
+                  >
+                    <Download size={12} /> Export .pt
                   </button>
                 )}
                 <div className="relative" ref={refreshMenuRef}>

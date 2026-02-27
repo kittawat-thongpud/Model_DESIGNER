@@ -826,10 +826,50 @@ def _training_worker(
             'weight_interval': config.pop('weight_interval', 1),
             'sample_per_class': config.pop('sample_per_class', 0),
         }
-        
+
+        # ── Pop Model Designer fields that are NOT valid Ultralytics kwargs ───
+        # These are handled manually below rather than passed to model.train().
+        _use_ema = config.pop('ema', True)
+        _pin_memory = config.pop('pin_memory', False)
+
         # Build train kwargs (only valid Ultralytics parameters)
         train_kwargs = {k: v for k, v in config.items() if v != ""}
         train_kwargs["project"] = str(job_dir / "runs")
+
+        # ── Device validation ─────────────────────────────────────────────────
+        # Strip GPU indices that exceed the actual device count so Ultralytics
+        # doesn't raise ValueError (e.g. user set "0,1,2" but only 1 GPU exists).
+        import torch as _torch
+        _device_val = str(train_kwargs.get("device", "")).strip()
+        if _device_val and _device_val not in ("cpu", "mps", ""):
+            _avail = _torch.cuda.device_count()
+            _indices = []
+            for _idx in _device_val.split(","):
+                _idx = _idx.strip()
+                if _idx.isdigit() and int(_idx) < _avail:
+                    _indices.append(_idx)
+            if not _indices:
+                # No valid GPU indices — let Ultralytics pick automatically
+                train_kwargs.pop("device", None)
+                job_storage.append_job_log(job_id, "WARNING",
+                    f"Requested device='{_device_val}' but only {_avail} GPU(s) available. "
+                    "Falling back to automatic device selection.")
+            elif len(_indices) < len([x for x in _device_val.split(",") if x.strip()]):
+                train_kwargs["device"] = ",".join(_indices)
+                job_storage.append_job_log(job_id, "WARNING",
+                    f"Requested device='{_device_val}' but only {_avail} GPU(s) available. "
+                    f"Using device='{train_kwargs['device']}'.")
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── ema / pin_memory note ─────────────────────────────────────────────
+        # Both were already popped from config before train_kwargs was built
+        # (_use_ema, _pin_memory above) because they are NOT valid Ultralytics
+        # kwargs in this version and would raise SyntaxError in the validator.
+        # pin_memory is left to Ultralytics default (False) intentionally to
+        # avoid ConnectionResetError in Docker environments with small /dev/shm.
+        job_storage.append_job_log(job_id, "DEBUG",
+            f"ema={_use_ema}, pin_memory={_pin_memory} (not passed to Ultralytics — handled internally).")
+        # ─────────────────────────────────────────────────────────────────────
         train_kwargs["name"] = "train"
         train_kwargs["exist_ok"] = True
         if resume_path:

@@ -1,84 +1,104 @@
 # Model DESIGNER — RunPod Docker Deployment
 
-## Prerequisites
-- RunPod account with a **Network Volume** (for persistent data)
-- Docker installed locally (for building image)
-- RunPod Pod using template: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
+## Architecture (Project-from-Volume Mode)
+
+```
+Docker Image  ── CUDA runtime + system libs + git + node  (small, rarely rebuilt)
+      │
+      └── mounts ──▶  /workspace  (RunPod Network Volume)
+                           ├── Model_DESIGNER/    ← git clone + venv  (auto on 1st boot)
+                           │     ├── venv/         ← pip install       (auto on 1st boot)
+                           │     └── frontend/dist ← npm build         (auto on 1st boot)
+                           └── data/              ← datasets/weights/jobs (always persists)
+```
+
+**Benefit:** แก้โค้ด → `git pull` บน volume → restart container — ไม่ต้อง rebuild image
 
 ---
 
 ## Quick Start (RunPod)
 
-### 1. Build and push image
+### 1. สร้าง Network Volume
+RunPod → **Storage** → **+ New Network Volume**
+- Name: `model-designer-vol`
+- Size: ≥ 50 GB (20 GB สำหรับ venv + project, ส่วนที่เหลือสำหรับ datasets)
+- Region: เดียวกับ Pod
 
-```bash
-# Build image
-docker build -t your-dockerhub/model-designer:latest .
+### 2. สร้าง Pod
+- **Container Image**: `ghcr.io/kittawat-thongpud/model-designer:latest`
+- **Expose HTTP Port**: `8000`
+- **Volume**: attach `model-designer-vol` → **Mount Path**: `/workspace`
+- **GPU**: เลือกตามต้องการ
 
-# Push to Docker Hub (or any registry RunPod can pull from)
-docker push your-dockerhub/model-designer:latest
+### 3. Environment Variables (ใน Pod settings)
+
+| Variable | ค่า | หมายเหตุ |
+|---|---|---|
+| `APP_DIR` | `/workspace/Model_DESIGNER` | path ของโปรเจค |
+| `DATA_DIR` | `/workspace/data` | path ข้อมูล persistent |
+| `GIT_REPO` | `https://github.com/kittawat-thongpud/Model_DESIGNER` | repo URL |
+| `GIT_BRANCH` | `main` | branch |
+| `PYTHONUNBUFFERED` | `1` | — |
+
+### 4. First Boot (อัตโนมัติ)
+
+entrypoint.sh จะทำสิ่งเหล่านี้อัตโนมัติถ้ายังไม่มีใน volume:
+1. `git clone` โปรเจคลงใน `/workspace/Model_DESIGNER`
+2. `python3 -m venv` + `pip install -r requirements.txt`
+3. `npm install` + `npm run build` (frontend)
+4. สร้าง data directories
+5. เปิด uvicorn server
+
+> **First boot ใช้เวลา ~5-10 นาที** (pip install torch + ultralytics)  
+> **Boot ครั้งถัดไปเร็วทันที** เพราะ venv อยู่บน volume แล้ว
+
+### 5. Access
+
 ```
-
-### 2. Deploy on RunPod
-
-In the RunPod Pod configuration:
-- **Docker Image**: `your-dockerhub/model-designer:latest`
-- **Expose Port**: `8000`
-- **Volume Mount**: Attach your Network Volume → mounted at `/workspace/data`
-- **GPU**: Select desired GPU (RTX 5090, A100, etc.)
-
-Or use **docker-compose** if RunPod supports it:
-
-```bash
-docker-compose up -d
-```
-
-### 3. Access the app
-
-```
-http://<pod-ip>:8000
+https://<pod-id>-8000.proxy.runpod.net
 ```
 
 ---
 
 ## Volume Structure
 
-RunPod Network Volume is mounted at `/workspace/data` inside the container.
-
 ```
-/workspace/data/
-├── datasets/       ← COCO, custom datasets (e.g. datasets/coco/)
-├── models/         ← saved model YAML configs
-├── weights/        ← trained .pt files
-├── jobs/           ← training job logs and checkpoints
-├── exports/        ← exported ONNX / TorchScript models
-├── logs/           ← app logs
-├── modules/        ← custom nn.Module blocks
-└── splits/         ← partition txt file lists (cached)
+/workspace/
+├── Model_DESIGNER/          ← โปรเจค (git clone)
+│   ├── venv/                ← Python virtual environment
+│   ├── backend/
+│   ├── frontend/dist/       ← built React app
+│   └── ...
+└── data/
+    ├── datasets/            ← COCO, custom datasets
+    ├── models/              ← model YAML configs
+    ├── weights/             ← trained .pt files
+    ├── jobs/                ← training logs + checkpoints
+    ├── exports/             ← ONNX / TorchScript
+    ├── logs/                ← app logs
+    ├── modules/             ← custom nn.Module blocks
+    └── splits/              ← partition txt lists (cached)
 ```
-
-> All data persists across container restarts via the network volume.
 
 ---
 
-## Environment Variables
+## Update โค้ด (ไม่ต้อง rebuild image)
 
-| Variable | Default | Description |
-|---|---|---|
-| `DATA_DIR` | `/workspace/data` | Root for all persistent data |
-| `LOG_LEVEL` | `DEBUG` | Logging verbosity |
-| `PYTHONUNBUFFERED` | `1` | Unbuffered Python output |
-
-Override at runtime:
 ```bash
-docker run -e DATA_DIR=/workspace/data -e LOG_LEVEL=INFO ...
+# SSH เข้า Pod แล้วรัน:
+cd /workspace/Model_DESIGNER
+git pull
+
+# Restart container ผ่าน RunPod UI
+# หรือถ้าต้อง rebuild frontend:
+cd frontend && npm run build
 ```
 
 ---
 
 ## COCO Dataset Setup
 
-Place COCO data on the network volume **before** starting training:
+วาง COCO ลงบน network volume ก่อน training:
 
 ```
 /workspace/data/datasets/coco/
@@ -90,23 +110,13 @@ Place COCO data on the network volume **before** starting training:
     └── instances_val2017.json
 ```
 
-The backend auto-converts COCO JSON → YOLO `.txt` labels on first training run.
+Backend จะ auto-convert COCO JSON → YOLO `.txt` labels ใน training run แรก
 
 ---
 
-## Local Development with Docker
+## ถ้า Private Registry (ghcr.io)
 
-```bash
-# Build
-docker build -t model-designer:local .
-
-# Run locally (no GPU)
-docker run -p 8000:8000 \
-  -v $(pwd)/backend/data:/workspace/data \
-  model-designer:local
-
-# Run with GPU
-docker run --gpus all -p 8000:8000 \
-  -v $(pwd)/backend/data:/workspace/data \
-  model-designer:local
-```
+RunPod → Pod settings → **Container Registry Credentials**:
+- Registry: `ghcr.io`
+- Username: `kittawat-thongpud`
+- Password: GitHub PAT (scope: `read:packages`)

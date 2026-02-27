@@ -39,6 +39,7 @@ export default function TrainingConfigDisplay({ config }: TrainingConfigDisplayP
         { key: 'seed', label: 'Seed' },
         { key: 'deterministic', label: 'Deterministic' },
         { key: 'amp', label: 'AMP' },
+        { key: 'ema', label: 'EMA' },
         { key: 'close_mosaic', label: 'Close Mosaic' },
       ],
     },

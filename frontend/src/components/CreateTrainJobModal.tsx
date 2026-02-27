@@ -26,6 +26,8 @@ const DEFAULT_CONFIG: TrainConfig = {
   seed: 0,
   deterministic: true,
   amp: true,
+  ema: true,
+  pin_memory: false,
   close_mosaic: 10,
   optimizer: 'auto',
   lr0: 0.01,
@@ -835,6 +837,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             <Toggle label="Resume Training" checked={Boolean(config.resume)} onChange={v => updateConfig('resume', v)} />
                             <Toggle label="Deterministic" checked={config.deterministic} onChange={v => updateConfig('deterministic', v)} />
                             <Toggle label="AMP (Mixed Precision)" checked={config.amp} onChange={v => updateConfig('amp', v)} />
+                            <Toggle label="EMA (Exponential Moving Average)" checked={Boolean(config.ema)} onChange={v => updateConfig('ema', v)} />
+                            <Toggle label="Pin Memory" checked={Boolean(config.pin_memory)} onChange={v => updateConfig('pin_memory', v)} />
                             <Toggle label="Save Plots" checked={config.plots} onChange={v => updateConfig('plots', v)} />
                             <Toggle label="Validate during training" checked={config.val} onChange={v => updateConfig('val', v)} />
                           </div>

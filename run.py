@@ -39,7 +39,7 @@ def run():
     # Backend command: uvicorn production (no --reload, 1 worker — training uses threads)
     backend_cmd = [
         python_exec, "-m", "uvicorn", "app.main:app",
-        "--host", "0.0.0.0", "--port", "8000",
+        "--host", "0.0.0.0", "--port", "8008",
         "--workers", "1",
     ]
 

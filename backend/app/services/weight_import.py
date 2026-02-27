@@ -134,17 +134,38 @@ def get_weight_groups(weight_id: str) -> list[dict]:
     if not pt_path.exists():
         raise FileNotFoundError(f"Weight file not found: {weight_id}")
 
-    sd: dict = torch.load(str(pt_path), map_location="cpu", weights_only=True)
+    # Try weights_only=True first (safe), fall back to False for full checkpoints
+    try:
+        raw = torch.load(str(pt_path), map_location="cpu", weights_only=True)
+    except Exception:
+        raw = torch.load(str(pt_path), map_location="cpu", weights_only=False)
 
-    # Try to use the original source plugin for better grouping
+    # Try to use the original source plugin for better grouping + extraction
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
         source_name = meta.get("source_plugin", "")
         if source_name:
             from ..plugins.loader import get_weight_source_plugin
             plugin = get_weight_source_plugin(source_name)
-            if plugin:
+            if plugin and plugin.can_parse(raw):
+                sd = plugin.extract_state_dict(raw)
                 return plugin.get_layer_groups(sd)
+
+    # If raw is already a state_dict (plain tensor dict), use it directly
+    if isinstance(raw, dict) and all(isinstance(v, torch.Tensor) for v in list(raw.values())[:5]):
+        sd = raw
+    else:
+        # Try all plugins as fallback
+        from ..plugins.loader import all_weight_source_plugins
+        for plugin in all_weight_source_plugins():
+            try:
+                if plugin.can_parse(raw):
+                    sd = plugin.extract_state_dict(raw)
+                    return plugin.get_layer_groups(sd)
+            except Exception:
+                continue
+        # Last resort: use raw as-is if it's a dict
+        sd = raw if isinstance(raw, dict) else {}
 
     # Fallback: generic grouping by first key segment
     from collections import OrderedDict

@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { WeightRecord, ModelSummary } from '../types';
-import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network } from 'lucide-react';
+import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { fmtSize } from '../utils/format';
 import { useWeightsStore } from '../store/weightsStore';
@@ -25,6 +25,11 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
+  // Import state
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
+
   const load = () => { loadWeights(null, true); };
   useEffect(() => { loadWeights(); }, []);
 
@@ -34,6 +39,24 @@ export default function WeightsPage({ onOpenWeight }: Props) {
     setDeleteTarget(null);
     invalidateWeights();
     load();
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const result = await api.importWeight(file, file.name.replace(/\.pt[h]?$/, ''));
+      invalidateWeights();
+      load();
+      if (onOpenWeight) onOpenWeight(result.weight_id);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setImporting(false);
+      if (importFileRef.current) importFileRef.current.value = '';
+    }
   };
 
   return (
@@ -53,13 +76,41 @@ export default function WeightsPage({ onOpenWeight }: Props) {
               }}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer"
             >
-              <Plus size={14} /> Create Empty Weight
+              <Plus size={14} /> Create Empty
             </button>
+
+            {/* Import .pt */}
+            <label
+              className={`flex items-center gap-2 px-3 py-1.5 text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 rounded-lg transition-colors cursor-pointer ${
+                importing ? 'opacity-60 cursor-not-allowed' : ''
+              }`}
+              title="Upload a .pt file to import"
+            >
+              {importing
+                ? <><RefreshCw size={14} className="animate-spin" /> Importing&hellip;</>
+                : <><Upload size={14} /> Import .pt</>}
+              <input
+                ref={importFileRef}
+                type="file"
+                accept=".pt,.pth"
+                className="hidden"
+                disabled={importing}
+                onChange={handleImportFile}
+              />
+            </label>
+
             <button onClick={load} className="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer">
               <RefreshCw size={14} /> Refresh
             </button>
           </div>
         </div>
+
+        {importError && (
+          <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-2">
+            <X size={12} /> {importError}
+            <button onClick={() => setImportError(null)} className="ml-auto text-slate-500 hover:text-white cursor-pointer"><X size={12} /></button>
+          </div>
+        )}
 
         {loading ? (
           <p className="text-slate-500 text-center py-20">Loading...</p>
@@ -67,7 +118,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
           <div className="text-center py-20">
             <Weight size={48} className="mx-auto text-slate-700 mb-4" />
             <h3 className="text-lg font-semibold text-white mb-2">No weights yet</h3>
-            <p className="text-slate-500">Train a model to save weights here.</p>
+            <p className="text-slate-500">Train a model to save weights here, or import a .pt file.</p>
           </div>
         ) : (
           <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
@@ -81,7 +132,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                   <th className="px-6 py-3 w-24">Accuracy</th>
                   <th className="px-6 py-3 w-24">Size</th>
                   <th className="px-6 py-3 w-36">Created</th>
-                  <th className="px-6 py-3 w-20 text-right">Actions</th>
+                  <th className="px-6 py-3 w-28 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -105,13 +156,31 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                     <td className="px-6 py-4 text-slate-500 text-xs">{fmtSize(w.file_size_bytes)}</td>
                     <td className="px-6 py-4 text-slate-500 text-xs">{new Date(w.created_at).toLocaleDateString()}</td>
                     <td className="px-6 py-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
+                      <div className="flex items-center justify-end gap-1">
                         {onOpenWeight && (
-                          <button onClick={() => onOpenWeight(w.weight_id)} className="p-1.5 text-slate-500 hover:text-indigo-400 cursor-pointer" title="View Details">
+                          <button
+                            onClick={() => onOpenWeight(w.weight_id)}
+                            className="p-1.5 text-slate-500 hover:text-indigo-400 cursor-pointer transition-colors"
+                            title="View Details"
+                          >
                             <Eye size={14} />
                           </button>
                         )}
-                        <button onClick={() => setDeleteTarget(w)} className="p-1.5 text-slate-500 hover:text-red-400 cursor-pointer" title="Delete">
+                        <button
+                          onClick={() => {
+                            const fn = `${w.model_name}_${w.weight_id.slice(0, 8)}.pt`.replace(/\s+/g, '_');
+                            api.downloadWeight(w.weight_id, fn);
+                          }}
+                          className="p-1.5 text-slate-500 hover:text-emerald-400 cursor-pointer transition-colors"
+                          title="Download .pt"
+                        >
+                          <Download size={14} />
+                        </button>
+                        <button
+                          onClick={() => setDeleteTarget(w)}
+                          className="p-1.5 text-slate-500 hover:text-red-400 cursor-pointer transition-colors"
+                          title="Delete"
+                        >
                           <Trash2 size={14} />
                         </button>
                       </div>

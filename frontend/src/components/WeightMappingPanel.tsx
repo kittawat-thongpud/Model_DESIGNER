@@ -64,6 +64,8 @@ export interface MappingPanelProps {
   showImport?: boolean;
   /** Compact mode (no toolbar stats) */
   compact?: boolean;
+  /** Target model_id — used to highlight same-model weights in picker */
+  targetModelId?: string;
 }
 
 export interface MappingPanelHandle {
@@ -108,6 +110,7 @@ export default function WeightMappingPanel({
   showFreezeControls = true,
   showImport = true,
   compact = false,
+  targetModelId,
 }: MappingPanelProps) {
   // ── State ──
   const [sourceWeightId, setSourceWeightId] = useState<string>(initialSourceWeightId || '');
@@ -125,6 +128,7 @@ export default function WeightMappingPanel({
   // System weights for "Select from System" picker
   const [systemWeights, setSystemWeights] = useState<WeightRecord[]>([]);
   const [showSystemPicker, setShowSystemPicker] = useState(false);
+  const [sameModelOnly, setSameModelOnly] = useState(true);
 
   // Pretrained model catalog
   const [pretrained, setPretrained] = useState<PretrainedModelInfo[]>([]);
@@ -458,34 +462,73 @@ export default function WeightMappingPanel({
                 System Weight
               </button>
               {showSystemPicker && (
-                <div className="absolute top-full left-0 mt-1 w-72 bg-slate-900 border border-slate-700 rounded-lg shadow-2xl z-30 max-h-60 overflow-y-auto">
-                  {systemWeights.length === 0 ? (
-                    <div className="px-3 py-4 text-[10px] text-slate-600 text-center">No weights available</div>
-                  ) : (
-                    systemWeights.map((w) => (
+                <div className="absolute top-full left-0 mt-1 w-80 bg-slate-900 border border-slate-700 rounded-lg shadow-2xl z-30 flex flex-col max-h-80">
+                  {/* Filter toolbar */}
+                  {targetModelId && (
+                    <div className="flex items-center gap-2 px-3 py-2 border-b border-slate-800 shrink-0">
                       <button
-                        key={w.weight_id}
-                        onClick={() => {
-                          setSourceWeightId(w.weight_id);
-                          setImportResult(null);
-                          setMappings([]);
-                          setShowSystemPicker(false);
-                        }}
-                        className={`w-full text-left px-3 py-2 hover:bg-slate-800 transition-colors cursor-pointer border-b border-slate-800/50 last:border-0 ${
-                          sourceWeightId === w.weight_id ? 'bg-indigo-500/10' : ''
+                        onClick={() => setSameModelOnly((p) => !p)}
+                        className={`flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                          sameModelOnly
+                            ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30'
+                            : 'bg-slate-800 text-slate-500 border border-slate-700 hover:text-white'
                         }`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs text-white font-medium truncate">{w.model_name}</span>
-                          <span className="text-[9px] text-slate-500 font-mono">{w.weight_id.slice(0, 8)}</span>
-                        </div>
-                        <div className="text-[9px] text-slate-500 mt-0.5">
-                          {w.dataset} · {w.epochs_trained} epochs
-                          {w.final_accuracy != null && <span className="text-emerald-400"> · {w.final_accuracy.toFixed(1)}%</span>}
-                        </div>
+                        Same model only
                       </button>
-                    ))
+                      <span className="text-[9px] text-slate-600">
+                        {(sameModelOnly
+                          ? systemWeights.filter((w) => w.model_id === targetModelId)
+                          : systemWeights
+                        ).length} weights
+                      </span>
+                    </div>
                   )}
+                  <div className="overflow-y-auto flex-1">
+                    {(() => {
+                      const filtered = (sameModelOnly && targetModelId)
+                        ? systemWeights.filter((w) => w.model_id === targetModelId)
+                        : systemWeights;
+                      if (filtered.length === 0) return (
+                        <div className="px-3 py-4 text-[10px] text-slate-600 text-center">
+                          {sameModelOnly && targetModelId
+                            ? 'No weights from the same model. Toggle filter to see all.'
+                            : 'No weights available'}
+                        </div>
+                      );
+                      return filtered.map((w) => {
+                        const isMatch = targetModelId && w.model_id === targetModelId;
+                        return (
+                          <button
+                            key={w.weight_id}
+                            onClick={() => {
+                              setSourceWeightId(w.weight_id);
+                              setImportResult(null);
+                              setMappings([]);
+                              setShowSystemPicker(false);
+                            }}
+                            className={`w-full text-left px-3 py-2 hover:bg-slate-800 transition-colors cursor-pointer border-b border-slate-800/50 last:border-0 ${
+                              sourceWeightId === w.weight_id ? 'bg-indigo-500/10' : ''
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs text-white font-medium truncate">{w.model_name}</span>
+                              <div className="flex items-center gap-1 shrink-0">
+                                {isMatch && (
+                                  <span className="text-[8px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 rounded px-1 py-0.5">same model</span>
+                                )}
+                                <span className="text-[9px] text-slate-500 font-mono">{w.weight_id.slice(0, 8)}</span>
+                              </div>
+                            </div>
+                            <div className="text-[9px] text-slate-500 mt-0.5">
+                              {w.dataset} · {w.epochs_trained} epochs
+                              {w.final_accuracy != null && <span className="text-emerald-400"> · {w.final_accuracy.toFixed(1)}%</span>}
+                            </div>
+                          </button>
+                        );
+                      });
+                    })()}
+                  </div>
                 </div>
               )}
             </div>

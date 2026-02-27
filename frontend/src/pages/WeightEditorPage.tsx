@@ -178,6 +178,7 @@ export default function WeightEditorPage({ weightId, onBack, onOpenWeight }: Pro
           <WeightMappingPanel
             targetWeightId={weightId}
             targetGroupsOverride={annotatedGroups}
+            targetModelId={weight?.model_id}
             showFreezeControls={true}
             showImport={true}
             onMappingsChange={handleMappingsChange}
