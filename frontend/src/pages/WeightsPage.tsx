@@ -32,6 +32,10 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [createScale, setCreateScale] = useState<string>('n');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  // Official YOLO
+  const [createMode, setCreateMode] = useState<'custom' | 'official'>('official');
+  const [yoloVariant, setYoloVariant] = useState<string>('yolov8');
+  const [usePretrained, setUsePretrained] = useState(true);
 
   // Import state
   const [importing, setImporting] = useState(false);
@@ -339,65 +343,176 @@ export default function WeightsPage({ onOpenWeight }: Props) {
 
         {/* Create Empty Weight Modal */}
         {showCreateModal && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[420px] overflow-hidden">
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowCreateModal(false)}>
+            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[480px] overflow-hidden" onClick={e => e.stopPropagation()}>
               <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
                 <h3 className="text-white font-semibold text-sm flex items-center gap-2">
                   <Plus size={16} className="text-indigo-400" />
-                  Create Empty Weight
+                  Create Weight
                 </h3>
                 <button onClick={() => setShowCreateModal(false)} className="text-slate-500 hover:text-white cursor-pointer">
                   <X size={16} />
                 </button>
               </div>
               <div className="p-5 space-y-4">
-                <p className="text-xs text-slate-400">
-                  Generate a randomly-initialised weight file from a model's architecture. No training required.
-                </p>
+                {/* Mode toggle */}
+                <div className="flex gap-1 p-1 bg-slate-800 rounded-lg">
+                  {(['official', 'custom'] as const).map(mode => (
+                    <button
+                      key={mode}
+                      onClick={() => setCreateMode(mode)}
+                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer ${
+                        createMode === mode
+                          ? 'bg-indigo-600 text-white shadow'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {mode === 'official' ? '⚡ Official YOLO' : '🔧 Custom Model'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Official YOLO section */}
+                {createMode === 'official' && (() => {
+                  const ARCH_SCALES: Record<string, string[]> = {
+                    yolov8: ['n','s','m','l','x'],
+                    yolov9: ['t','s','m','c','e'],
+                    yolov10: ['n','s','m','b','l','x'],
+                    yolov11: ['n','s','m','l','x'],
+                    rtdetr: ['l','x'],
+                  };
+                  const availableScales = ARCH_SCALES[yoloVariant] ?? ['n','s','m','l','x'];
+                  const effectiveScale = availableScales.includes(createScale) ? createScale : availableScales[0];
+                  const modelKey = yoloVariant === 'rtdetr' ? `rtdetr-${effectiveScale}` : `${yoloVariant}${effectiveScale}`;
+                  return (
+                  <>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1.5">Architecture</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(['yolov8','yolov9','yolov10','yolov11','rtdetr'] as const).map(v => (
+                          <button
+                            key={v}
+                            onClick={() => {
+                              setYoloVariant(v);
+                              const sc = ARCH_SCALES[v];
+                              if (!sc.includes(createScale)) setCreateScale(sc[0]);
+                            }}
+                            className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ${
+                              yoloVariant === v
+                                ? v === 'rtdetr'
+                                  ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-400'
+                                  : 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                            }`}
+                          >
+                            {v === 'rtdetr' ? 'RT-DETR' : v.replace('yolo', 'YOLO')}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1.5">Scale</label>
+                      <div className="flex gap-1.5">
+                        {availableScales.map(sc => (
+                          <button
+                            key={sc}
+                            onClick={() => setCreateScale(sc)}
+                            className={`flex-1 py-1.5 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                              effectiveScale === sc
+                                ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                            }`}
+                          >
+                            {sc.toUpperCase()}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[10px] text-slate-600 mt-1">
+                        Model: <span className="text-amber-400 font-mono">{modelKey}</span>
+                      </p>
+                    </div>
+                    {/* Pretrained toggle */}
+                    <div className="flex items-center justify-between bg-slate-800/60 rounded-lg px-3 py-2.5">
+                      <div>
+                        <div className="text-xs text-white font-medium">Load Pretrained Weights</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          {usePretrained
+                            ? 'Download COCO-pretrained checkpoint from Ultralytics'
+                            : 'Random initialization — no download needed'}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setUsePretrained(v => !v)}
+                        className={`w-10 h-5.5 rounded-full relative transition-colors cursor-pointer shrink-0 ml-3 ${
+                          usePretrained ? 'bg-amber-500' : 'bg-slate-600'
+                        }`}
+                        style={{ minWidth: '2.5rem', height: '1.375rem' }}
+                      >
+                        <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                          usePretrained ? 'translate-x-5' : 'translate-x-0.5'
+                        }`} />
+                      </button>
+                    </div>
+                    {usePretrained && (
+                      <p className="text-[10px] text-amber-400/80 bg-amber-500/5 border border-amber-500/20 rounded-lg px-3 py-2">
+                        ⚡ Pretrained on COCO — ideal for fine-tuning or transfer learning
+                      </p>
+                    )}
+                  </>
+                  );
+                })()}
+
+                {/* Custom model section */}
+                {createMode === 'custom' && (
+                  <>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Select Model</label>
+                      <select
+                        value={selectedModelId}
+                        onChange={(e) => setSelectedModelId(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none"
+                      >
+                        <option value="">— Choose a model —</option>
+                        {models.map((m) => (
+                          <option key={m.model_id} value={m.model_id}>
+                            {m.name} ({m.layer_count} layers)
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1">Model Scale</label>
+                      <div className="flex gap-1.5">
+                        {['n', 's', 'm', 'l', 'x'].map(sc => (
+                          <button
+                            key={sc}
+                            onClick={() => setCreateScale(sc)}
+                            className={`flex-1 py-1.5 rounded-lg border text-xs font-medium transition-all cursor-pointer ${
+                              createScale === sc
+                                ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                            }`}
+                          >
+                            {sc.toUpperCase()}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {/* Weight name (always shown) */}
                 <div>
-                  <label className="block text-[10px] text-slate-500 mb-1">Weight Name</label>
+                  <label className="block text-[10px] text-slate-500 mb-1">Weight Name <span className="text-slate-600">(optional)</span></label>
                   <input
                     type="text"
                     value={weightName}
                     onChange={(e) => setWeightName(e.target.value)}
-                    placeholder="e.g. MyModel-init"
+                    placeholder={createMode === 'official' ? `e.g. ${yoloVariant === 'rtdetr' ? `rtdetr-${createScale}` : `${yoloVariant}${createScale}`}-finetune` : 'e.g. MyModel-init'}
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none placeholder:text-slate-600"
                   />
                 </div>
-                <div>
-                  <label className="block text-[10px] text-slate-500 mb-1">Select Model</label>
-                  <select
-                    value={selectedModelId}
-                    onChange={(e) => setSelectedModelId(e.target.value)}
-                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none"
-                  >
-                    <option value="">— Choose a model —</option>
-                    {models.map((m) => (
-                      <option key={m.model_id} value={m.model_id}>
-                        {m.name} ({m.layer_count} layers)
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[10px] text-slate-500 mb-1">Model Scale</label>
-                  <div className="flex gap-1.5">
-                    {['n', 's', 'm', 'l', 'x'].map(sc => (
-                      <button
-                        key={sc}
-                        onClick={() => setCreateScale(sc)}
-                        className={`flex-1 py-1.5 rounded-lg border text-xs font-medium transition-all ${
-                          createScale === sc
-                            ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
-                            : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
-                        }`}
-                      >
-                        {sc.toUpperCase()}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="text-[10px] text-slate-600 mt-1">Affects channel width / depth of the generated weights</p>
-                </div>
+
                 {createError && (
                   <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
                     {createError}
@@ -413,11 +528,16 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                 </button>
                 <button
                   onClick={async () => {
-                    if (!selectedModelId) return;
+                    if (createMode === 'custom' && !selectedModelId) return;
                     setCreating(true);
                     setCreateError(null);
                     try {
-                      await api.createEmptyWeight(selectedModelId, weightName, createScale);
+                      if (createMode === 'official') {
+                        const yoloKey = yoloVariant === 'rtdetr' ? `rtdetr-${createScale}` : `${yoloVariant}${createScale}`;
+                        await api.createEmptyWeight('', weightName, createScale, yoloKey, usePretrained);
+                      } else {
+                        await api.createEmptyWeight(selectedModelId, weightName, createScale);
+                      }
                       setShowCreateModal(false);
                       setSelectedModelId('');
                       setWeightName('');
@@ -429,7 +549,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                       setCreating(false);
                     }
                   }}
-                  disabled={!selectedModelId || creating}
+                  disabled={(createMode === 'custom' && !selectedModelId) || creating}
                   className="flex items-center gap-1.5 px-4 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-default"
                 >
                   {creating ? <Loader2 size={12} className="animate-spin" /> : <Network size={12} />}

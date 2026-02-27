@@ -220,9 +220,15 @@ export const api = {
     a.click();
     document.body.removeChild(a);
   },
-  createEmptyWeight: (modelId: string, name?: string, scale?: string) =>
+  createEmptyWeight: (modelId: string, name?: string, scale?: string, yoloModel?: string, usePretrained?: boolean) =>
     post<{ weight_id: string; model_id: string; model_name: string; key_count: number; file_size_bytes: number }>(
-      '/api/weights/create-empty', { model_id: modelId, name: name || '', model_scale: scale || null },
+      '/api/weights/create-empty', {
+        model_id: modelId,
+        name: name || '',
+        model_scale: scale || null,
+        yolo_model: yoloModel || null,
+        use_pretrained: usePretrained ?? true,
+      },
     ),
   inspectWeightKeys: (id: string) => get<{ key: string; node_id: string; shape: number[]; dtype: string; numel: number }[]>(`/api/weights/${id}/keys`),
   getWeightInfo: (id: string) => get<{ params: number; gflops: number | null }>(`/api/weights/${id}/info`),

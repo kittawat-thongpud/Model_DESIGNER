@@ -62,6 +62,8 @@ class ApplyMapRequest(BaseModel):
 
 class CreateEmptyRequest(BaseModel):
     """Create an empty (randomly-initialized) weight from a model architecture."""
-    model_id: str = Field(..., description="Model to instantiate")
+    model_id: str = Field(default="", description="Model to instantiate (custom model ID or empty for YOLO official)")
     name: str = Field(default="", description="Optional display name for the weight")
     model_scale: str | None = Field(default=None, description="Scale variant: n, s, m, l, x")
+    yolo_model: str | None = Field(default=None, description="Official YOLO model key e.g. 'yolov8n', 'yolov8s' (overrides model_id)")
+    use_pretrained: bool = Field(default=True, description="If yolo_model set: load pretrained COCO weights (True) or random init (False)")

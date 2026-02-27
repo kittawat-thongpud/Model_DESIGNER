@@ -23,11 +23,74 @@ router = APIRouter(prefix="/api/weights", tags=["Weights"])
 
 @router.post("/create-empty", summary="Create an empty weight from a model")
 async def create_empty_weight(body: CreateEmptyRequest):
-    """Generate a randomly-initialised weight file from a model's YAML architecture.
+    """Generate a weight file from a model architecture or official YOLO checkpoint.
 
-    Uses Ultralytics YOLO to instantiate the model, then saves its state_dict.
+    - If ``yolo_model`` is set (e.g. 'yolov8n') uses the official Ultralytics model.
+      ``use_pretrained=True`` loads COCO-pretrained weights; False gives random init.
+    - Otherwise uses the custom model YAML identified by ``model_id``.
     """
     import torch
+    from ultralytics import YOLO
+
+    # ── Branch A: Official YOLO model ────────────────────────────────────────
+    if body.yolo_model:
+        yolo_key = body.yolo_model.strip()   # e.g. "yolov8n", "yolov8s"
+        try:
+            if body.use_pretrained:
+                # Downloads pretrained weights from Ultralytics hub if not cached
+                model = YOLO(f"{yolo_key}.pt")
+            else:
+                # Load architecture only (random init) via YAML
+                model = YOLO(f"{yolo_key}.yaml")
+            sd = model.model.state_dict()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to load YOLO model '{yolo_key}': {e}")
+
+        pretrained_label = "pretrained-coco" if body.use_pretrained else "random-init"
+        display_name = body.name.strip() if body.name.strip() else f"{yolo_key}-{pretrained_label}"
+        model_id_meta = f"yolo:{yolo_key}"
+        weight_id = weight_storage.save_weight_meta(
+            model_id=model_id_meta,
+            model_name=display_name,
+            job_id=None,
+            dataset="COCO (pretrained)" if body.use_pretrained else "(empty)",
+            epochs_trained=0,
+            final_accuracy=None,
+            final_loss=None,
+        )
+        pt_path = weight_storage.weight_pt_path(weight_id)
+        ckpt = {
+            "model": model.model,
+            "epoch": -1,
+            "optimizer": None,
+            "train_args": {"model": f"{yolo_key}.pt" if body.use_pretrained else f"{yolo_key}.yaml"},
+            "date": None,
+            "version": None,
+        }
+        torch.save(ckpt, str(pt_path))
+
+        meta = weight_storage.load_weight_meta(weight_id)
+        if meta:
+            meta["file_size_bytes"] = pt_path.stat().st_size
+            meta["key_count"] = len(sd)
+            meta["param_count"] = sum(v.numel() for v in sd.values())
+            weight_storage._store.save(weight_id, meta)
+
+        logger.log("system", "INFO", "Official YOLO weight created", {
+            "weight_id": weight_id, "yolo_model": yolo_key,
+            "pretrained": body.use_pretrained, "keys": len(sd),
+        })
+        return {
+            "weight_id": weight_id,
+            "model_id": model_id_meta,
+            "model_name": display_name,
+            "key_count": len(sd),
+            "file_size_bytes": pt_path.stat().st_size,
+        }
+
+    # ── Branch B: Custom model YAML ───────────────────────────────────────────
+    if not body.model_id:
+        raise HTTPException(status_code=400, detail="Either model_id or yolo_model must be provided")
 
     record = model_storage.load_model(body.model_id)
     if not record:
@@ -38,23 +101,17 @@ async def create_empty_weight(body: CreateEmptyRequest):
         raise HTTPException(status_code=400, detail="No YAML file for this model")
 
     try:
-        from ultralytics import YOLO
         from ..plugins.loader import find_arch_for_yaml
         from ..utils.yaml_utils import prepare_model_yaml
-        
-        # Auto-detect and register custom modules if YAML uses a known arch plugin
+
         arch_plugin = find_arch_for_yaml(str(yaml_path))
         if arch_plugin:
             arch_plugin.register_modules()
-        
-        # Use explicit scale from request, fallback to model record scale
+
         effective_scale = body.model_scale or record.get("scale")
-        # Prepare YAML with scale patching and validation
         patched_yaml = prepare_model_yaml(yaml_path, scale=effective_scale)
         model = YOLO(str(patched_yaml), task=record.get("task", "detect"))
         sd = model.model.state_dict()
-        
-        # Clean up temp file
         Path(patched_yaml).unlink(missing_ok=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Model instantiation failed: {e}")
@@ -70,7 +127,6 @@ async def create_empty_weight(body: CreateEmptyRequest):
         final_loss=None,
     )
     pt_path = weight_storage.weight_pt_path(weight_id)
-    # Save as Ultralytics checkpoint so YOLO(pt_path) works for benchmark/val
     ckpt = {
         "model": model.model,
         "epoch": -1,
@@ -89,11 +145,8 @@ async def create_empty_weight(body: CreateEmptyRequest):
         weight_storage._store.save(weight_id, meta)
 
     logger.log("system", "INFO", "Empty weight created", {
-        "weight_id": weight_id,
-        "model_id": body.model_id,
-        "keys": len(sd),
+        "weight_id": weight_id, "model_id": body.model_id, "keys": len(sd),
     })
-
     return {
         "weight_id": weight_id,
         "model_id": body.model_id,
