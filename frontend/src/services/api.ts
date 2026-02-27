@@ -12,6 +12,8 @@ import type {
   MappingPreview, MappingKey, ApplyMapResult,
   CompatCheckResult, LayerDetailResult,
   LogEntry, DashboardStats,
+  InferenceResult, InferenceHistoryEntry,
+  BenchmarkResult, JobCheckpoint,
 } from '../types';
 
 const API = '';
@@ -34,6 +36,10 @@ function get<T>(path: string): Promise<T> {
 
 function post<T>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
+}
+
+function patch<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined });
 }
 
 function put<T>(path: string, body?: unknown): Promise<T> {
@@ -130,6 +136,29 @@ export const api = {
   deleteDatasetData: (name: string) => del<{ name: string; deleted_dirs: string[]; available: boolean }>(`/api/datasets/${name}/data`),
   startDatasetDownload: (name: string) => post<{ status: string; progress: number; message: string }>(`/api/datasets/${name}/download`, {}),
   getDatasetDownloadStatus: (name: string) => get<{ status: string; progress: number; message: string; current_file?: string; bytes_downloaded?: number; bytes_total?: number }>(`/api/datasets/${name}/download-status`),
+  workspaceScan: (name: string) => get<{ found: boolean; path: string; file_count: number; size_bytes?: number }>(`/api/datasets/${name}/workspace-scan`),
+  importLocal: (name: string) => post<{ status: string; message: string }>(`/api/datasets/${name}/import-local`, {}),
+  downloadFromUrl: (name: string, url: string) => post<{ status: string; message: string }>(`/api/datasets/${name}/download-url`, { url }),
+  uploadDataset: (name: string, file: File, onProgress?: (pct: number, msg: string) => void) => {
+    const form = new FormData();
+    form.append('file', file);
+    return new Promise<{ status: string; message: string }>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `/api/datasets/${name}/upload`);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress) {
+          onProgress(Math.round((e.loaded / e.total) * 50), `Uploading ${(e.loaded / (1024 * 1024)).toFixed(1)} / ${(e.total / (1024 * 1024)).toFixed(1)} MB`);
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
+        else reject(new Error(JSON.parse(xhr.responseText)?.detail || 'Upload failed'));
+      };
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.send(form);
+    });
+  },
+  getDatasetUploadStatus: (name: string) => get<{ status: string; progress: number; message: string; bytes_received?: number }>(`/api/datasets/${name}/upload-status`),
   getDatasetSplits: (name: string) => get<SplitResponse>(`/api/datasets/${name}/splits`),
   saveDatasetSplits: (name: string, body: SplitTransferConfig) =>
     post<SplitResponse>(`/api/datasets/${name}/splits`, body),
@@ -182,6 +211,7 @@ export const api = {
   getWeight: (id: string) => get<WeightRecord>(`/api/weights/${id}`),
   getWeightLineage: (id: string) => get<WeightRecord[]>(`/api/weights/${id}/lineage`),
   deleteWeight: (id: string) => del<{ message: string }>(`/api/weights/${id}`),
+  renameWeight: (id: string, name: string) => patch<WeightRecord>(`/api/weights/${id}/rename`, { name }),
   downloadWeight: (id: string, filename?: string) => {
     const a = document.createElement('a');
     a.href = `/api/weights/${id}/download`;
@@ -195,6 +225,7 @@ export const api = {
       '/api/weights/create-empty', { model_id: modelId, name: name || '', model_scale: scale || null },
     ),
   inspectWeightKeys: (id: string) => get<{ key: string; node_id: string; shape: number[]; dtype: string; numel: number }[]>(`/api/weights/${id}/keys`),
+  getWeightInfo: (id: string) => get<{ params: number; gflops: number | null }>(`/api/weights/${id}/info`),
   extractPartialWeight: (id: string, nodeIds: string[]) =>
     post<{ weight_id: string; keys_extracted: number }>(`/api/weights/${id}/extract`, { node_ids: nodeIds }),
   transferWeights: (targetId: string, sourceId: string, nodeIdMap?: Record<string, string>) =>
@@ -254,4 +285,102 @@ export const api = {
 
   // ── Stats ───────────────────────────────────────────────────────────────
   getStats: () => get<DashboardStats>('/api/stats'),
+
+  // ── Job Checkpoints ─────────────────────────────────────────────────────────
+  listJobCheckpoints: (jobId: string) =>
+    get<{ checkpoints: JobCheckpoint[] }>(`/api/train/${jobId}/checkpoints`),
+  createWeightFromCheckpoint: (jobId: string, checkpointName: string) =>
+    post<{ weight_id: string; model_name: string; checkpoint: string; message: string }>(
+      `/api/train/${jobId}/checkpoints/${encodeURIComponent(checkpointName)}/create-weight-profile`
+    ),
+
+  // ── Weight Export ───────────────────────────────────────────────────────────
+  exportWeight: (weightId: string, body: { format: string; imgsz?: number; device?: string; half?: boolean; simplify?: boolean }) =>
+    post<{ weight_id: string; format: string; exported_path: string; message: string }>(
+      `/api/weights/${weightId}/export`, body
+    ),
+  downloadExportedWeight: (weightId: string, fmt: string) => {
+    const a = document.createElement('a');
+    a.href = `/api/weights/${weightId}/export/download?fmt=${fmt}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+
+  // ── Benchmark ───────────────────────────────────────────────────────────────
+  listBenchmarkDatasets: (weightId?: string) => {
+    const qs = weightId ? `?weight_id=${weightId}` : '';
+    return get<{ label: string; value: string; yaml_path: string; nc: number | null; source: string }[]>(`/api/benchmark/datasets${qs}`);
+  },
+  runBenchmark: (body: { weight_id: string; dataset: string; split?: string; conf?: number; iou?: number; imgsz?: number; batch?: number; device?: string }) =>
+    post<BenchmarkResult>('/api/benchmark/run', body),
+  listBenchmarks: (weightId?: string, limit = 20) => {
+    const qs = weightId ? `?weight_id=${weightId}&limit=${limit}` : `?limit=${limit}`;
+    return get<BenchmarkResult[]>(`/api/benchmark/history${qs}`);
+  },
+  getBenchmark: (id: string) => get<BenchmarkResult>(`/api/benchmark/${id}`),
+  deleteBenchmark: (id: string) => del<{ message: string }>(`/api/benchmark/${id}`),
+
+  // ── Inference ───────────────────────────────────────────────────────────────
+  predictImages: async (weightId: string, files: File[], conf = 0.25, iou = 0.45, imgsz = 640): Promise<InferenceResult> => {
+    const formData = new FormData();
+    formData.append('weight_id', weightId);
+    formData.append('conf', String(conf));
+    formData.append('iou', String(iou));
+    formData.append('imgsz', String(imgsz));
+    files.forEach(f => formData.append('files', f));
+    const res = await fetch('/api/inference/predict', { method: 'POST', body: formData });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  getInferenceHistory: (limit = 50) => get<InferenceHistoryEntry[]>(`/api/inference/history?limit=${limit}`),
+  clearInferenceHistory: () => del<{ message: string }>('/api/inference/history'),
+  deleteInferenceEntry: (id: string) => del<{ message: string }>(`/api/inference/history/${id}`),
+
+  // ── Packages (.mdpkg) ───────────────────────────────────────────────────
+  exportWeightPackage: (weightId: string, includeJobs = false) => {
+    const a = document.createElement('a');
+    a.href = `/api/packages/weights/${weightId}/export?include_jobs=${includeJobs}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+  exportJobPackage: (jobId: string, includeJobs = false) => {
+    const a = document.createElement('a');
+    a.href = `/api/packages/jobs/${jobId}/export?include_jobs=${includeJobs}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+  peekPackage: async (
+    file: File,
+  ): Promise<{ version: string; weights: { id: string; model_name: string; dataset: string; epochs_trained: number }[]; jobs: string[] }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/api/packages/peek', { method: 'POST', body: formData });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  importPackage: async (
+    file: File,
+    renameMap: Record<string, string> = {},
+    includeJobs = false,
+  ): Promise<{ weights_imported: { old_id: string; new_id: string; name: string }[]; jobs_imported: { old_id: string; new_id: string }[]; errors: string[] }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('rename_map', JSON.stringify(renameMap));
+    formData.append('include_jobs', String(includeJobs));
+    const res = await fetch('/api/packages/import', { method: 'POST', body: formData });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
 };

@@ -56,6 +56,16 @@ class DatasetPlugin(ABC):
     def is_available(self) -> bool:
         return False
 
+    @property
+    def manual_download(self) -> bool:
+        """True if dataset cannot be auto-downloaded and requires user upload."""
+        return False
+
+    @property
+    def upload_instructions(self) -> str:
+        """Instructions shown in the upload dialog for manual-download datasets."""
+        return ""
+
     def download(self, state: dict) -> None:
         raise NotImplementedError
 

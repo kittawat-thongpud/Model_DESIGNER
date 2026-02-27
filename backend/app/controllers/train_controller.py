@@ -291,6 +291,87 @@ async def get_class_sample(job_id: str, class_name: str, filename: str):
     return FileResponse(sample_path, media_type="image/jpeg")
 
 
+@router.get("/{job_id}/checkpoints", summary="List available checkpoints for a job")
+async def list_checkpoints(job_id: str):
+    """List best.pt and last.pt checkpoints available for export or profile creation."""
+    from pathlib import Path
+    from ..config import JOBS_DIR
+
+    job_dir = JOBS_DIR / job_id
+    weights_dir = job_dir / "runs" / "train" / "weights"
+
+    checkpoints = []
+    for name in ("best.pt", "last.pt"):
+        p = weights_dir / name
+        if p.exists():
+            checkpoints.append({
+                "name": name,
+                "path": str(p),
+                "size_bytes": p.stat().st_size,
+                "modified_at": p.stat().st_mtime,
+            })
+
+    return {"checkpoints": checkpoints}
+
+
+@router.post("/{job_id}/checkpoints/{checkpoint_name}/create-weight-profile",
+             summary="Create a weight profile from a job checkpoint")
+async def create_weight_from_checkpoint(job_id: str, checkpoint_name: str):
+    """Save best.pt or last.pt from a job as a named weight profile in the weight library."""
+    import torch
+    from pathlib import Path
+    from ..config import JOBS_DIR
+    from ..services import weight_storage
+
+    job = job_storage.load_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job not found: {job_id}")
+
+    weights_dir = JOBS_DIR / job_id / "runs" / "train" / "weights"
+    src = weights_dir / checkpoint_name
+    if not src.exists():
+        raise HTTPException(404, f"Checkpoint '{checkpoint_name}' not found for job {job_id}")
+
+    label = "best" if "best" in checkpoint_name else "last"
+    profile_name = f"{job.get('model_name', job_id)} ({label})"
+
+    weight_id = weight_storage.save_weight_meta(
+        model_id=job.get("model_id", ""),
+        model_name=profile_name,
+        job_id=job_id,
+        dataset=job.get("dataset_name") or job.get("config", {}).get("data", ""),
+        epochs_trained=job.get("epoch", 0),
+        final_accuracy=job.get("best_mAP50"),
+        final_loss=None,
+        model_scale=job.get("model_scale"),
+        total_time=job.get("total_time"),
+        device=job.get("config", {}).get("device", ""),
+    )
+
+    import shutil
+    dest = weight_storage.weight_pt_path(weight_id)
+    shutil.copy2(str(src), str(dest))
+
+    meta = weight_storage.load_weight_meta(weight_id)
+    if meta:
+        try:
+            sd = torch.load(str(dest), map_location="cpu", weights_only=True)
+            meta["key_count"] = len(sd)
+            meta["param_count"] = sum(v.numel() for v in sd.values() if hasattr(v, "numel"))
+        except Exception:
+            pass
+        meta["file_size_bytes"] = dest.stat().st_size
+        weight_storage._store.save(weight_id, meta)
+
+    return {
+        "weight_id": weight_id,
+        "model_name": profile_name,
+        "checkpoint": checkpoint_name,
+        "job_id": job_id,
+        "message": f"Weight profile created from {checkpoint_name}",
+    }
+
+
 @router.get("/{job_id}/metrics", summary="Get system metrics for a job")
 async def get_job_metrics(job_id: str):
     """Get current system metrics (GPU, CPU, RAM) for monitoring."""

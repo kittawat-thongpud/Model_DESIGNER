@@ -132,11 +132,15 @@ def create_app() -> FastAPI:
     from .controllers.stats_controller import router as stats_router
     from .controllers.stream_controller import router as stream_router
     from .controllers.system_controller import router as system_router
+    from .controllers.inference_controller import router as inference_router
+    from .controllers.benchmark_controller import router as benchmark_router
+    from .controllers.package_controller import router as package_router
 
     for router in (
         model_router, module_router, train_router,
         dataset_router, dataset_samples_router, job_router,
-        weight_router, snapshot_router, log_router, stats_router, stream_router, system_router
+        weight_router, snapshot_router, log_router, stats_router, stream_router, system_router,
+        inference_router, benchmark_router, package_router,
     ):
         application.include_router(router)
 

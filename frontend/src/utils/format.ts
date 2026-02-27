@@ -36,6 +36,41 @@ export function timeAgo(iso: string): string {
   return `${days}d ago`;
 }
 
+/**
+ * Extract a short, human-readable dataset name from a raw value.
+ * Handles:
+ *   - Full paths: "/home/.../jobs/abc123/data.yaml" → resolved via datasetName fallback
+ *   - Dataset dir paths: "/home/.../datasets/coco128/data.yaml" → "coco128"
+ *   - Plain names: "coco128" → "coco128"
+ *
+ * @param raw       raw config.data value (path or name)
+ * @param datasetName  optional pre-resolved dataset name from job.dataset_name
+ */
+export function fmtDataset(raw: string | null | undefined, datasetName?: string | null): string {
+  if (!raw && !datasetName) return '—';
+  // If we have a pre-resolved human-readable name, prefer it
+  if (datasetName) return datasetName;
+  if (!raw) return '—';
+  // If it's a path ending in data.yaml or *.yaml
+  if (raw.includes('/') || raw.includes('\\')) {
+    const normalized = raw.replace(/\\/g, '/');
+    // datasets dir: .../datasets/<name>/data.yaml or <name>.yaml
+    const dsMatch = normalized.match(/\/datasets\/([^/]+)\//);
+    if (dsMatch) return dsMatch[1];
+    // job dir: .../jobs/<job_id>/data.yaml — can't determine dataset, show placeholder
+    const jobMatch = normalized.match(/\/jobs\/([a-f0-9]{8,})\//);
+    if (jobMatch) return 'custom dataset';
+    // fallback: parent directory name
+    const parts = normalized.split('/').filter(Boolean);
+    const filename = parts[parts.length - 1];
+    if (filename.endsWith('.yaml') || filename.endsWith('.yml')) {
+      return parts[parts.length - 2] || filename;
+    }
+    return parts[parts.length - 1];
+  }
+  return raw;
+}
+
 /** Format megabytes to human-readable memory size (MB / GB). */
 export function fmtMem(mb: number | null | undefined): string {
   if (mb == null) return '—';

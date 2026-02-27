@@ -9,14 +9,16 @@ import {
   Server 
 } from 'lucide-react';
 import { TrainConfig } from '../types';
+import { fmtDataset } from '../utils/format';
 
 interface JobConfigurationProps {
   config: TrainConfig;
+  datasetName?: string | null;
   partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean}>;
   modelScale?: string;
 }
 
-const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, partitions, modelScale }) => {
+const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName, partitions, modelScale }) => {
   const [showConfig, setShowConfig] = useState(false);
 
   // Helper to safely access config values
@@ -121,9 +123,9 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, partitions,
               </div>
               <div className="mt-4 pt-2 border-t border-slate-800">
                 <span className="text-xs text-slate-500 block mb-1">Dataset</span>
-                <code className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 break-all block border border-slate-800">
-                  {getValue('data')}
-                </code>
+                <span className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 block border border-slate-800">
+                  {fmtDataset(getValue('data') as string, datasetName)}
+                </span>
               </div>
               {partitions && partitions.length > 0 && (
                 <div className="mt-4 pt-2 border-t border-slate-800">

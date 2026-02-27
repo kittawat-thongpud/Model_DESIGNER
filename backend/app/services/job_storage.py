@@ -82,66 +82,78 @@ def get_job_history(job_id: str) -> list[dict]:
     # Try extended_metrics.jsonl first (most comprehensive)
     if extended_metrics_path.exists():
         try:
-            history = []
+            raw_rows = []
             with open(extended_metrics_path, 'r') as f:
                 for line in f:
                     if line.strip():
                         data = json.loads(line)
-                        # Extended metrics already has all fields we need
-                        # Just rename some keys for frontend compatibility
-                        epoch_metrics = {
-                            "epoch": data.get("epoch"),
-                            "timestamp": data.get("timestamp"),
-                            
-                            # Training losses
-                            "box_loss": data.get("train_box_loss"),
-                            "cls_loss": data.get("train_cls_loss"),
-                            "dfl_loss": data.get("train_dfl_loss"),
-                            
-                            # Validation losses
-                            "val_box_loss": data.get("val_box_loss"),
-                            "val_cls_loss": data.get("val_cls_loss"),
-                            "val_dfl_loss": data.get("val_dfl_loss"),
-                            
-                            # Validation metrics
-                            "mAP50": data.get("map50"),
-                            "mAP50_95": data.get("map"),
-                            "mAP75": data.get("map75"),
-                            "precision": data.get("precision"),
-                            "recall": data.get("recall"),
-                            "fitness": data.get("fitness"),
-                            
-                            # Per-class metrics
-                            "ap_per_class": data.get("ap_per_class"),
-                            "ap50_per_class": data.get("ap50_per_class"),
-                            "precision_per_class": data.get("precision_per_class"),
-                            "recall_per_class": data.get("recall_per_class"),
-                            "f1_per_class": data.get("f1_per_class"),
-                            
-                            # Latency metrics
-                            "inference_latency_ms": data.get("inference_latency_ms"),
-                            "preprocess_latency_ms": data.get("preprocess_latency_ms"),
-                            "postprocess_latency_ms": data.get("postprocess_latency_ms"),
-                            "total_latency_ms": data.get("total_latency_ms"),
-                            
-                            # System info
-                            "device": data.get("device"),
-                            "ram_gb": data.get("ram_gb"),
-                            "gpu_mem_gb": data.get("gpu_mem_gb"),
-                            "gpu_mem_reserved_gb": data.get("gpu_mem_reserved_gb"),
-                            
-                            # Learning rate
-                            "lr": data.get("lr"),
-                            
-                            # Timing
-                            "val_time_s": data.get("val_time_s"),
-                        }
-                        
-                        # Remove None values
-                        epoch_metrics = {k: v for k, v in epoch_metrics.items() if v is not None}
-                        if epoch_metrics.get("epoch"):
-                            history.append(epoch_metrics)
-            
+                        if data.get("epoch"):
+                            raw_rows.append(data)
+
+            history = []
+            prev_ts: float | None = None
+            for data in raw_rows:
+                ts = data.get("timestamp")
+                # Compute per-epoch time from timestamp diff
+                if ts is not None and prev_ts is not None:
+                    epoch_time = float(ts) - prev_ts
+                else:
+                    epoch_time = None
+                prev_ts = float(ts) if ts is not None else prev_ts
+
+                epoch_metrics = {
+                    "epoch": data.get("epoch"),
+                    "timestamp": ts,
+
+                    # Training losses
+                    "box_loss": data.get("train_box_loss"),
+                    "cls_loss": data.get("train_cls_loss"),
+                    "dfl_loss": data.get("train_dfl_loss"),
+
+                    # Validation losses
+                    "val_box_loss": data.get("val_box_loss"),
+                    "val_cls_loss": data.get("val_cls_loss"),
+                    "val_dfl_loss": data.get("val_dfl_loss"),
+
+                    # Validation metrics
+                    "mAP50": data.get("map50"),
+                    "mAP50_95": data.get("map"),
+                    "mAP75": data.get("map75"),
+                    "precision": data.get("precision"),
+                    "recall": data.get("recall"),
+                    "fitness": data.get("fitness"),
+
+                    # Per-class metrics
+                    "ap_per_class": data.get("ap_per_class"),
+                    "ap50_per_class": data.get("ap50_per_class"),
+                    "precision_per_class": data.get("precision_per_class"),
+                    "recall_per_class": data.get("recall_per_class"),
+                    "f1_per_class": data.get("f1_per_class"),
+
+                    # Latency metrics
+                    "inference_latency_ms": data.get("inference_latency_ms"),
+                    "preprocess_latency_ms": data.get("preprocess_latency_ms"),
+                    "postprocess_latency_ms": data.get("postprocess_latency_ms"),
+                    "total_latency_ms": data.get("total_latency_ms"),
+
+                    # System info
+                    "device": data.get("device"),
+                    "ram_gb": data.get("ram_gb"),
+                    "gpu_mem_gb": data.get("gpu_mem_gb"),
+                    "gpu_mem_reserved_gb": data.get("gpu_mem_reserved_gb"),
+
+                    # Learning rate
+                    "lr": data.get("lr"),
+
+                    # Timing — per-epoch (not cumulative)
+                    "epoch_time": epoch_time,
+                    "val_time_s": data.get("val_time_s"),
+                }
+
+                # Remove None values
+                epoch_metrics = {k: v for k, v in epoch_metrics.items() if v is not None}
+                history.append(epoch_metrics)
+
             if history:
                 return history
         except Exception as e:
@@ -167,24 +179,37 @@ def get_job_history(job_id: str) -> list[dict]:
                                 epoch_data[key] = value
                     
                     if epoch_data:
-                        # Rename keys to match frontend expectations
-                        metrics = {
-                            "epoch": int(epoch_data.get("epoch", 0)),
-                            "box_loss": epoch_data.get("train/box_loss"),
-                            "cls_loss": epoch_data.get("train/cls_loss"),
-                            "dfl_loss": epoch_data.get("train/dfl_loss"),
-                            "precision": epoch_data.get("metrics/precision(B)"),
-                            "recall": epoch_data.get("metrics/recall(B)"),
-                            "mAP50": epoch_data.get("metrics/mAP50(B)"),
-                            "mAP50_95": epoch_data.get("metrics/mAP50-95(B)"),
-                            "val_box_loss": epoch_data.get("val/box_loss"),
-                            "val_cls_loss": epoch_data.get("val/cls_loss"),
-                            "val_dfl_loss": epoch_data.get("val/dfl_loss"),
-                            "epoch_time": epoch_data.get("time"),
-                            "lr": epoch_data.get("lr/pg0"),
-                        }
-                        # Remove None values
-                        history.append({k: v for k, v in metrics.items() if v is not None})
+                        # results.csv 'time' is cumulative seconds — store raw for now
+                        history.append(epoch_data)
+
+            # Convert cumulative 'time' → per-epoch time by diffing consecutive rows
+            prev_cum = 0.0
+            parsed = []
+            for epoch_data in history:
+                cum_time = epoch_data.get("time")
+                if cum_time is not None:
+                    per_epoch = float(cum_time) - prev_cum
+                    prev_cum = float(cum_time)
+                else:
+                    per_epoch = None
+
+                metrics = {
+                    "epoch": int(epoch_data.get("epoch", 0)),
+                    "box_loss": epoch_data.get("train/box_loss"),
+                    "cls_loss": epoch_data.get("train/cls_loss"),
+                    "dfl_loss": epoch_data.get("train/dfl_loss"),
+                    "precision": epoch_data.get("metrics/precision(B)"),
+                    "recall": epoch_data.get("metrics/recall(B)"),
+                    "mAP50": epoch_data.get("metrics/mAP50(B)"),
+                    "mAP50_95": epoch_data.get("metrics/mAP50-95(B)"),
+                    "val_box_loss": epoch_data.get("val/box_loss"),
+                    "val_cls_loss": epoch_data.get("val/cls_loss"),
+                    "val_dfl_loss": epoch_data.get("val/dfl_loss"),
+                    "epoch_time": per_epoch,
+                    "lr": epoch_data.get("lr/pg0"),
+                }
+                parsed.append({k: v for k, v in metrics.items() if v is not None})
+            history = parsed
             
             if history:
                 return history

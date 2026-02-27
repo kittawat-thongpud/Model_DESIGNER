@@ -17,6 +17,7 @@ import WeightEditorPage from './pages/WeightEditorPage';
 import DatasetsPage from './pages/DatasetsPage';
 import DatasetDetailPage from './pages/DatasetDetailPage';
 import JobDetailPage from './pages/JobDetailPage';
+import InferencePage from './pages/InferencePage';
 import ToastContainer from './components/ToastContainer';
 import type { PageName } from './types';
 
@@ -120,6 +121,7 @@ export default function App() {
         {currentPage === 'dataset-detail' && selectedDatasetName && (
           <DatasetDetailPage datasetName={selectedDatasetName} onBack={handleBackFromDataset} />
         )}
+        {currentPage === 'inference' && <InferencePage />}
       </main>
       <ToastContainer />
     </div>

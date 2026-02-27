@@ -70,7 +70,16 @@ async def create_empty_weight(body: CreateEmptyRequest):
         final_loss=None,
     )
     pt_path = weight_storage.weight_pt_path(weight_id)
-    torch.save(sd, str(pt_path))
+    # Save as Ultralytics checkpoint so YOLO(pt_path) works for benchmark/val
+    ckpt = {
+        "model": model.model,
+        "epoch": -1,
+        "optimizer": None,
+        "train_args": {},
+        "date": None,
+        "version": None,
+    }
+    torch.save(ckpt, str(pt_path))
 
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
@@ -97,7 +106,11 @@ async def create_empty_weight(body: CreateEmptyRequest):
 @router.get("/", summary="List all saved weights")
 async def list_weights(model_id: str | None = None):
     """Return all weight metadata, optionally filtered by parent model."""
-    return weight_storage.list_weights(model_id=model_id)
+    records = weight_storage.list_weights(model_id=model_id)
+    for r in records:
+        if not r.get("dataset_name"):
+            r["dataset_name"] = weight_storage.resolve_dataset_name(r)
+    return records
 
 
 # ── Weight Source Plugins (must be before /{weight_id} to avoid shadowing) ──
@@ -151,9 +164,31 @@ async def download_pretrained(body: dict):
 async def get_weight(weight_id: str):
     """Return full weight metadata including parent model and job info."""
     record = weight_storage.load_weight_meta(weight_id)
+    if record and not record.get("dataset_name"):
+        record["dataset_name"] = weight_storage.resolve_dataset_name(record)
     if not record:
         raise HTTPException(status_code=404, detail=f"Weight '{weight_id}' not found")
     return record
+
+
+@router.get("/{weight_id}/info", summary="Get model params and GFLOPs from weight file")
+async def get_weight_info(weight_id: str):
+    """Load the .pt file via Ultralytics YOLO and return parameter count + GFLOPs."""
+    pt_path = weight_storage.weight_pt_path(weight_id)
+    if not pt_path.exists():
+        raise HTTPException(status_code=404, detail=f"Weight file not found: {weight_id}")
+    try:
+        from ultralytics import YOLO
+        from ultralytics.utils.torch_utils import get_flops
+        yolo = YOLO(str(pt_path))
+        params = sum(p.numel() for p in yolo.model.parameters())
+        try:
+            gflops = get_flops(yolo.model, imgsz=640)
+        except Exception:
+            gflops = None
+        return {"params": params, "gflops": round(gflops, 2) if gflops is not None else None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{weight_id}/download", summary="Download weight .pt file")
@@ -189,6 +224,21 @@ async def delete_weight(weight_id: str):
         logger.log("system", "INFO", f"Weight deleted", {"weight_id": weight_id})
         return {"message": f"Weight '{weight_id}' deleted"}
     raise HTTPException(status_code=404, detail=f"Weight '{weight_id}' not found")
+
+
+@router.patch("/{weight_id}/rename", summary="Rename a weight")
+async def rename_weight(weight_id: str, body: dict):
+    """Update model_name for a weight record."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    meta = weight_storage.load_weight_meta(weight_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Weight '{weight_id}' not found")
+    meta["model_name"] = name
+    weight_storage._store.save(weight_id, meta)
+    logger.log("system", "INFO", "Weight renamed", {"weight_id": weight_id, "name": name})
+    return meta
 
 
 # ── Partial weight operations ──────────────────────────────────────────────
@@ -723,3 +773,77 @@ async def layer_detail(weight_id: str, key: str, bins: int = 50):
         "histogram": histogram,
         "tensor_map": tensor_map,
     }
+
+
+# ── Export ─────────────────────────────────────────────────────────────────
+
+class ExportWeightRequest(BaseModel):
+    format: str = "onnx"            # onnx | torchscript | engine | tflite | coreml
+    imgsz: int = 640
+    device: str = ""                # "" = auto
+    half: bool = False
+    simplify: bool = True           # ONNX simplify
+
+
+@router.post("/{weight_id}/export", summary="Export weight to ONNX / TorchScript / etc.")
+async def export_weight(weight_id: str, body: ExportWeightRequest):
+    """Export a weight .pt file using Ultralytics model.export()."""
+    import asyncio
+
+    meta = weight_storage.load_weight_meta(weight_id)
+    if not meta:
+        raise HTTPException(404, f"Weight '{weight_id}' not found")
+
+    pt_path = weight_storage.weight_pt_path(weight_id)
+    if not pt_path.exists():
+        raise HTTPException(404, f"Weight file missing: {weight_id}")
+
+    def _export():
+        import torch
+        from ultralytics import YOLO
+        model = YOLO(str(pt_path))
+        device = body.device
+        if not device:
+            device = "0" if torch.cuda.is_available() else "cpu"
+        exported = model.export(
+            format=body.format,
+            imgsz=body.imgsz,
+            device=device,
+            half=body.half,
+            simplify=body.simplify,
+            verbose=False,
+        )
+        return str(exported)
+
+    try:
+        exported_path = await asyncio.to_thread(_export)
+        logger.log("system", "INFO", "Weight exported", {
+            "weight_id": weight_id, "format": body.format, "path": exported_path,
+        })
+        return {
+            "weight_id": weight_id,
+            "format": body.format,
+            "exported_path": exported_path,
+            "message": f"Exported as {body.format}",
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Export failed: {e}")
+
+
+@router.get("/{weight_id}/export/download", summary="Download exported file")
+async def download_exported(weight_id: str, fmt: str = "onnx"):
+    """Stream an already-exported file for the given format."""
+    from fastapi.responses import FileResponse
+    pt_path = weight_storage.weight_pt_path(weight_id)
+    ext_map = {
+        "onnx": ".onnx", "torchscript": ".torchscript",
+        "engine": ".engine", "tflite": ".tflite", "coreml": ".mlpackage",
+    }
+    ext = ext_map.get(fmt, f".{fmt}")
+    exported = pt_path.with_suffix(ext)
+    if not exported.exists():
+        raise HTTPException(404, f"No exported {fmt} file found. Export it first.")
+    meta = weight_storage.load_weight_meta(weight_id)
+    name = (meta or {}).get("model_name", "weight")
+    filename = f"{name}_{weight_id[:8]}{ext}".replace(" ", "_")
+    return FileResponse(path=str(exported), media_type="application/octet-stream", filename=filename)

@@ -15,7 +15,8 @@ export type PageName =
   | 'weight-detail'
   | 'weight-editor'
   | 'datasets'
-  | 'dataset-detail';
+  | 'dataset-detail'
+  | 'inference';
 
 // ─── Module Designer (custom nn.Module blocks) ──────────────────────────────
 
@@ -192,6 +193,7 @@ export interface JobRecord {
   model_name: string;
   model_scale?: string;
   task?: string;
+  dataset_name?: string;
   status: string;
   epoch: number;
   total_epochs: number;
@@ -387,6 +389,7 @@ export interface WeightRecord {
   model_name: string;
   job_id: string | null;
   dataset: string;
+  dataset_name?: string;
   epochs_trained: number;
   total_epochs?: number;
   final_accuracy: number | null;
@@ -555,6 +558,111 @@ export interface LogEntry {
   category: string;
   message: string;
   data?: Record<string, unknown>;
+}
+
+// ─── Inference ───────────────────────────────────────────────────────────────
+
+export interface InferenceDetection {
+  class_id: number;
+  class_name: string;
+  confidence: number;
+  bbox: [number, number, number, number];
+  top_classes: { class_id: number; class_name: string; score: number }[];
+}
+
+export interface InferenceImageResult {
+  detections: InferenceDetection[];
+  image_b64: string | null;
+  preprocess_ms: number;
+  inference_ms: number;
+  postprocess_ms: number;
+  total_ms: number;
+}
+
+export interface InferenceClassSummary {
+  class_id: number;
+  class_name: string;
+  count: number;
+  max_conf: number;
+  avg_conf: number;
+}
+
+export interface InferenceResult {
+  weight_id: string;
+  source_name: string;
+  image_count: number;
+  total_detections: number;
+  elapsed_ms: number;
+  avg_latency_ms: number;
+  fps: number;
+  class_summary: InferenceClassSummary[];
+  images: InferenceImageResult[];
+}
+
+export interface InferenceHistoryEntry {
+  id: string;
+  timestamp: string;
+  weight_id: string;
+  source_name: string;
+  image_count: number;
+  total_detections: number;
+  avg_latency_ms: number;
+  fps: number;
+  class_summary: InferenceClassSummary[];
+  conf: number;
+  iou: number;
+  imgsz: number;
+  type: 'image' | 'video';
+}
+
+// ─── Benchmark ───────────────────────────────────────────────────────────────
+
+export interface BenchmarkPerClass {
+  class_id: number;
+  class_name: string;
+  ap50: number | null;
+  ap50_95: number | null;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
+}
+
+export interface BenchmarkConfusionMatrix {
+  matrix: number[][];
+  names: string[];
+}
+
+export interface BenchmarkResult {
+  benchmark_id: string;
+  weight_id: string;
+  dataset: string;
+  split: string;
+  timestamp: string;
+  elapsed_s: number;
+  mAP50: number | null;
+  mAP50_95: number | null;
+  precision: number | null;
+  recall: number | null;
+  fitness: number | null;
+  per_class: BenchmarkPerClass[];
+  confusion_matrix: BenchmarkConfusionMatrix | null;
+  preprocess_ms: number;
+  inference_ms: number;
+  postprocess_ms: number;
+  params: number | null;
+  flops_gflops: number | null;
+  conf: number;
+  iou: number;
+  imgsz: number;
+}
+
+// ─── Export ──────────────────────────────────────────────────────────────────
+
+export interface JobCheckpoint {
+  name: string;
+  path: string;
+  size_bytes: number;
+  modified_at: number;
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────────

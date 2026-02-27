@@ -16,7 +16,44 @@ from ..config import WEIGHTS_DIR
 from . import weight_storage
 
 
-# ── Ultralytics checkpoint unwrapping ────────────────────────────────────────
+# ── Ultralytics checkpoint unwrapping / saving ───────────────────────────────
+
+def _save_state_dict(sd: dict, pt_path: Path) -> None:
+    """Save a flat state_dict back to disk, preserving checkpoint format if the
+    original file was an Ultralytics checkpoint (has a 'model' key).
+
+    If the original was a plain state_dict, save as-is.
+    If it was an Ultralytics checkpoint, load the original, update the model's
+    state_dict in-place, and save back the full checkpoint so YOLO() can load it.
+    """
+    if not pt_path.exists():
+        torch.save(sd, pt_path)
+        return
+
+    try:
+        original = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except Exception:
+        torch.save(sd, pt_path)
+        return
+
+    if isinstance(original, dict) and "model" in original:
+        model_obj = original["model"]
+        import torch.nn as nn
+        if isinstance(model_obj, nn.Module):
+            # Add back 'model.' prefix that was stripped by _load_state_dict_safe
+            prefixed = {f"model.{k}": v for k, v in sd.items()}
+            model_obj.load_state_dict(prefixed, strict=False)
+            torch.save(original, pt_path)
+            return
+        elif isinstance(model_obj, dict):
+            prefixed = {f"model.{k}": v for k, v in sd.items()}
+            original["model"] = prefixed
+            torch.save(original, pt_path)
+            return
+
+    # Plain state_dict fallback
+    torch.save(sd, pt_path)
+
 
 def _load_state_dict_safe(pt_path: Path) -> dict:
     """Load a .pt file and return a flat state_dict.
@@ -25,6 +62,22 @@ def _load_state_dict_safe(pt_path: Path) -> dict:
       - Plain state_dict files (legacy Model DESIGNER format)
       - Ultralytics checkpoint files (nested dict with 'model' key)
     """
+    # Ensure backend/ is in sys.path so custom packages (e.g. hsg_det) are importable
+    import sys as _sys
+    _backend_dir = str(Path(__file__).resolve().parents[2])
+    if _backend_dir not in _sys.path:
+        _sys.path.insert(0, _backend_dir)
+    # Register all arch plugin custom modules before loading
+    try:
+        from ..plugins.loader import all_arch_plugins
+        for _ap in all_arch_plugins():
+            try:
+                _ap.register_modules()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
 
     # Already a flat state_dict (all values are tensors)
@@ -36,10 +89,16 @@ def _load_state_dict_safe(pt_path: Path) -> dict:
         model_obj = data["model"]
         # If it's an nn.Module, extract state_dict
         if hasattr(model_obj, "state_dict"):
-            return model_obj.state_dict()
+            sd = model_obj.state_dict()
         # If it's already a dict (state_dict)
-        if isinstance(model_obj, dict):
-            return model_obj
+        elif isinstance(model_obj, dict):
+            sd = model_obj
+        else:
+            sd = {}
+        # Strip Ultralytics 'model.' prefix so keys are '0.conv.weight' not 'model.0.conv.weight'
+        if sd and all(k.startswith("model.") for k in list(sd.keys())[:10]):
+            sd = {k[len("model."):]: v for k, v in sd.items()}
+        return sd
 
     # Fallback: try weights_only=True for strict state_dict loading
     try:
@@ -156,8 +215,8 @@ def transfer_weights(
             tgt_sd[k] = src_sd[k]
             matched_keys.append(k)
 
-    # Save updated target
-    torch.save(tgt_sd, tgt_path)
+    # Save updated target (preserving original checkpoint format)
+    _save_state_dict(tgt_sd, tgt_path)
 
     return len(matched_keys), len(tgt_sd), matched_keys
 
@@ -579,8 +638,8 @@ def apply_mapping(
         node_id = tgt_key.split(".")[0] if "." in tgt_key else tgt_key
         applied_node_ids.add(node_id)
 
-    # Save updated target
-    torch.save(tgt_sd, tgt_path)
+    # Save updated target (preserving original checkpoint format)
+    _save_state_dict(tgt_sd, tgt_path)
 
     return {
         "applied": len(applied_keys),

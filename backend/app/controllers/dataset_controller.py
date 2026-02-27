@@ -11,7 +11,9 @@ import shutil
 import threading
 
 import numpy as np
-from fastapi import APIRouter, HTTPException
+import asyncio
+import tempfile
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from torch.utils.data import Subset
 
 from datetime import datetime, timezone
@@ -182,6 +184,9 @@ async def dataset_status(name: str):
     available = plugin.is_available() if plugin else False
 
     result: dict = {"name": key, "available": available}
+    if plugin:
+        result["manual_download"] = getattr(plugin, "manual_download", False)
+        result["instructions"] = getattr(plugin, "upload_instructions", "")
     meta = _load_meta(key)
     if meta:
         result["meta"] = meta
@@ -329,6 +334,318 @@ def _bg_download(name: str):
         state["status"] = "error"
         state["progress"] = 0
         state["message"] = f"Error: {e}"
+
+
+# ── Workspace scan + local import ────────────────────────────────────────────
+
+@router.get("/{name}/workspace-scan", summary="Check if dataset files exist in workspace")
+async def workspace_scan(name: str):
+    """Scan DATASETS_DIR for existing files without plugin availability check."""
+    _get_plugin(name)  # 404 if not registered
+    key = name.lower()
+    dest = DATASETS_DIR / key
+    if not dest.exists():
+        return {"found": False, "path": str(dest), "file_count": 0}
+    files = list(dest.rglob("*"))
+    file_count = sum(1 for f in files if f.is_file())
+    size_bytes = sum(f.stat().st_size for f in files if f.is_file())
+    return {"found": file_count > 0, "path": str(dest), "file_count": file_count, "size_bytes": size_bytes}
+
+
+@router.post("/{name}/import-local", summary="Index an already-extracted dataset from workspace")
+async def import_local(name: str):
+    """Build index and scan metadata for a dataset already present in DATASETS_DIR."""
+    key = name.lower()
+    plugin = _get_plugin(key)
+    state: dict = {"status": "indexing", "progress": 10, "message": "Scanning workspace..."}
+    _upload_tasks[key] = state
+
+    def _bg():
+        try:
+            state["message"] = "Building index..."
+            state["progress"] = 40
+            if hasattr(plugin, "rebuild_index"):
+                plugin.rebuild_index()
+            state["progress"] = 80
+            state["message"] = "Scanning metadata..."
+            _invalidate_cache(key)
+            _scan_dataset_meta(key)
+            state["status"] = "complete"
+            state["progress"] = 100
+            state["message"] = "Dataset ready!"
+        except Exception as e:
+            state["status"] = "error"
+            state["progress"] = 0
+            state["message"] = f"Import failed: {e}"
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return {"status": "indexing", "message": "Indexing started"}
+
+
+# ── URL download (manual datasets: Google Drive, direct link, etc.) ───────────
+
+@router.post("/{name}/download-url", summary="Download dataset from a URL")
+async def download_from_url(name: str, body: dict):
+    """Start a background download from a user-supplied URL (e.g. Google Drive)."""
+    key = name.lower()
+    _get_plugin(key)
+    url: str = body.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    with _download_lock:
+        existing = _download_tasks.get(key)
+        if existing and existing["status"] == "downloading":
+            raise HTTPException(status_code=409, detail="Download already in progress")
+        _download_tasks[key] = {
+            "status": "downloading", "progress": 0,
+            "message": "Starting download...",
+            "current_file": "", "bytes_downloaded": 0, "bytes_total": 0,
+            "rate_bps": 0, "eta_seconds": -1, "files": {},
+            "total_files": 1, "completed_files": 0,
+        }
+
+    threading.Thread(target=_bg_url_download, args=(key, url), daemon=True).start()
+    return _download_tasks[key]
+
+
+def _bg_url_download(name: str, url: str):
+    """Download from URL, detect Google Drive links, extract, index."""
+    import os, re
+    from pathlib import Path as _Path
+
+    state = _download_tasks[name]
+    try:
+        # Resolve Google Drive share links → direct download URL
+        gdrive = re.match(r'https://drive\.google\.com/file/d/([^/]+)', url)
+        gdrive_folder = re.match(r'https://drive\.google\.com/drive/folders/([^?]+)', url)
+        if gdrive:
+            file_id = gdrive.group(1)
+            url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+        elif gdrive_folder:
+            state["status"] = "error"
+            state["message"] = "Google Drive folder links not supported. Share individual file links."
+            return
+
+        state["message"] = "Connecting..."
+        import urllib.request, time as _time
+
+        dest_dir = DATASETS_DIR / name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine filename from URL or Content-Disposition
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            cd = resp.headers.get("Content-Disposition", "")
+            fname_match = re.search(r'filename[^;=\n]*=([\'"]?)([^\n;"\']+)\1', cd)
+            if fname_match:
+                fname = fname_match.group(2).strip()
+            else:
+                fname = url.split("?")[0].split("/")[-1] or "dataset.zip"
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            state["bytes_total"] = total
+
+            tmp_path = dest_dir / f"_download_{fname}"
+            received = 0
+            t0 = _time.time()
+            with open(tmp_path, "wb") as f:
+                while True:
+                    chunk = resp.read(4 * 1024 * 1024)  # 4 MB chunks
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    elapsed = max(_time.time() - t0, 0.001)
+                    state["bytes_downloaded"] = received
+                    state["rate_bps"] = int(received / elapsed)
+                    state["progress"] = int(received / total * 50) if total else 10
+                    state["message"] = f"Downloading {received // (1024*1024):.0f} / {total // (1024*1024):.0f} MB"
+                    state["eta_seconds"] = int((total - received) / state["rate_bps"]) if state["rate_bps"] > 0 and total > 0 else -1
+
+        state["progress"] = 50
+        state["message"] = "Extracting..."
+
+        # Extract
+        lower = fname.lower()
+        if lower.endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(tmp_path) as zf:
+                zf.extractall(dest_dir)
+        elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+            import tarfile
+            with tarfile.open(tmp_path) as tf:
+                tf.extractall(dest_dir, filter="data")
+        else:
+            # Not an archive — treat as-is (e.g. already extracted via some other means)
+            pass
+
+        tmp_path.unlink(missing_ok=True)
+
+        # Flatten single root dir
+        subdirs = [d for d in dest_dir.iterdir() if d.is_dir() and not d.name.startswith("_")]
+        if len(subdirs) == 1:
+            inner = subdirs[0]
+            for item in list(inner.iterdir()):
+                target = dest_dir / item.name
+                if not target.exists():
+                    shutil.move(str(item), str(target))
+            try:
+                inner.rmdir()
+            except Exception:
+                pass
+
+        state["progress"] = 85
+        state["message"] = "Building index..."
+
+        plugin = get_dataset_plugin(name)
+        if plugin and hasattr(plugin, "rebuild_index"):
+            plugin.rebuild_index()
+
+        _invalidate_cache(name)
+        _scan_dataset_meta(name)
+        state["status"] = "complete"
+        state["progress"] = 100
+        state["message"] = "Dataset ready!"
+
+    except Exception as e:
+        state["status"] = "error"
+        state["progress"] = 0
+        state["message"] = f"Download failed: {e}"
+
+
+# ── Upload with progress ─────────────────────────────────────────────────────
+
+_upload_tasks: dict[str, dict] = {}
+_upload_lock = threading.Lock()
+
+
+@router.post("/{name}/upload", summary="Upload a dataset archive (zip/tar)")
+async def upload_dataset(
+    name: str,
+    file: UploadFile = File(...),
+):
+    """Stream-upload a zip/tar.gz archive, extract into the dataset directory."""
+    key = name.lower()
+    plugin = _get_plugin(key)
+
+    with _upload_lock:
+        existing = _upload_tasks.get(key)
+        if existing and existing["status"] == "uploading":
+            raise HTTPException(status_code=409, detail="Upload already in progress")
+        _upload_tasks[key] = {
+            "status": "uploading",
+            "progress": 0,
+            "message": "Receiving file...",
+            "bytes_received": 0,
+        }
+
+    state = _upload_tasks[key]
+
+    # Stream file to a temp location using large buffer for max local throughput
+    suffix = (file.filename or "upload.bin")
+    suffix = "." + suffix.split(".")[-1] if "." in suffix else ".bin"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            # Use shutil.copyfileobj with 4 MB buffer — fastest for local/LAN transfers
+            await asyncio.to_thread(
+                shutil.copyfileobj, file.file, tmp, 4 * 1024 * 1024
+            )
+            state["bytes_received"] = tmp.tell()
+            state["message"] = f"Received {state['bytes_received'] // (1024*1024):.1f} MB"
+    except Exception as e:
+        state["status"] = "error"
+        state["message"] = f"Upload failed: {e}"
+        raise HTTPException(status_code=500, detail=str(e))
+
+    state["message"] = "Extracting archive..."
+    state["progress"] = 50
+
+    thread = threading.Thread(
+        target=_bg_extract,
+        args=(key, tmp_path, state),
+        daemon=True,
+    )
+    thread.start()
+    return {"status": "extracting", "message": "Upload received, extracting..."}
+
+
+@router.get("/{name}/upload-status", summary="Poll dataset upload/extract progress")
+async def upload_status_endpoint(name: str):
+    key = name.lower()
+    state = _upload_tasks.get(key)
+    if not state:
+        return {"status": "idle", "progress": 0, "message": ""}
+    return state
+
+
+def _bg_extract(name: str, archive_path: str, state: dict):
+    """Background: extract archive → dataset dir → scan meta."""
+    import os
+    from pathlib import Path as _Path
+
+    try:
+        dest = DATASETS_DIR / name
+        dest.mkdir(parents=True, exist_ok=True)
+
+        arc = _Path(archive_path)
+        lower = arc.name.lower()
+
+        state["message"] = "Extracting..."
+        state["progress"] = 55
+
+        if lower.endswith(".zip"):
+            import zipfile
+            state["progress"] = 60
+            with zipfile.ZipFile(arc) as zf:
+                zf.extractall(dest)
+        elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+            import tarfile
+            state["progress"] = 60
+            with tarfile.open(arc) as tf:
+                tf.extractall(dest, filter="data")
+        else:
+            raise ValueError(f"Unsupported archive format: {arc.name}")
+        state["progress"] = 88
+
+        # Flatten single-root-dir extraction (e.g. idd/ inside zip)
+        subdirs = [d for d in dest.iterdir() if d.is_dir()]
+        if len(subdirs) == 1 and not any(dest.iterdir().__next__() == d for d in [dest / "images", dest / "labels", dest / "annotations"]):
+            inner = subdirs[0]
+            # Move contents up one level if the subdir name matches dataset name or common names
+            inner_items = list(inner.iterdir())
+            for item in inner_items:
+                target = dest / item.name
+                if not target.exists():
+                    shutil.move(str(item), str(target))
+            try:
+                inner.rmdir()
+            except Exception:
+                pass
+
+        state["progress"] = 90
+        state["message"] = "Building index..."
+
+        # Let plugin rebuild index
+        plugin = get_dataset_plugin(name)
+        if plugin and hasattr(plugin, "rebuild_index"):
+            plugin.rebuild_index()
+
+        _invalidate_cache(name)
+        _scan_dataset_meta(name)
+
+        state["status"] = "complete"
+        state["progress"] = 100
+        state["message"] = "Dataset ready!"
+
+    except Exception as e:
+        state["status"] = "error"
+        state["progress"] = 0
+        state["message"] = f"Extraction failed: {e}"
+    finally:
+        try:
+            os.unlink(archive_path)
+        except Exception:
+            pass
 
 
 # ── Split config helpers ─────────────────────────────────────────────────────

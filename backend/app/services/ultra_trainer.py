@@ -63,12 +63,17 @@ def start_training(
     if partition_configs is None:
         partition_configs = []
 
+    # Resolve human-readable dataset name from config.data
+    _data_arg = config.get("data", "")
+    _dataset_name = _data_arg if (_data_arg and dataset_registry.is_image_dataset(_data_arg)) else ""
+
     job = {
         "job_id": job_id,
         "model_id": model_id,
         "model_name": model_name,
         "task": task,
         "config": config,
+        "dataset_name": _dataset_name,  # human-readable dataset name
         "partition_configs": partition_configs,
         "model_scale": model_scale,  # Store scale in job record
         "status": "pending",
@@ -491,6 +496,7 @@ def _training_worker(
         
         # Resolve dataset: if 'data' is a registered dataset name, generate data.yaml
         data_arg = config.get("data", "")
+        dataset_name = data_arg if (data_arg and dataset_registry.is_image_dataset(data_arg)) else ""
         if data_arg and dataset_registry.is_image_dataset(data_arg):
             # Generate data.yaml in job dir with selected partition split configurations
             # Generate data.yaml in job dir
@@ -523,6 +529,7 @@ def _training_worker(
                     partition_configs=partition_configs if partition_configs else None
                 )
                 config["data"] = str(data_yaml_path)
+                config["dataset_name"] = dataset_name  # preserve original name
                 job_storage.append_job_log(job_id, "INFO", f"Using generated config: {data_yaml_path}")
             except Exception as e:
                 job_storage.append_job_log(job_id, "ERROR", f"Failed to generate data.yaml: {e}")
@@ -1564,12 +1571,15 @@ def _save_best_weight(job_id: str, job_dir: Path, model_name: str = "") -> str |
             pass
     
     # Save weight metadata with lineage
+    # Prefer dataset_name (original registered name) over full path
+    _cfg = job.get("config", {})
+    _dataset = _cfg.get("dataset_name") or _cfg.get("data", "")
     weight_storage.save_weight_meta(
         model_id=job.get("model_id", ""),
         model_name=model_name,
         model_scale=job.get("model_scale", "n"),
         job_id=job_id,
-        dataset=job.get("config", {}).get("data", ""),
+        dataset=_dataset,
         epochs_trained=job.get("total_epochs", 0),
         final_accuracy=final_accuracy,
         final_loss=final_loss,

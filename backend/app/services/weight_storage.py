@@ -173,6 +173,43 @@ def get_lineage(weight_id: str, max_depth: int = 20) -> list[dict]:
     return chain
 
 
+def resolve_dataset_name(meta: dict) -> str:
+    """Return a human-readable dataset name for a weight record.
+
+    Priority:
+    1. meta["dataset"] if it looks like a plain name (no path separators)
+    2. Extract from ``/datasets/<name>/`` pattern in meta["dataset"]
+    3. Read the job data.yaml ``path:`` field and extract dataset dir name
+    4. Fallback to empty string
+    """
+    import re as _re
+    import yaml as _yaml
+
+    raw = meta.get("dataset", "")
+    if raw and "/" not in raw and "\\" not in raw:
+        return raw
+
+    if raw:
+        normalized = raw.replace("\\", "/")
+        m = _re.search(r"/datasets/([^/]+)/", normalized)
+        if m:
+            return m.group(1)
+
+        # raw is a path to a job data.yaml — read it to get 'path:' field
+        try:
+            p = Path(raw)
+            if p.exists():
+                content = _yaml.safe_load(p.read_text())
+                yaml_path_field = str(content.get("path", "")).replace("\\", "/")
+                m2 = _re.search(r"/datasets/([^/]+)$", yaml_path_field)
+                if m2:
+                    return m2.group(1)
+        except Exception:
+            pass
+
+    return ""
+
+
 def delete_weight(weight_id: str) -> bool:
     """Delete entire weight folder."""
     existed = _store.delete(weight_id)

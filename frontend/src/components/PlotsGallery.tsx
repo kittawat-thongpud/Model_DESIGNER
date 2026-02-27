@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Image, Download, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Image, Download, X, ChevronLeft, ChevronRight, ImageOff } from 'lucide-react';
 import { api } from '../services/api';
 
 interface PlotsGalleryProps {
@@ -12,11 +12,50 @@ interface PlotInfo {
   size: number;
 }
 
+function PlotThumbnail({ src, alt, onClick }: { src: string; alt: string; onClick: () => void }) {
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>('loading');
+  return (
+    <div
+      className="aspect-video bg-slate-900 relative overflow-hidden cursor-pointer"
+      onClick={onClick}
+    >
+      {/* Skeleton while loading */}
+      {status === 'loading' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
+          <div className="w-10 h-10 rounded-full border-2 border-slate-700 border-t-indigo-500 animate-spin" />
+          <span className="text-[10px] text-slate-600 font-mono">loading…</span>
+        </div>
+      )}
+      {/* Error state */}
+      {status === 'error' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-600">
+          <ImageOff size={24} />
+          <span className="text-xs">Failed to load</span>
+        </div>
+      )}
+      <img
+        src={src}
+        alt={alt}
+        onLoad={() => setStatus('loaded')}
+        onError={() => setStatus('error')}
+        className={`w-full h-full object-contain transition-opacity duration-300 ${status === 'loaded' ? 'opacity-100' : 'opacity-0'}`}
+      />
+      {/* Hover overlay */}
+      {status === 'loaded' && (
+        <div className="absolute inset-0 bg-black/0 hover:bg-black/25 transition-all flex items-center justify-center">
+          <Image className="w-7 h-7 text-white opacity-0 group-hover:opacity-100 transition-opacity" />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function PlotsGallery({ jobId }: PlotsGalleryProps) {
   const [plots, setPlots] = useState<PlotInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedPlot, setSelectedPlot] = useState<PlotInfo | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [lightboxLoaded, setLightboxLoaded] = useState(false);
 
   useEffect(() => {
     loadPlots();
@@ -49,16 +88,21 @@ export default function PlotsGallery({ jobId }: PlotsGalleryProps) {
 
   const navigatePlot = (direction: 'prev' | 'next') => {
     if (!plots.length) return;
-    
     let newIndex = selectedIndex;
     if (direction === 'prev') {
       newIndex = selectedIndex > 0 ? selectedIndex - 1 : plots.length - 1;
     } else {
       newIndex = selectedIndex < plots.length - 1 ? selectedIndex + 1 : 0;
     }
-    
     setSelectedIndex(newIndex);
     setSelectedPlot(plots[newIndex]);
+    setLightboxLoaded(false);
+  };
+
+  const openLightboxAt = (plot: PlotInfo, index: number) => {
+    setSelectedPlot(plot);
+    setSelectedIndex(index);
+    setLightboxLoaded(false);
   };
 
   const downloadPlot = (plot: PlotInfo) => {
@@ -101,36 +145,27 @@ export default function PlotsGallery({ jobId }: PlotsGalleryProps) {
         {plots.map((plot, index) => (
           <div
             key={plot.name}
-            className="bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 transition-all cursor-pointer group"
-            onClick={() => openLightbox(plot, index)}
+            className="bg-slate-800 rounded-xl overflow-hidden hover:ring-2 hover:ring-indigo-500 transition-all cursor-pointer group border border-slate-700/50"
           >
-            <div className="aspect-video bg-gray-900 relative">
-              <img
-                src={getPlotUrl(plot.name)}
-                alt={plot.name}
-                className="w-full h-full object-contain"
-              />
-              <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-30 transition-all flex items-center justify-center">
-                <Image className="w-8 h-8 text-white opacity-0 group-hover:opacity-100 transition-opacity" />
-              </div>
-            </div>
+            <PlotThumbnail
+              src={getPlotUrl(plot.name)}
+              alt={plot.name}
+              onClick={() => openLightboxAt(plot, index)}
+            />
             <div className="p-3">
               <div className="flex items-center justify-between">
                 <h4 className="text-sm font-medium text-white truncate">
                   {getPlotTitle(plot.name)}
                 </h4>
                 <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    downloadPlot(plot);
-                  }}
-                  className="p-1 hover:bg-gray-700 rounded transition-colors"
+                  onClick={(e) => { e.stopPropagation(); downloadPlot(plot); }}
+                  className="p-1 hover:bg-slate-700 rounded transition-colors"
                   title="Download"
                 >
-                  <Download className="w-4 h-4 text-gray-400" />
+                  <Download className="w-4 h-4 text-slate-400" />
                 </button>
               </div>
-              <div className="text-xs text-gray-500 mt-1">
+              <div className="text-xs text-slate-500 mt-1">
                 {(plot.size / 1024).toFixed(1)} KB
               </div>
             </div>
@@ -193,11 +228,19 @@ export default function PlotsGallery({ jobId }: PlotsGalleryProps) {
                   Download
                 </button>
               </div>
-              <div className="p-4 bg-black">
+              <div className="p-4 bg-black relative min-h-[200px] flex items-center justify-center">
+                {!lightboxLoaded && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black">
+                    <div className="w-10 h-10 rounded-full border-2 border-slate-700 border-t-indigo-400 animate-spin" />
+                    <span className="text-xs text-slate-500">Loading image…</span>
+                  </div>
+                )}
                 <img
+                  key={selectedPlot.name}
                   src={getPlotUrl(selectedPlot.name)}
                   alt={selectedPlot.name}
-                  className="w-full h-auto max-h-[70vh] object-contain mx-auto"
+                  onLoad={() => setLightboxLoaded(true)}
+                  className={`w-full h-auto max-h-[70vh] object-contain mx-auto transition-opacity duration-300 ${lightboxLoaded ? 'opacity-100' : 'opacity-0'}`}
                 />
               </div>
             </div>

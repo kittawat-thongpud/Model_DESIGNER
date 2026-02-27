@@ -3,7 +3,7 @@ import { api } from '../services/api';
 import type { DatasetInfo, DatasetMeta } from '../types';
 import {
   Database, CheckCircle, XCircle, ArrowRight, Search,
-  Download, Loader2, AlertCircle, Trash2, HardDrive, RefreshCw,
+  Download, Loader2, AlertCircle, Trash2, HardDrive, Upload, Link, FolderSearch,
 } from 'lucide-react';
 import { useDatasetsStore } from '../store/datasetsStore';
 
@@ -34,6 +34,22 @@ interface DownloadState {
   completed_files?: number;
 }
 
+interface UploadState {
+  status: 'idle' | 'uploading' | 'extracting' | 'complete' | 'error' | 'indexing';
+  progress: number;
+  message: string;
+  bytesReceived?: number;
+}
+
+type InstallMethod = 'choose' | 'workspace' | 'upload' | 'url';
+
+interface WorkspaceScan {
+  scanning: boolean;
+  found: boolean;
+  file_count: number;
+  size_bytes: number;
+}
+
 interface StatusInfo {
   available: boolean;
   manual?: boolean;
@@ -53,6 +69,13 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
   const [downloadTarget, setDownloadTarget] = useState<DatasetInfo | null>(null);
   const [dlState, setDlState] = useState<DownloadState>({ status: 'idle', progress: 0, message: '' });
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Upload state
+  const [uploadState, setUploadState] = useState<UploadState>({ status: 'idle', progress: 0, message: '' });
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [installMethod, setInstallMethod] = useState<InstallMethod>('choose');
+  const [urlInput, setUrlInput] = useState('');
+  const [wsScan, setWsScan] = useState<WorkspaceScan>({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
 
   // Delete dialog
   const [deleteTarget, setDeleteTarget] = useState<DatasetInfo | null>(null);
@@ -90,13 +113,30 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, []);
 
-  const handleCardClick = (ds: DatasetInfo) => {
+  const handleCardClick = async (ds: DatasetInfo) => {
     const st = statuses[ds.name];
     if (st?.available) {
       onOpenDataset?.(ds.name);
+      return;
+    }
+    setDownloadTarget(ds);
+    setDlState({ status: 'idle', progress: 0, message: '' });
+    setUploadState({ status: 'idle', progress: 0, message: '' });
+    setInstallMethod('choose');
+    setUrlInput('');
+    // Scan workspace first
+    const isManualDs = statuses[ds.name]?.manual;
+    if (isManualDs) {
+      setWsScan({ scanning: true, found: false, file_count: 0, size_bytes: 0 });
+      try {
+        const r = await api.workspaceScan(ds.name);
+        setWsScan({ scanning: false, found: r.found, file_count: r.file_count, size_bytes: r.size_bytes ?? 0 });
+        if (r.found) setInstallMethod('workspace');
+      } catch {
+        setWsScan({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
+      }
     } else {
-      setDownloadTarget(ds);
-      setDlState({ status: 'idle', progress: 0, message: '' });
+      setWsScan({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
     }
   };
 
@@ -116,6 +156,95 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
 
   const isManual = downloadTarget ? statuses[downloadTarget.name]?.manual : false;
   const manualInstructions = downloadTarget ? statuses[downloadTarget.name]?.instructions : undefined;
+
+  const handleImportLocal = useCallback(async () => {
+    if (!downloadTarget) return;
+    const name = downloadTarget.name;
+    setUploadState({ status: 'indexing', progress: 10, message: 'Indexing workspace files...' });
+    try {
+      await api.importLocal(name);
+    } catch (e: unknown) {
+      setUploadState({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Import failed' });
+      return;
+    }
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await api.getDatasetUploadStatus(name);
+        setUploadState({ status: s.status as UploadState['status'], progress: s.progress, message: s.message });
+        if (s.status === 'complete' || s.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          if (s.status === 'complete') {
+            const fresh = await api.getDatasetStatus(name).catch(() => null);
+            if (fresh) setStatuses(prev => ({ ...prev, [name]: { ...prev[name], available: true, meta: fresh.meta } }));
+          }
+        }
+      } catch { /* ignore */ }
+    }, 800);
+  }, [downloadTarget]);
+
+  const handleUrlDownload = useCallback(async () => {
+    if (!downloadTarget || !urlInput.trim()) return;
+    const name = downloadTarget.name;
+    try {
+      await api.downloadFromUrl(name, urlInput.trim());
+    } catch (e: unknown) {
+      setDlState({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Failed to start download' });
+      return;
+    }
+    setDlState({ status: 'downloading', progress: 0, message: 'Starting download...' });
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await api.getDatasetDownloadStatus(name) as DownloadState & Record<string, unknown>;
+        setDlState({ status: s.status, progress: s.progress, message: s.message, rate_bps: s.rate_bps as number | undefined, eta_seconds: s.eta_seconds as number | undefined });
+        if (s.status === 'complete') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          const fresh = await api.getDatasetStatus(name).catch(() => null);
+          if (fresh) setStatuses(prev => ({ ...prev, [name]: { ...prev[name], available: true, meta: fresh.meta } }));
+        } else if (s.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      } catch { /* ignore */ }
+    }, 600);
+  }, [downloadTarget, urlInput]);
+
+  const handleUpload = useCallback(async (file: File) => {
+    if (!downloadTarget) return;
+    const name = downloadTarget.name;
+    setUploadState({ status: 'uploading', progress: 0, message: 'Starting upload...' });
+    try {
+      await api.uploadDataset(name, file, (pct, msg) => {
+        setUploadState({ status: 'uploading', progress: pct, message: msg });
+      });
+    } catch (e: unknown) {
+      setUploadState({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Upload failed' });
+      return;
+    }
+    // Poll extract progress
+    setUploadState({ status: 'extracting', progress: 50, message: 'Extracting archive...' });
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await api.getDatasetUploadStatus(name);
+        setUploadState({ status: s.status as UploadState['status'], progress: s.progress, message: s.message, bytesReceived: s.bytes_received });
+        if (s.status === 'complete') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          try {
+            const fresh = await api.getDatasetStatus(name);
+            setStatuses(prev => ({ ...prev, [name]: { ...prev[name], available: true, meta: fresh.meta } }));
+          } catch { /* ignore */ }
+        } else if (s.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      } catch { /* ignore */ }
+    }, 800);
+  }, [downloadTarget]);
 
   const startDownload = useCallback(async () => {
     if (!downloadTarget) return;
@@ -169,6 +298,7 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
     pollRef.current = null;
     setDownloadTarget(null);
     setDlState({ status: 'idle', progress: 0, message: '' });
+    setUploadState({ status: 'idle', progress: 0, message: '' });
   };
 
   const filtered = datasets.filter((ds) => {
@@ -385,11 +515,124 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
                 </div>
               </div>
 
-              {/* Content based on state */}
-              {dlState.status === 'idle' && isManual && (
+              {/* ── Workspace scanning spinner ── */}
+              {wsScan.scanning && (
+                <div className="flex items-center gap-2 py-2 text-slate-400 text-sm">
+                  <Loader2 size={14} className="animate-spin shrink-0" /> Scanning workspace...
+                </div>
+              )}
+
+              {/* ── Workspace found banner ── */}
+              {!wsScan.scanning && wsScan.found && installMethod === 'workspace' && uploadState.status === 'idle' && (
                 <div className="space-y-3">
-                  <p className="text-sm text-amber-400 font-medium">Manual download required</p>
-                  <pre className="text-xs text-slate-300 bg-slate-800/80 rounded-lg p-3 whitespace-pre-wrap leading-relaxed">{manualInstructions}</pre>
+                  <div className="flex items-center gap-2 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
+                    <FolderSearch size={16} className="text-emerald-400 shrink-0" />
+                    <div className="text-sm">
+                      <span className="text-emerald-400 font-medium">Files found in workspace</span>
+                      <span className="text-slate-400 ml-2">({wsScan.file_count.toLocaleString()} files · {(wsScan.size_bytes / (1024 * 1024)).toFixed(0)} MB)</span>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500">Dataset files already exist in the server workspace. Click Import to build the index.</p>
+                  <div className="flex gap-2 pt-1">
+                    <button onClick={() => setInstallMethod('choose')} className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer">Use different method</button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Method selector ── */}
+              {!wsScan.scanning && installMethod === 'choose' && uploadState.status === 'idle' && dlState.status === 'idle' && (
+                <div className="space-y-3">
+                  {manualInstructions && (
+                    <pre className="text-xs text-slate-400 bg-slate-800/80 rounded-lg p-3 whitespace-pre-wrap leading-relaxed">{manualInstructions}</pre>
+                  )}
+                  <p className="text-xs text-slate-500 uppercase tracking-wider font-medium">Choose installation method</p>
+                  <div className="grid grid-cols-1 gap-2">
+                    <button
+                      onClick={() => setInstallMethod('url')}
+                      className="flex items-center gap-3 p-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-indigo-500 rounded-lg text-left transition-colors cursor-pointer"
+                    >
+                      <Link size={18} className="text-indigo-400 shrink-0" />
+                      <div>
+                        <div className="text-sm text-white font-medium">Download from URL</div>
+                        <div className="text-xs text-slate-400">Google Drive, direct link — fastest for remote servers</div>
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => setInstallMethod('upload')}
+                      className="flex items-center gap-3 p-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-slate-600 rounded-lg text-left transition-colors cursor-pointer"
+                    >
+                      <Upload size={18} className="text-slate-400 shrink-0" />
+                      <div>
+                        <div className="text-sm text-white font-medium">Upload archive</div>
+                        <div className="text-xs text-slate-400">Upload .zip / .tar.gz from your computer (slower over internet)</div>
+                      </div>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── URL input ── */}
+              {installMethod === 'url' && dlState.status === 'idle' && (
+                <div className="space-y-3">
+                  <button onClick={() => setInstallMethod('choose')} className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer">← Back</button>
+                  <label className="block text-xs text-slate-400">Download URL</label>
+                  <input
+                    type="url"
+                    value={urlInput}
+                    onChange={e => setUrlInput(e.target.value)}
+                    placeholder="https://drive.google.com/file/d/... or direct link"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                  />
+                  <p className="text-xs text-slate-500">Google Drive share links are resolved automatically. Use File → Share → Copy link.</p>
+                </div>
+              )}
+
+              {/* ── Upload dropzone ── */}
+              {installMethod === 'upload' && uploadState.status === 'idle' && (
+                <div className="space-y-3">
+                  <button onClick={() => setInstallMethod('choose')} className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer">← Back</button>
+                  <label
+                    className="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-6 cursor-pointer transition-colors text-slate-500 hover:text-slate-300"
+                    onDragOver={e => e.preventDefault()}
+                    onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleUpload(f); }}
+                  >
+                    <Upload size={24} />
+                    <span className="text-sm font-medium">Drop archive here or click to browse</span>
+                    <span className="text-xs">Supports .zip, .tar.gz, .tar.bz2</span>
+                    <input ref={fileInputRef} type="file" accept=".zip,.tar,.tar.gz,.tgz,.tar.bz2" className="hidden"
+                      onChange={e => { const f = e.target.files?.[0]; if (f) handleUpload(f); }} />
+                  </label>
+                </div>
+              )}
+
+              {/* ── Upload / index progress ── */}
+              {(uploadState.status === 'uploading' || uploadState.status === 'extracting' || uploadState.status === 'indexing') && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Loader2 size={14} className="text-indigo-400 animate-spin shrink-0" />
+                    <p className="text-sm text-slate-300 truncate">{uploadState.message}</p>
+                  </div>
+                  <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
+                    <div className={`h-full rounded-full transition-all duration-300 ${
+                      uploadState.status === 'extracting' ? 'bg-amber-500' : 'bg-indigo-500'
+                    }`} style={{ width: `${Math.max(2, uploadState.progress)}%` }} />
+                  </div>
+                  <div className="flex justify-between text-xs text-slate-500">
+                    <span>{uploadState.status === 'uploading' ? 'Uploading…' : uploadState.status === 'extracting' ? 'Extracting…' : 'Indexing…'}</span>
+                    <span>{uploadState.progress}%</span>
+                  </div>
+                </div>
+              )}
+              {uploadState.status === 'complete' && (
+                <div className="flex items-center gap-2 py-2">
+                  <CheckCircle size={16} className="text-emerald-400 shrink-0" />
+                  <p className="text-sm text-emerald-400">Dataset imported successfully!</p>
+                </div>
+              )}
+              {uploadState.status === 'error' && (
+                <div className="flex items-start gap-2">
+                  <AlertCircle size={16} className="text-red-400 shrink-0 mt-0.5" />
+                  <p className="text-sm text-red-400">{uploadState.message}</p>
                 </div>
               )}
               {dlState.status === 'idle' && !isManual && (
@@ -487,64 +730,86 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
 
             {/* Footer */}
             <div className="border-t border-slate-800 px-6 py-4 flex items-center justify-end gap-2">
-              {dlState.status === 'idle' && isManual && (
-                <button
-                  onClick={closeDialog}
-                  className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer"
-                >
-                  Close
-                </button>
+              {/* In-progress states */}
+              {(uploadState.status === 'uploading' || uploadState.status === 'extracting' || uploadState.status === 'indexing' || dlState.status === 'downloading') && (
+                <p className="text-xs text-slate-600">Please wait…</p>
               )}
-              {dlState.status === 'idle' && !isManual && (
+
+              {/* Upload/index complete */}
+              {uploadState.status === 'complete' && (
                 <>
-                  <button
-                    onClick={closeDialog}
-                    className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={startDownload}
-                    className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Download size={14} /> Download
+                  <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Close</button>
+                  <button onClick={() => { closeDialog(); onOpenDataset?.(downloadTarget!.name); }}
+                    className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer">
+                    Open Dataset <ArrowRight size={14} />
                   </button>
                 </>
               )}
-              {dlState.status === 'downloading' && (
-                <p className="text-xs text-slate-600">Downloading... please wait</p>
+              {uploadState.status === 'error' && (
+                <>
+                  <button onClick={() => { setUploadState({ status: 'idle', progress: 0, message: '' }); setInstallMethod('choose'); }} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">← Back</button>
+                  <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Close</button>
+                </>
               )}
+
+              {/* URL download complete/error */}
               {dlState.status === 'complete' && (
                 <>
-                  <button
-                    onClick={closeDialog}
-                    className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer"
-                  >
-                    Close
-                  </button>
-                  <button
-                    onClick={() => { closeDialog(); onOpenDataset?.(downloadTarget.name); }}
-                    className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer"
-                  >
+                  <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Close</button>
+                  <button onClick={() => { closeDialog(); onOpenDataset?.(downloadTarget!.name); }}
+                    className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer">
                     Open Dataset <ArrowRight size={14} />
                   </button>
                 </>
               )}
               {dlState.status === 'error' && (
                 <>
-                  <button
-                    onClick={closeDialog}
-                    className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer"
-                  >
-                    Close
-                  </button>
-                  <button
-                    onClick={startDownload}
-                    className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer"
-                  >
-                    Retry
-                  </button>
+                  <button onClick={() => { setDlState({ status: 'idle', progress: 0, message: '' }); setInstallMethod('url'); }} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">← Back</button>
+                  <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Close</button>
                 </>
+              )}
+
+              {/* Idle states */}
+              {uploadState.status === 'idle' && dlState.status === 'idle' && !wsScan.scanning && (
+                <>
+                  {/* Workspace found → Import button */}
+                  {installMethod === 'workspace' && (
+                    <>
+                      <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
+                      <button onClick={handleImportLocal}
+                        className="flex items-center gap-2 px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer">
+                        <FolderSearch size={14} /> Import from workspace
+                      </button>
+                    </>
+                  )}
+                  {/* Method selector / instructions */}
+                  {(installMethod === 'choose' || installMethod === 'upload') && (
+                    <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
+                  )}
+                  {/* URL → Download button */}
+                  {installMethod === 'url' && (
+                    <>
+                      <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
+                      <button onClick={handleUrlDownload} disabled={!urlInput.trim()}
+                        className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg transition-colors cursor-pointer">
+                        <Download size={14} /> Download
+                      </button>
+                    </>
+                  )}
+                  {/* Auto-downloadable dataset */}
+                  {!isManual && (
+                    <>
+                      <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
+                      <button onClick={startDownload}
+                        className="flex items-center gap-2 px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer">
+                        <Download size={14} /> Download
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+              {wsScan.scanning && (
+                <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
               )}
             </div>
           </div>

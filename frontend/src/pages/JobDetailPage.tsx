@@ -6,7 +6,7 @@ import type { JobRecord, EpochMetrics } from '../types';
 import { 
   ArrowLeft, Square, Play, RefreshCw, ScrollText, Activity, 
   Timer, ChevronDown, AlertTriangle, Target, ImageIcon, Layers,
-  Zap, HardDrive, PlusCircle, Download
+  Zap, HardDrive, PlusCircle, Download, Package
 } from 'lucide-react';
 import { useWeightsStore } from '../store/weightsStore';
 import { useJobsStore } from '../store/jobsStore';
@@ -14,6 +14,7 @@ import JobCharts from '../components/JobCharts';
 import JobConfiguration from '../components/JobConfiguration';
 import PlotsGallery from '../components/PlotsGallery';
 import ClassSamplesGallery from '../components/ClassSamplesGallery';
+import ExportWeightPanel from '../components/ExportWeightPanel';
 
 interface Props { jobId: string; onBack: () => void; }
 
@@ -87,6 +88,13 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
   const [appendEpochs, setAppendEpochs] = useState(50);
   const [appending, setAppending] = useState(false);
   const [appendError, setAppendError] = useState<string | null>(null);
+  const [showExportPanel, setShowExportPanel] = useState(false);
+
+  // Resolve dataset_name: prefer job.dataset_name, fallback to linked weight's dataset_name
+  const weights = useWeightsStore((s) => s.weights);
+  const resolvedDatasetName = job?.dataset_name
+    || weights.find(w => w.job_id === jobId)?.dataset_name
+    || null;
 
   // Auto-refresh intervals (0 = off) — persisted across page visits
   const [mainInterval, setMainInterval] = usePersistedState('job.mainInterval', 0);
@@ -331,18 +339,20 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
                     <PlusCircle size={12} /> Append
                   </button>
                 )}
-                {job.weight_id && (
-                  <button
-                    onClick={() => {
-                      const fn = `${job.model_name}_${job.weight_id!.slice(0, 8)}.pt`.replace(/\s+/g, '_');
-                      api.downloadWeight(job.weight_id!, fn);
-                    }}
-                    className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-600/30 rounded text-xs font-medium transition-colors cursor-pointer"
-                    title="Download trained weight (.pt)"
-                  >
-                    <Download size={12} /> Export .pt
-                  </button>
-                )}
+                <button
+                  onClick={() => setShowExportPanel(true)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-400 border border-indigo-600/30 rounded text-xs font-medium transition-colors cursor-pointer"
+                  title="Export weight .pt"
+                >
+                  <Download size={12} /> Export
+                </button>
+                <button
+                  onClick={() => api.exportJobPackage(job.job_id)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-violet-600/20 hover:bg-violet-600/30 text-violet-400 border border-violet-600/30 rounded text-xs font-medium transition-colors cursor-pointer"
+                  title="Export full package with lineage (.mdpkg)"
+                >
+                  <Package size={12} /> Export Package
+                </button>
                 <div className="relative" ref={refreshMenuRef}>
                     <button
                       onClick={refreshAll}
@@ -497,7 +507,8 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
         {/* Configuration */}
         {job.config && (
           <JobConfiguration 
-            config={job.config as any} 
+            config={job.config as any}
+            datasetName={resolvedDatasetName}
             partitions={job.partitions}
             modelScale={job.model_scale}
           />
@@ -612,6 +623,15 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
             </div>
           </div>
         </div>
+      )}
+
+      {showExportPanel && (
+        <ExportWeightPanel
+          jobId={jobId}
+          weightId={job.weight_id ?? undefined}
+          onClose={() => setShowExportPanel(false)}
+          onWeightCreated={() => useWeightsStore.getState().invalidate()}
+        />
       )}
 
     </div>

@@ -1,11 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { WeightRecord, ModelSummary } from '../types';
-import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download } from 'lucide-react';
+import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download, BarChart2, Pencil, Check, Package, ChevronDown } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
-import { fmtSize } from '../utils/format';
+import { fmtSize, fmtDataset } from '../utils/format';
 import { useWeightsStore } from '../store/weightsStore';
 import { useModelsStore } from '../store/modelsStore';
+import BenchmarkPanel from '../components/BenchmarkPanel';
+import ExportWeightPanel from '../components/ExportWeightPanel';
+import ImportPackageModal from '../components/ImportPackageModal';
 
 interface Props { onOpenWeight?: (weightId: string) => void; }
 
@@ -18,6 +21,11 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const loadModels = useModelsStore((s) => s.load);
 
   const [deleteTarget, setDeleteTarget] = useState<WeightRecord | null>(null);
+  const [renameTarget, setRenameTarget] = useState<WeightRecord | null>(null);
+  const [renameName, setRenameName] = useState('');
+  const [renaming, setRenaming] = useState(false);
+  const [benchmarkTarget, setBenchmarkTarget] = useState<WeightRecord | null>(null);
+  const [exportTarget, setExportTarget] = useState<WeightRecord | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [weightName, setWeightName] = useState('');
@@ -29,6 +37,21 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
+  const [showImportPkg, setShowImportPkg] = useState(false);
+  const [showImportMenu, setShowImportMenu] = useState(false);
+  const [exportMenuFor, setExportMenuFor] = useState<string | null>(null);
+  const [pkgIncludeJobs, setPkgIncludeJobs] = useState(false);
+  const importMenuRef = useRef<HTMLDivElement>(null);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (importMenuRef.current && !importMenuRef.current.contains(e.target as Node)) setShowImportMenu(false);
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) setExportMenuFor(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   const load = () => { loadWeights(null, true); };
   useEffect(() => { loadWeights(); }, []);
@@ -39,6 +62,18 @@ export default function WeightsPage({ onOpenWeight }: Props) {
     setDeleteTarget(null);
     invalidateWeights();
     load();
+  };
+
+  const handleRename = async () => {
+    if (!renameTarget || !renameName.trim()) return;
+    setRenaming(true);
+    try {
+      await api.renameWeight(renameTarget.weight_id, renameName.trim());
+      setRenameTarget(null);
+      invalidateWeights();
+      load();
+    } catch { /* ignore */ }
+    setRenaming(false);
   };
 
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -79,25 +114,41 @@ export default function WeightsPage({ onOpenWeight }: Props) {
               <Plus size={14} /> Create Empty
             </button>
 
-            {/* Import .pt */}
-            <label
-              className={`flex items-center gap-2 px-3 py-1.5 text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 rounded-lg transition-colors cursor-pointer ${
-                importing ? 'opacity-60 cursor-not-allowed' : ''
-              }`}
-              title="Upload a .pt file to import"
-            >
-              {importing
-                ? <><RefreshCw size={14} className="animate-spin" /> Importing&hellip;</>
-                : <><Upload size={14} /> Import .pt</>}
-              <input
-                ref={importFileRef}
-                type="file"
-                accept=".pt,.pth"
-                className="hidden"
-                disabled={importing}
-                onChange={handleImportFile}
-              />
-            </label>
+            {/* Import dropdown */}
+            <div className="relative" ref={importMenuRef}>
+              <button
+                onClick={() => setShowImportMenu(v => !v)}
+                className={`flex items-center gap-2 px-3 py-1.5 text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 rounded-lg transition-colors cursor-pointer ${importing ? 'opacity-60 pointer-events-none' : ''}`}
+              >
+                {importing ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
+                {importing ? 'Importing…' : 'Import'}
+                {!importing && <ChevronDown size={13} className={`transition-transform ${showImportMenu ? 'rotate-180' : ''}`} />}
+              </button>
+              {showImportMenu && !importing && (
+                <div className="absolute right-0 top-full mt-1 w-52 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-30 overflow-hidden">
+                  <label className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer">
+                    <Upload size={14} className="text-emerald-400 shrink-0" />
+                    <div className="text-left">
+                      <div className="font-medium">Import .pt</div>
+                      <div className="text-xs text-slate-500">Upload weight file</div>
+                    </div>
+                    <input ref={importFileRef} type="file" accept=".pt,.pth" className="hidden" disabled={importing}
+                      onChange={(e) => { setShowImportMenu(false); handleImportFile(e); }} />
+                  </label>
+                  <div className="border-t border-slate-700/50" />
+                  <button
+                    onClick={() => { setShowImportPkg(true); setShowImportMenu(false); }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer"
+                  >
+                    <Package size={14} className="text-violet-400 shrink-0" />
+                    <div className="text-left">
+                      <div className="font-medium">Import Package</div>
+                      <div className="text-xs text-slate-500">Import .mdpkg with lineage</div>
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
 
             <button onClick={load} className="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors cursor-pointer">
               <RefreshCw size={14} /> Refresh
@@ -148,7 +199,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                         <button onClick={() => onOpenWeight(w.weight_id)} className="hover:text-indigo-400 cursor-pointer transition-colors">{w.model_name}</button>
                       ) : w.model_name}
                     </td>
-                    <td className="px-6 py-4 text-slate-400">{w.dataset}</td>
+                    <td className="px-6 py-4 text-slate-400">{fmtDataset(w.dataset, w.dataset_name)}</td>
                     <td className="px-6 py-4 text-slate-400">{w.epochs_trained}</td>
                     <td className="px-6 py-4 text-emerald-400 font-medium">
                       {w.final_accuracy != null ? `${w.final_accuracy.toFixed(1)}%` : '—'}
@@ -167,14 +218,63 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                           </button>
                         )}
                         <button
-                          onClick={() => {
-                            const fn = `${w.model_name}_${w.weight_id.slice(0, 8)}.pt`.replace(/\s+/g, '_');
-                            api.downloadWeight(w.weight_id, fn);
-                          }}
-                          className="p-1.5 text-slate-500 hover:text-emerald-400 cursor-pointer transition-colors"
-                          title="Download .pt"
+                          onClick={() => setBenchmarkTarget(w)}
+                          className="p-1.5 text-slate-500 hover:text-indigo-400 cursor-pointer transition-colors"
+                          title="Benchmark"
                         >
-                          <Download size={14} />
+                          <BarChart2 size={14} />
+                        </button>
+                        {/* Export dropdown per-row */}
+                        <div className="relative" ref={exportMenuFor === w.weight_id ? exportMenuRef : undefined}>
+                          <button
+                            onClick={() => setExportMenuFor(exportMenuFor === w.weight_id ? null : w.weight_id)}
+                            className="p-1.5 text-slate-500 hover:text-emerald-400 cursor-pointer transition-colors flex items-center gap-0.5"
+                            title="Export"
+                          >
+                            <Download size={14} /><ChevronDown size={11} />
+                          </button>
+                          {exportMenuFor === w.weight_id && (
+                            <div className="absolute right-0 top-full mt-1 w-48 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-30 overflow-hidden">
+                              <button
+                                onClick={() => { setExportTarget(w); setExportMenuFor(null); }}
+                                className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer"
+                              >
+                                <Download size={13} className="text-emerald-400 shrink-0" />
+                                <div className="text-left">
+                                  <div className="text-xs font-medium">Export .pt</div>
+                                  <div className="text-[10px] text-slate-500">Weight file only</div>
+                                </div>
+                              </button>
+                              <div className="border-t border-slate-700/50" />
+                              <button
+                                onClick={() => { api.exportWeightPackage(w.weight_id, pkgIncludeJobs); setExportMenuFor(null); }}
+                                className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer"
+                              >
+                                <Package size={13} className="text-violet-400 shrink-0" />
+                                <div className="text-left flex-1">
+                                  <div className="text-xs font-medium">Export Package</div>
+                                  <div className="text-[10px] text-slate-500">Lineage (.mdpkg)</div>
+                                </div>
+                              </button>
+                              <div className="border-t border-slate-700/50" />
+                              <div className="px-3 py-2 flex items-center justify-between">
+                                <span className="text-[10px] text-slate-400">Include Jobs</span>
+                                <button
+                                  onClick={e => { e.stopPropagation(); setPkgIncludeJobs(v => !v); }}
+                                  className={`w-7 h-4 rounded-full relative transition-colors cursor-pointer shrink-0 ${pkgIncludeJobs ? 'bg-violet-500' : 'bg-slate-600'}`}
+                                >
+                                  <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${pkgIncludeJobs ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => { setRenameTarget(w); setRenameName(w.model_name); }}
+                          className="p-1.5 text-slate-500 hover:text-amber-400 cursor-pointer transition-colors"
+                          title="Rename"
+                        >
+                          <Pencil size={14} />
                         </button>
                         <button
                           onClick={() => setDeleteTarget(w)}
@@ -189,6 +289,51 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {/* Import Package Modal */}
+        {showImportPkg && (
+          <ImportPackageModal
+            onClose={() => setShowImportPkg(false)}
+            onDone={() => { invalidateWeights(); setTimeout(load, 50); }}
+          />
+        )}
+
+        {/* Rename Weight Dialog */}
+        {renameTarget && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setRenameTarget(null)}>
+            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-96 overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+                <h3 className="text-white font-semibold text-sm flex items-center gap-2">
+                  <Pencil size={15} className="text-amber-400" /> Rename Weight
+                </h3>
+                <button onClick={() => setRenameTarget(null)} className="text-slate-500 hover:text-white cursor-pointer"><X size={16} /></button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Weight Name</label>
+                  <input
+                    autoFocus
+                    type="text"
+                    value={renameName}
+                    onChange={e => setRenameName(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleRename(); if (e.key === 'Escape') setRenameTarget(null); }}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-amber-500 outline-none"
+                  />
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button onClick={() => setRenameTarget(null)} className="px-4 py-2 text-sm text-slate-400 hover:text-white cursor-pointer">Cancel</button>
+                  <button
+                    onClick={handleRename}
+                    disabled={renaming || !renameName.trim()}
+                    className="flex items-center gap-2 px-4 py-2 text-sm bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"
+                  >
+                    {renaming ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />} Save
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -298,7 +443,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
         {deleteTarget && (
           <ConfirmDialog
             title="Delete Weight"
-            message={`Delete weight ${deleteTarget.weight_id.slice(0, 8)} (${deleteTarget.model_name}, ${deleteTarget.dataset})? The .pt file will be permanently removed.`}
+            message={`Delete weight ${deleteTarget.weight_id.slice(0, 8)} (${deleteTarget.model_name}, ${fmtDataset(deleteTarget.dataset, deleteTarget.dataset_name)})? The .pt file will be permanently removed.`}
             confirmLabel="Delete"
             danger
             onConfirm={handleDelete}
@@ -306,6 +451,20 @@ export default function WeightsPage({ onOpenWeight }: Props) {
           />
         )}
       </div>
+
+      {benchmarkTarget && (
+        <BenchmarkPanel
+          weightId={benchmarkTarget.weight_id}
+          onClose={() => setBenchmarkTarget(null)}
+        />
+      )}
+
+      {exportTarget && (
+        <ExportWeightPanel
+          weightId={exportTarget.weight_id}
+          onClose={() => setExportTarget(null)}
+        />
+      )}
     </div>
   );
 }
