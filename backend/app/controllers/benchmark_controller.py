@@ -270,6 +270,24 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
     # Rewrite absolute paths in data.yaml that may point to another machine
     data_yaml = _rewrite_yaml_paths(data_yaml)
 
+    # Delete stale .cache files — they embed absolute paths from the machine that
+    # built them, so they will be invalid on a different machine.  Ultralytics
+    # will rebuild them automatically on first use.
+    try:
+        import yaml as _yaml
+        _yaml_data = _yaml.safe_load(data_yaml.read_text())
+        _ds_path = _yaml_data.get("path", "")
+        if _ds_path:
+            for _sub in ("labels", "images", "."):
+                _cache_dir = Path(_ds_path) / _sub if _sub != "." else Path(_ds_path)
+                for _cf in _cache_dir.glob("*.cache"):
+                    try:
+                        _cf.unlink()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     try:
         model = YOLO(str(pt_path))
     except (KeyError, Exception) as e:
