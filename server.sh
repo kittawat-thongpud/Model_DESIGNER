@@ -76,7 +76,24 @@ case "${1}" in
             echo "   Use: ./server.sh start   — to start"
         fi
         ;;
+    update)
+        echo "🔄 Pulling latest code from git..."
+        git -C "${APP_DIR}" pull
+        if tmux has-session -t "${SESSION}" 2>/dev/null; then
+            echo "🔁 Restarting server..."
+            tmux kill-session -t "${SESSION}"
+            sleep 1
+        fi
+        tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
+        sleep 1
+        if tmux has-session -t "${SESSION}" 2>/dev/null; then
+            echo "✅ Server updated and restarted."
+            echo "   Use: ./server.sh logs  — to verify"
+        else
+            echo "❌ Failed to restart. Check: cat ${LOG_FILE}"
+        fi
+        ;;
     *)
-        echo "Usage: ./server.sh {start|attach|logs|stop|status}"
+        echo "Usage: ./server.sh {start|attach|logs|stop|status|update}"
         ;;
 esac
