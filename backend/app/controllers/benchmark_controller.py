@@ -69,7 +69,7 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
     if not needs_fix:
         return yaml_path
 
-    # ── Strategy 2: regenerate from current DATA_DIR ──────────────────────────
+    # ── Strategy 2: rebuild yaml with current paths, preserve class info ─────
     # Extract dataset name from the 'path' field (last component)
     ds_path_str = str(data.get("path", "")).split("#")[0].strip()
     if ds_path_str:
@@ -77,13 +77,42 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
         local_ds_path = DATA_DIR / "datasets" / ds_name
         if local_ds_path.exists():
             try:
-                from ..services.dataset_yaml import generate_data_yaml
-                yaml_str = generate_data_yaml(ds_name, custom_path=local_ds_path)
+                # Build a minimal but correct data.yaml with current paths,
+                # preserving nc/names from the original file.
+                orig_names = data.get("names") or {}
+                orig_nc = data.get("nc") or (len(orig_names) if orig_names else 0)
+                # Auto-detect split dirs on local dataset
+                def _find_split(ds: Path, split: str) -> str:
+                    for cand in (
+                        f"images/{split}2017", f"{split}2017",
+                        f"images/{split}", split,
+                    ):
+                        if (ds / cand).exists():
+                            return cand
+                    return f"images/{split}"
+                train_dir = _find_split(local_ds_path, "train")
+                val_dir   = _find_split(local_ds_path, "val")
+                if isinstance(orig_names, dict):
+                    names_block = "\n".join(f"  {k}: {v}" for k, v in orig_names.items())
+                else:
+                    names_block = "\n".join(f"  {i}: {n}" for i, n in enumerate(orig_names))
+                lines_out = [
+                    f"# Ultralytics data.yaml — {ds_name} (paths remapped by Model DESIGNER)",
+                    f"",
+                    f"path: {local_ds_path}",
+                    f"train: {train_dir}",
+                    f"val: {val_dir}",
+                    f"",
+                    f"nc: {orig_nc}",
+                    f"names:",
+                    names_block,
+                    f"",
+                ]
                 tmp = tempfile.NamedTemporaryFile(
                     mode="w", suffix="_data.yaml", delete=False,
                     dir=str(BENCHMARK_DIR)
                 )
-                tmp.write(yaml_str)
+                tmp.write("\n".join(lines_out))
                 tmp.flush()
                 tmp.close()
                 return Path(tmp.name)
