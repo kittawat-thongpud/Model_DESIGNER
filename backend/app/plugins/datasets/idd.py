@@ -121,10 +121,12 @@ def _build_index(ann_path: Path, img_dir: Path, index_path: Path) -> list[dict]:
     # Remap category_ids to contiguous indices in each annotation
     index = []
     for entry in img_lookup.values():
-        img_file = img_dir / entry["file"]
+        file_rel = str(entry["file"])
+        img_file = img_dir / file_rel
         # Handle nested paths in file_name (e.g. "train/img.jpg")
         if not img_file.exists():
-            img_file = img_dir / Path(entry["file"]).name
+            file_rel = Path(file_rel).name
+            img_file = img_dir / file_rel
         if not img_file.exists():
             continue
 
@@ -150,7 +152,7 @@ def _build_index(ann_path: Path, img_dir: Path, index_path: Path) -> list[dict]:
             })
 
         index.append({
-            "file": img_file.name,
+            "file": file_rel,
             "w": w,
             "h": h,
             "anns": remapped_anns,
@@ -173,13 +175,30 @@ class IDDRawDataset(Dataset):
         self._img_dir = img_dir
         self._index = index
         self._transform = transform
+        self._path_cache: dict[str, str] = {}
 
     def __len__(self):
         return len(self._index)
 
     def __getitem__(self, idx):
         entry = self._index[idx]
-        img = PILImage.open(self._img_dir / entry["file"]).convert("RGB")
+        rel = str(entry["file"])
+        p = self._img_dir / Path(rel)
+        if not p.exists():
+            base = Path(rel).name
+            cached = self._path_cache.get(base)
+            if cached:
+                p = self._img_dir / Path(cached)
+            else:
+                hit = next(self._img_dir.rglob(base), None)
+                if hit is not None:
+                    try:
+                        rel_hit = hit.relative_to(self._img_dir)
+                        self._path_cache[base] = str(rel_hit)
+                        p = hit
+                    except Exception:
+                        p = hit
+        img = PILImage.open(p).convert("RGB")
         if self._transform is not None:
             img = self._transform(img)
         return img, entry["anns"]

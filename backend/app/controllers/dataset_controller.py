@@ -348,6 +348,19 @@ async def workspace_scan(name: str):
         return {"found": False, "path": str(dest), "file_count": 0,
                 "pending_archive": None}
 
+    def _looks_like_archive(p: Path) -> bool:
+        if not p.is_file():
+            return False
+        n = p.name.lower()
+        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+            return True
+        try:
+            with open(p, "rb") as _mf:
+                hdr = _mf.read(8)
+            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
+        except Exception:
+            return False
+
     # Fast: only iterate top-level entries (no recursive stat)
     top_entries = list(dest.iterdir())
     file_count = sum(1 for f in top_entries if f.is_file())
@@ -356,10 +369,14 @@ async def workspace_scan(name: str):
     # Detect any leftover _download_*.{tar.gz,zip,tgz,...} archive
     pending_archive = None
     for f in top_entries:
-        if f.is_file() and f.name.startswith("_download_"):
-            pending_archive = {"path": str(f), "name": f.name,
-                               "size_bytes": f.stat().st_size}
+        if f.is_file() and f.name.startswith("_download_") and _looks_like_archive(f):
+            pending_archive = {"path": str(f), "name": f.name, "size_bytes": f.stat().st_size}
             break
+    if pending_archive is None:
+        for f in top_entries:
+            if _looks_like_archive(f):
+                pending_archive = {"path": str(f), "name": f.name, "size_bytes": f.stat().st_size}
+                break
 
     found = (file_count + dir_count) > 0
     return {
@@ -378,13 +395,31 @@ async def resume_extract(name: str):
     plugin = _get_plugin(key)
     dest = DATASETS_DIR / key
 
+    def _looks_like_archive(p: Path) -> bool:
+        if not p.is_file():
+            return False
+        n = p.name.lower()
+        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+            return True
+        try:
+            with open(p, "rb") as _mf:
+                hdr = _mf.read(8)
+            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
+        except Exception:
+            return False
+
     # Find the pending archive
     pending = None
     if dest.exists():
         for f in dest.iterdir():
-            if f.is_file() and f.name.startswith("_download_"):
+            if f.is_file() and f.name.startswith("_download_") and _looks_like_archive(f):
                 pending = f
                 break
+        if not pending:
+            for f in dest.iterdir():
+                if _looks_like_archive(f):
+                    pending = f
+                    break
 
     if not pending:
         raise HTTPException(status_code=404,
@@ -415,11 +450,67 @@ async def import_local(name: str):
     """Build index and scan metadata for a dataset already present in DATASETS_DIR."""
     key = name.lower()
     plugin = _get_plugin(key)
+
+    dest = DATASETS_DIR / key
+
+    def _looks_like_archive(p: Path) -> bool:
+        if not p.is_file():
+            return False
+        n = p.name.lower()
+        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+            return True
+        try:
+            with open(p, "rb") as _mf:
+                hdr = _mf.read(8)
+            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
+        except Exception:
+            return False
+
+    archive_to_extract: Path | None = None
+    if dest.exists():
+        extracted_dirs = {p.name for p in dest.iterdir() if p.is_dir()}
+        looks_extracted = any(d in extracted_dirs for d in ("JPEGImages", "Annotations", "images", "annotations"))
+
+        for f in dest.iterdir():
+            if looks_extracted:
+                break
+            if _looks_like_archive(f):
+                archive_to_extract = f
+                break
+
+    if archive_to_extract is not None:
+        state: dict = {
+            "status": "extracting",
+            "progress": 50,
+            "message": f"Extracting {archive_to_extract.name}…",
+        }
+        _upload_tasks[key] = state
+        threading.Thread(
+            target=_bg_extract,
+            args=(key, str(archive_to_extract), state),
+            daemon=True,
+        ).start()
+        return {"status": "extracting", "message": f"Extracting {archive_to_extract.name}"}
+
     state: dict = {"status": "indexing", "progress": 10, "message": "Scanning workspace..."}
     _upload_tasks[key] = state
 
     def _bg():
         try:
+            if key == "idd":
+                try:
+                    ann_dir = dest / "annotations"
+                    has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
+                    yolo_train = (dest / "images" / "train")
+                    yolo_val = (dest / "images" / "val")
+                    has_yolo_images = yolo_train.exists() and yolo_val.exists()
+                    if (not has_json) or (not has_yolo_images):
+                        state["message"] = "Converting IDD dataset to COCO JSON..."
+                        state["progress"] = 25
+                        _auto_convert_idd_voc_to_coco(dest, state)
+                except Exception:
+                    pass
+
             state["message"] = "Building index..."
             state["progress"] = 40
             if hasattr(plugin, "rebuild_index"):
@@ -545,6 +636,124 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
             state["message"] = f"Warning: could not extract {arc.name}: {_ne}"
 
     return extracted
+
+
+def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
+    import json as _json
+    import xml.etree.ElementTree as _ET
+    import os as _os
+    from pathlib import Path as _Path
+
+    ann_dir = root / "Annotations"
+    img_dir = root / "JPEGImages"
+    train_list = root / "train.txt"
+    val_list = root / "val.txt"
+    if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
+        return False
+
+    coco_ann_dir = root / "annotations"
+    coco_ann_dir.mkdir(parents=True, exist_ok=True)
+
+    yolo_img_dir = root / "images"
+    (yolo_img_dir / "train").mkdir(parents=True, exist_ok=True)
+    (yolo_img_dir / "val").mkdir(parents=True, exist_ok=True)
+
+    cats = [
+        "person", "rider", "car", "truck", "bus", "motorcycle",
+        "bicycle", "autorickshaw", "animal", "traffic light",
+        "traffic sign", "utility pole", "misc", "drivable area", "non-drivable area",
+    ]
+    cat_name_to_id = {n: i for i, n in enumerate(cats)}
+    categories = [{"id": i, "name": n} for i, n in enumerate(cats)]
+
+    def _convert_split(split: str, list_path: Path) -> Path:
+        lines = [ln.strip() for ln in list_path.read_text().splitlines() if ln.strip()]
+        images = []
+        annotations = []
+        img_id = 1
+        ann_id = 1
+
+        for idx, rel in enumerate(lines):
+            if idx % 500 == 0:
+                state["message"] = f"Converting IDD VOC→COCO ({split}): {idx}/{len(lines)}"
+                state["progress"] = min(state.get("progress", 70) + 1, 89)
+
+            rel_path = _Path(rel)
+            jpg_src = img_dir / (str(rel_path) + ".jpg")
+            xml_src = ann_dir / (str(rel_path) + ".xml")
+            if not jpg_src.exists() or not xml_src.exists():
+                continue
+
+            jpg_link = yolo_img_dir / split / (str(rel_path) + ".jpg")
+            jpg_link.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if not jpg_link.exists():
+                    _os.symlink(jpg_src, jpg_link)
+            except Exception:
+                pass
+
+            try:
+                tree = _ET.parse(str(xml_src))
+                xml_root = tree.getroot()
+                size = xml_root.find("size")
+                w = int(size.findtext("width", default="0")) if size is not None else 0
+                h = int(size.findtext("height", default="0")) if size is not None else 0
+            except Exception:
+                continue
+
+            images.append({
+                "id": img_id,
+                "file_name": str(rel_path) + ".jpg",
+                "width": w,
+                "height": h,
+            })
+
+            for obj in xml_root.findall("object"):
+                name_node = obj.find("name")
+                cls = (name_node.text or "").strip() if name_node is not None else ""
+                cat_id = cat_name_to_id.get(cls)
+                if cat_id is None:
+                    continue
+                bnd = obj.find("bndbox")
+                if bnd is None:
+                    continue
+                try:
+                    xmin = float(bnd.findtext("xmin"))
+                    ymin = float(bnd.findtext("ymin"))
+                    xmax = float(bnd.findtext("xmax"))
+                    ymax = float(bnd.findtext("ymax"))
+                except Exception:
+                    continue
+                bw = max(0.0, xmax - xmin)
+                bh = max(0.0, ymax - ymin)
+                if bw <= 0 or bh <= 0:
+                    continue
+                annotations.append({
+                    "id": ann_id,
+                    "image_id": img_id,
+                    "category_id": cat_id,
+                    "bbox": [xmin, ymin, bw, bh],
+                    "area": bw * bh,
+                    "iscrowd": 0,
+                })
+                ann_id += 1
+
+            img_id += 1
+
+        out_path = coco_ann_dir / f"idd_detection_{split}.json"
+        out = {
+            "info": {"description": "IDD Detection"},
+            "images": images,
+            "annotations": annotations,
+            "categories": categories,
+        }
+        with open(out_path, "w") as f:
+            _json.dump(out, f)
+        return out_path
+
+    out_train = _convert_split("train", train_list)
+    out_val = _convert_split("val", val_list)
+    return out_train.exists() and out_val.exists()
 
 
 def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
@@ -916,31 +1125,44 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
         state["message"] = "Extracting..."
 
-        if is_zip or lower.endswith(".zip"):
-            with zipfile.ZipFile(arc) as zf:
-                members = zf.namelist()
-                total_m = max(len(members), 1)
-                for i, member in enumerate(members):
-                    zf.extract(member, dest)
-                    if i % 200 == 0:
-                        pct = 55 + int((i / total_m) * 33)
-                        state["progress"] = pct
-                        state["message"] = f"Extracting {i}/{total_m} files..."
-        elif is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext:
-            with _tarfile.open(arc) as tf:
-                i = 0
-                for member in tf:
-                    tf.extract(member, dest, filter="data")
-                    i += 1
-                    if i % 200 == 0:
-                        pct = min(55 + int(i / 100), 87)
-                        state["progress"] = pct
-                        state["message"] = f"Extracting {i} files..."
-        else:
-            raise ValueError(
-                f"Unsupported archive format: {arc.name} "
-                f"(magic bytes: {magic[:4].hex()})"
-            )
+        is_zip_valid = zipfile.is_zipfile(str(arc)) if (is_zip or lower.endswith(".zip")) else False
+        if is_zip_valid:
+            try:
+                with zipfile.ZipFile(arc) as zf:
+                    members = zf.namelist()
+                    total_m = max(len(members), 1)
+                    for i, member in enumerate(members):
+                        zf.extract(member, dest)
+                        if i % 200 == 0:
+                            pct = 55 + int((i / total_m) * 33)
+                            state["progress"] = pct
+                            state["message"] = f"Extracting {i}/{total_m} files..."
+            except zipfile.BadZipFile:
+                is_zip_valid = False
+
+        if not is_zip_valid:
+            if is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext or is_zip or lower.endswith(".zip"):
+                try:
+                    with _tarfile.open(arc) as tf:
+                        i = 0
+                        for member in tf:
+                            tf.extract(member, dest, filter="data")
+                            i += 1
+                            if i % 200 == 0:
+                                pct = min(55 + int(i / 100), 87)
+                                state["progress"] = pct
+                                state["message"] = f"Extracting {i} files..."
+                except _tarfile.TarError as _te:
+                    raise ValueError(
+                        f"Archive '{arc.name}' is not a valid zip or tar archive. "
+                        f"If the file extension is .zip, it may actually be a .tar.gz (or the file is corrupted). "
+                        f"Details: {_te}"
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported archive format: {arc.name} "
+                    f"(magic bytes: {magic[:4].hex()})"
+                )
         state["progress"] = 88
 
         # Flatten single-root-dir extraction (e.g. idd/ inside zip)
@@ -962,6 +1184,119 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         nested = _extract_nested_archives(dest, state, progress_start=70, progress_end=88)
         if nested:
             state["message"] = f"Extracted {nested} nested archive(s). Building index..."
+
+        def _auto_convert_idd_voc_to_coco(_root: _Path, _state: dict) -> bool:
+            import json as _json
+            import xml.etree.ElementTree as _ET
+
+            ann_dir = _root / "Annotations"
+            img_dir = _root / "JPEGImages"
+            train_list = _root / "train.txt"
+            val_list = _root / "val.txt"
+            if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
+                return False
+
+            coco_ann_dir = _root / "annotations"
+            coco_ann_dir.mkdir(parents=True, exist_ok=True)
+
+            cats = [
+                "person", "rider", "car", "truck", "bus", "motorcycle",
+                "bicycle", "autorickshaw", "animal", "traffic light",
+                "traffic sign", "utility pole", "misc", "drivable area", "non-drivable area",
+            ]
+            cat_name_to_id = {n: i for i, n in enumerate(cats)}
+            categories = [{"id": i, "name": n} for i, n in enumerate(cats)]
+
+            def _convert_split(split: str, list_path: _Path) -> _Path:
+                lines = [ln.strip() for ln in list_path.read_text().splitlines() if ln.strip()]
+                images = []
+                annotations = []
+                img_id = 1
+                ann_id = 1
+
+                for idx, rel in enumerate(lines):
+                    if idx % 500 == 0:
+                        _state["message"] = f"Converting IDD VOC→COCO ({split}): {idx}/{len(lines)}"
+                        _state["progress"] = min(_state.get("progress", 70) + 1, 89)
+
+                    rel_path = _Path(rel)
+                    jpg_src = img_dir / (str(rel_path) + ".jpg")
+                    xml_src = ann_dir / (str(rel_path) + ".xml")
+                    if not jpg_src.exists() or not xml_src.exists():
+                        continue
+
+                    try:
+                        tree = _ET.parse(str(xml_src))
+                        root = tree.getroot()
+                        size = root.find("size")
+                        w = int(size.findtext("width", default="0")) if size is not None else 0
+                        h = int(size.findtext("height", default="0")) if size is not None else 0
+                    except Exception:
+                        continue
+
+                    images.append({
+                        "id": img_id,
+                        "file_name": str(rel_path) + ".jpg",
+                        "width": w,
+                        "height": h,
+                    })
+
+                    for obj in root.findall("object"):
+                        name_node = obj.find("name")
+                        cls = (name_node.text or "").strip() if name_node is not None else ""
+                        cat_id = cat_name_to_id.get(cls)
+                        if cat_id is None:
+                            continue
+                        bnd = obj.find("bndbox")
+                        if bnd is None:
+                            continue
+                        try:
+                            xmin = float(bnd.findtext("xmin"))
+                            ymin = float(bnd.findtext("ymin"))
+                            xmax = float(bnd.findtext("xmax"))
+                            ymax = float(bnd.findtext("ymax"))
+                        except Exception:
+                            continue
+                        bw = max(0.0, xmax - xmin)
+                        bh = max(0.0, ymax - ymin)
+                        if bw <= 0 or bh <= 0:
+                            continue
+                        annotations.append({
+                            "id": ann_id,
+                            "image_id": img_id,
+                            "category_id": cat_id,
+                            "bbox": [xmin, ymin, bw, bh],
+                            "area": bw * bh,
+                            "iscrowd": 0,
+                        })
+                        ann_id += 1
+
+                    img_id += 1
+
+                out_path = coco_ann_dir / f"idd_detection_{split}.json"
+                out = {
+                    "info": {"description": "IDD Detection"},
+                    "images": images,
+                    "annotations": annotations,
+                    "categories": categories,
+                }
+                with open(out_path, "w") as f:
+                    _json.dump(out, f)
+                return out_path
+
+            out_train = _convert_split("train", train_list)
+            out_val = _convert_split("val", val_list)
+            return out_train.exists() and out_val.exists()
+
+        if name.lower() == "idd":
+            try:
+                has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
+                if not has_json:
+                    state["message"] = "Converting IDD dataset to COCO JSON..."
+                    state["progress"] = max(state.get("progress", 70), 70)
+                    _auto_convert_idd_voc_to_coco(dest, state)
+            except Exception:
+                pass
 
         state["progress"] = 90
         state["message"] = "Building index..."
@@ -995,7 +1330,14 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         state["message"] = f"Extraction failed: {e}"
     finally:
         try:
-            os.unlink(archive_path)
+            arc_path = _Path(archive_path)
+            should_delete = False
+            if not str(arc_path.resolve()).startswith(str((DATASETS_DIR / name).resolve())):
+                should_delete = True
+            if arc_path.name.startswith("_download_"):
+                should_delete = True
+            if should_delete:
+                os.unlink(archive_path)
         except Exception:
             pass
 
