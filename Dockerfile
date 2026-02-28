@@ -32,24 +32,23 @@ RUN python3 -m venv /opt/venv \
 # ══ Stage 3 — Final runtime ══════════════════════════════════════════════════
 FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
-# ── System libs ───────────────────────────────────────────────────────────────
+# ── System libs (no Node.js — frontend already built in stage 1) ──────────────
+# This layer is stable and will be cached after the first build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
         git curl tmux \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Copy baked venv from builder ──────────────────────────────────────────────
+# ── Copy baked venv from builder (stable — cached unless requirements.txt changes)
 COPY --from=python-builder /opt/venv /opt/venv
 
-# ── Copy project source ───────────────────────────────────────────────────────
+# ── Copy built frontend dist (stable — cached unless frontend/ changes) ────────
 ENV APP_DIR=/app
 WORKDIR /app
-COPY . /app/
-
-# ── Copy built frontend dist ──────────────────────────────────────────────────
 COPY --from=frontend-builder /build/frontend/dist /app/frontend/dist
+
+# ── Copy project source last (changes every push — only this layer rebuilds) ───
+COPY . /app/
 
 # ── Point run.sh / run.py at the baked venv ───────────────────────────────────
 # MODEL_DESIGNER_PYTHON lets run.py skip re-detection and use the baked venv.

@@ -54,7 +54,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # ── Layer cache stored in GHCR ──────────────────────────────────────
-          # pip install and npm ci layers are cached — only rebuild on changes
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # ── GitHub Actions cache (fast, stored in Actions cache storage) ────
+          # Each build stage is cached separately:
+          #   frontend-builder — npm ci + npm build
+          #   python-builder   — pip install (heaviest, cached unless requirements.txt changes)
+          #   final            — source copy only (always fast)
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
