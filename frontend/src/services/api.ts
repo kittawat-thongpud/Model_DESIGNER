@@ -136,7 +136,8 @@ export const api = {
   deleteDatasetData: (name: string) => del<{ name: string; deleted_dirs: string[]; available: boolean }>(`/api/datasets/${name}/data`),
   startDatasetDownload: (name: string) => post<{ status: string; progress: number; message: string }>(`/api/datasets/${name}/download`, {}),
   getDatasetDownloadStatus: (name: string) => get<{ status: string; progress: number; message: string; current_file?: string; bytes_downloaded?: number; bytes_total?: number }>(`/api/datasets/${name}/download-status`),
-  workspaceScan: (name: string) => get<{ found: boolean; path: string; file_count: number; size_bytes?: number }>(`/api/datasets/${name}/workspace-scan`),
+  workspaceScan: (name: string) => get<{ found: boolean; path: string; file_count: number; dir_count?: number; size_bytes?: number; pending_archive: { path: string; name: string; size_bytes: number } | null }>(`/api/datasets/${name}/workspace-scan`),
+  resumeExtract: (name: string) => post<{ status: string; message: string }>(`/api/datasets/${name}/resume-extract`, {}),
   importLocal: (name: string) => post<{ status: string; message: string }>(`/api/datasets/${name}/import-local`, {}),
   downloadFromUrl: (name: string, url: string) => post<{ status: string; message: string }>(`/api/datasets/${name}/download-url`, { url }),
   uploadDataset: (name: string, file: File, onProgress?: (pct: number, msg: string) => void) => {

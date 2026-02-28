@@ -838,6 +838,10 @@ def _training_worker(
         # These are handled manually below rather than passed to model.train().
         _use_ema = config.pop('ema', True)
         _pin_memory = config.pop('pin_memory', False)
+        config.pop('dataset_name', None)       # internal tracking field — not a YOLO arg
+        config.pop('use_yolo_pretrained', None)  # handled above, not a YOLO arg
+        config.pop('yolov8_backbone', None)      # handled above, not a YOLO arg
+        config.pop('nan_retries', None)          # handled above, not a YOLO arg
 
         # Build train kwargs (only valid Ultralytics parameters)
         train_kwargs = {k: v for k, v in config.items() if v != ""}

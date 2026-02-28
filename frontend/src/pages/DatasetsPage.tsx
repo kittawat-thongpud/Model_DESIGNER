@@ -47,7 +47,9 @@ interface WorkspaceScan {
   scanning: boolean;
   found: boolean;
   file_count: number;
+  dir_count: number;
   size_bytes: number;
+  pending_archive: { path: string; name: string; size_bytes: number } | null;
 }
 
 interface StatusInfo {
@@ -75,7 +77,7 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [installMethod, setInstallMethod] = useState<InstallMethod>('choose');
   const [urlInput, setUrlInput] = useState('');
-  const [wsScan, setWsScan] = useState<WorkspaceScan>({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
+  const [wsScan, setWsScan] = useState<WorkspaceScan>({ scanning: false, found: false, file_count: 0, dir_count: 0, size_bytes: 0, pending_archive: null });
 
   // Delete dialog
   const [deleteTarget, setDeleteTarget] = useState<DatasetInfo | null>(null);
@@ -124,19 +126,25 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
     setUploadState({ status: 'idle', progress: 0, message: '' });
     setInstallMethod('choose');
     setUrlInput('');
-    // Scan workspace first
-    const isManualDs = statuses[ds.name]?.manual;
-    if (isManualDs) {
-      setWsScan({ scanning: true, found: false, file_count: 0, size_bytes: 0 });
-      try {
-        const r = await api.workspaceScan(ds.name);
-        setWsScan({ scanning: false, found: r.found, file_count: r.file_count, size_bytes: r.size_bytes ?? 0 });
-        if (r.found) setInstallMethod('workspace');
-      } catch {
-        setWsScan({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
+    // Always scan workspace — detect both existing files and pending _download_ archives
+    setWsScan({ scanning: true, found: false, file_count: 0, dir_count: 0, size_bytes: 0, pending_archive: null });
+    try {
+      const r = await api.workspaceScan(ds.name);
+      setWsScan({
+        scanning: false,
+        found: r.found,
+        file_count: r.file_count,
+        dir_count: r.dir_count ?? 0,
+        size_bytes: r.size_bytes ?? 0,
+        pending_archive: r.pending_archive ?? null,
+      });
+      if (r.pending_archive) {
+        setInstallMethod('workspace');
+      } else if (r.found && statuses[ds.name]?.manual) {
+        setInstallMethod('workspace');
       }
-    } else {
-      setWsScan({ scanning: false, found: false, file_count: 0, size_bytes: 0 });
+    } catch {
+      setWsScan({ scanning: false, found: false, file_count: 0, dir_count: 0, size_bytes: 0, pending_archive: null });
     }
   };
 
@@ -156,6 +164,33 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
 
   const isManual = downloadTarget ? statuses[downloadTarget.name]?.manual : false;
   const manualInstructions = downloadTarget ? statuses[downloadTarget.name]?.instructions : undefined;
+
+  const handleResumeExtract = useCallback(async () => {
+    if (!downloadTarget) return;
+    const name = downloadTarget.name;
+    setUploadState({ status: 'extracting', progress: 50, message: 'Resuming extraction...' });
+    try {
+      await api.resumeExtract(name);
+    } catch (e: unknown) {
+      setUploadState({ status: 'error', progress: 0, message: e instanceof Error ? e.message : 'Resume extract failed' });
+      return;
+    }
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await api.getDatasetUploadStatus(name);
+        setUploadState({ status: s.status as UploadState['status'], progress: s.progress, message: s.message });
+        if (s.status === 'complete' || s.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          if (s.status === 'complete') {
+            const fresh = await api.getDatasetStatus(name).catch(() => null);
+            if (fresh) setStatuses(prev => ({ ...prev, [name]: { ...prev[name], available: true, meta: fresh.meta } }));
+          }
+        }
+      } catch { /* ignore */ }
+    }, 800);
+  }, [downloadTarget]);
 
   const handleImportLocal = useCallback(async () => {
     if (!downloadTarget) return;
@@ -522,14 +557,32 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
                 </div>
               )}
 
-              {/* ── Workspace found banner ── */}
-              {!wsScan.scanning && wsScan.found && installMethod === 'workspace' && uploadState.status === 'idle' && (
+              {/* ── Pending archive banner (resume extract) ── */}
+              {!wsScan.scanning && wsScan.pending_archive && installMethod === 'workspace' && uploadState.status === 'idle' && (
+                <div className="space-y-3">
+                  <div className="flex items-start gap-2 p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+                    <HardDrive size={16} className="text-amber-400 shrink-0 mt-0.5" />
+                    <div className="text-sm flex-1 min-w-0">
+                      <span className="text-amber-400 font-medium">Downloaded archive found</span>
+                      <p className="text-slate-400 text-xs mt-0.5 truncate">{wsScan.pending_archive.name}</p>
+                      <p className="text-slate-500 text-xs">{(wsScan.pending_archive.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB — ready to extract</p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500">A previously downloaded archive was found. Click Resume to extract and register the dataset.</p>
+                  <div className="flex gap-2 pt-1">
+                    <button onClick={() => setInstallMethod('choose')} className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer">Use different method</button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Workspace found banner (extracted files) ── */}
+              {!wsScan.scanning && wsScan.found && !wsScan.pending_archive && installMethod === 'workspace' && uploadState.status === 'idle' && (
                 <div className="space-y-3">
                   <div className="flex items-center gap-2 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg">
                     <FolderSearch size={16} className="text-emerald-400 shrink-0" />
                     <div className="text-sm">
                       <span className="text-emerald-400 font-medium">Files found in workspace</span>
-                      <span className="text-slate-400 ml-2">({wsScan.file_count.toLocaleString()} files · {(wsScan.size_bytes / (1024 * 1024)).toFixed(0)} MB)</span>
+                      <span className="text-slate-400 ml-2">({wsScan.file_count.toLocaleString()} files, {wsScan.dir_count} dirs)</span>
                     </div>
                   </div>
                   <p className="text-xs text-slate-500">Dataset files already exist in the server workspace. Click Import to build the index.</p>
@@ -772,14 +825,21 @@ export default function DatasetsPage({ onOpenDataset }: Props) {
               {/* Idle states */}
               {uploadState.status === 'idle' && dlState.status === 'idle' && !wsScan.scanning && (
                 <>
-                  {/* Workspace found → Import button */}
+                  {/* Workspace found → Resume Extract or Import */}
                   {installMethod === 'workspace' && (
                     <>
                       <button onClick={closeDialog} className="px-4 py-2 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer">Cancel</button>
-                      <button onClick={handleImportLocal}
-                        className="flex items-center gap-2 px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer">
-                        <FolderSearch size={14} /> Import from workspace
-                      </button>
+                      {wsScan.pending_archive ? (
+                        <button onClick={handleResumeExtract}
+                          className="flex items-center gap-2 px-4 py-2 text-sm bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition-colors cursor-pointer">
+                          <HardDrive size={14} /> Resume Extract
+                        </button>
+                      ) : (
+                        <button onClick={handleImportLocal}
+                          className="flex items-center gap-2 px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer">
+                          <FolderSearch size={14} /> Import from workspace
+                        </button>
+                      )}
                     </>
                   )}
                   {/* Method selector / instructions */}

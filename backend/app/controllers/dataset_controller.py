@@ -340,16 +340,74 @@ def _bg_download(name: str):
 
 @router.get("/{name}/workspace-scan", summary="Check if dataset files exist in workspace")
 async def workspace_scan(name: str):
-    """Scan DATASETS_DIR for existing files without plugin availability check."""
+    """Fast scan: check top-level entries + detect pending _download_ archives."""
     _get_plugin(name)  # 404 if not registered
     key = name.lower()
     dest = DATASETS_DIR / key
     if not dest.exists():
-        return {"found": False, "path": str(dest), "file_count": 0}
-    files = list(dest.rglob("*"))
-    file_count = sum(1 for f in files if f.is_file())
-    size_bytes = sum(f.stat().st_size for f in files if f.is_file())
-    return {"found": file_count > 0, "path": str(dest), "file_count": file_count, "size_bytes": size_bytes}
+        return {"found": False, "path": str(dest), "file_count": 0,
+                "pending_archive": None}
+
+    # Fast: only iterate top-level entries (no recursive stat)
+    top_entries = list(dest.iterdir())
+    file_count = sum(1 for f in top_entries if f.is_file())
+    dir_count  = sum(1 for f in top_entries if f.is_dir())
+
+    # Detect any leftover _download_*.{tar.gz,zip,tgz,...} archive
+    pending_archive = None
+    for f in top_entries:
+        if f.is_file() and f.name.startswith("_download_"):
+            pending_archive = {"path": str(f), "name": f.name,
+                               "size_bytes": f.stat().st_size}
+            break
+
+    found = (file_count + dir_count) > 0
+    return {
+        "found": found,
+        "path": str(dest),
+        "file_count": file_count,
+        "dir_count": dir_count,
+        "pending_archive": pending_archive,
+    }
+
+
+@router.post("/{name}/resume-extract", summary="Extract a pending _download_ archive found in the dataset directory")
+async def resume_extract(name: str):
+    """If a leftover _download_* archive exists in the dataset dir, extract it now."""
+    key = name.lower()
+    plugin = _get_plugin(key)
+    dest = DATASETS_DIR / key
+
+    # Find the pending archive
+    pending = None
+    if dest.exists():
+        for f in dest.iterdir():
+            if f.is_file() and f.name.startswith("_download_"):
+                pending = f
+                break
+
+    if not pending:
+        raise HTTPException(status_code=404,
+                            detail="No pending _download_ archive found in dataset directory")
+
+    with _upload_lock:
+        existing = _upload_tasks.get(key)
+        if existing and existing["status"] in ("uploading", "extracting"):
+            raise HTTPException(status_code=409, detail="Extraction already in progress")
+        state: dict = {
+            "status": "extracting",
+            "progress": 50,
+            "message": f"Resuming extraction of {pending.name}…",
+        }
+        _upload_tasks[key] = state
+
+    thread = threading.Thread(
+        target=_bg_extract,
+        args=(key, str(pending), state),
+        daemon=True,
+    )
+    thread.start()
+    return {"status": "extracting", "message": f"Extracting {pending.name}"}
 
 
 @router.post("/{name}/import-local", summary="Index an already-extracted dataset from workspace")
@@ -576,24 +634,41 @@ def _bg_url_download(name: str, url: str):
                         state["eta_seconds"] = int((total - received) / state["rate_bps"]) if state["rate_bps"] > 0 and total > 0 else -1
 
         state["progress"] = 50
-        state["message"] = "Extracting..."
+        state["message"] = "Detecting archive format..."
 
-        # Detect archive format from magic bytes (reliable even for GDrive .bin downloads)
+        # Detect archive format from magic bytes only (no tarfile.is_tarfile — it reads whole file)
         import zipfile, tarfile
         with open(tmp_path, "rb") as _mf:
             magic = _mf.read(8)
-        is_zip = magic[:4] == b"PK\x03\x04"
-        is_tar_gz = magic[:2] == b"\x1f\x8b"          # gzip magic
-        is_tar_bz2 = magic[:3] == b"BZh"               # bzip2 magic
-        is_tar = magic[:5] in (b"ustar",) or (not is_zip and tarfile.is_tarfile(str(tmp_path)))
-
+        is_zip   = magic[:4] == b"PK\x03\x04"
+        is_tar_gz  = magic[:2] == b"\x1f\x8b"   # gzip
+        is_tar_bz2 = magic[:3] == b"BZh"         # bzip2
+        is_tar_raw = magic[:5] == b"ustar"        # ustar posix tar (no compression)
         lower = str(tmp_path).lower()
+        is_tar_ext = lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar"))
+
+        state["message"] = "Extracting..."
+
         if is_zip or lower.endswith(".zip"):
             with zipfile.ZipFile(tmp_path) as zf:
-                zf.extractall(dest_dir)
-        elif is_tar_gz or is_tar_bz2 or is_tar or lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+                members = zf.namelist()
+                total_m = max(len(members), 1)
+                for i, member in enumerate(members):
+                    zf.extract(member, dest_dir)
+                    if i % 200 == 0:
+                        pct = 50 + int((i / total_m) * 35)
+                        state["progress"] = pct
+                        state["message"] = f"Extracting {i}/{total_m} files..."
+        elif is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext:
             with tarfile.open(tmp_path) as tf:
-                tf.extractall(dest_dir, filter="data")
+                i = 0
+                for member in tf:
+                    tf.extract(member, dest_dir, filter="data")
+                    i += 1
+                    if i % 200 == 0:
+                        pct = min(50 + int(i / 100), 84)
+                        state["progress"] = pct
+                        state["message"] = f"Extracting {i} files..."
         else:
             raise ValueError(
                 f"Downloaded file does not appear to be a zip or tar archive "
@@ -725,21 +800,45 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         arc = _Path(archive_path)
         lower = arc.name.lower()
 
-        state["message"] = "Extracting..."
+        state["message"] = "Detecting archive format..."
         state["progress"] = 55
 
-        if lower.endswith(".zip"):
-            import zipfile
-            state["progress"] = 60
+        import zipfile, tarfile as _tarfile
+        with open(arc, "rb") as _mf:
+            magic = _mf.read(8)
+        is_zip    = magic[:4] == b"PK\x03\x04"
+        is_tar_gz  = magic[:2] == b"\x1f\x8b"
+        is_tar_bz2 = magic[:3] == b"BZh"
+        is_tar_raw = magic[:5] == b"ustar"
+        is_tar_ext = lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar"))
+
+        state["message"] = "Extracting..."
+
+        if is_zip or lower.endswith(".zip"):
             with zipfile.ZipFile(arc) as zf:
-                zf.extractall(dest)
-        elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
-            import tarfile
-            state["progress"] = 60
-            with tarfile.open(arc) as tf:
-                tf.extractall(dest, filter="data")
+                members = zf.namelist()
+                total_m = max(len(members), 1)
+                for i, member in enumerate(members):
+                    zf.extract(member, dest)
+                    if i % 200 == 0:
+                        pct = 55 + int((i / total_m) * 33)
+                        state["progress"] = pct
+                        state["message"] = f"Extracting {i}/{total_m} files..."
+        elif is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext:
+            with _tarfile.open(arc) as tf:
+                i = 0
+                for member in tf:
+                    tf.extract(member, dest, filter="data")
+                    i += 1
+                    if i % 200 == 0:
+                        pct = min(55 + int(i / 100), 87)
+                        state["progress"] = pct
+                        state["message"] = f"Extracting {i} files..."
         else:
-            raise ValueError(f"Unsupported archive format: {arc.name}")
+            raise ValueError(
+                f"Unsupported archive format: {arc.name} "
+                f"(magic bytes: {magic[:4].hex()})"
+            )
         state["progress"] = 88
 
         # Flatten single-root-dir extraction (e.g. idd/ inside zip)

@@ -128,7 +128,7 @@ export default function WeightMappingPanel({
   // System weights for "Select from System" picker
   const [systemWeights, setSystemWeights] = useState<WeightRecord[]>([]);
   const [showSystemPicker, setShowSystemPicker] = useState(false);
-  const [sameModelOnly, setSameModelOnly] = useState(true);
+  const [sameModelOnly, setSameModelOnly] = useState(false);
 
   // Pretrained model catalog
   const [pretrained, setPretrained] = useState<PretrainedModelInfo[]>([]);
