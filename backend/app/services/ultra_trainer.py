@@ -1513,15 +1513,22 @@ def _preflight_cache_diag(data_arg: Any, job_id: str) -> None:
         return []
 
     for split_name in ("train", "val"):
-        cache_file = labels_dir / f"{split_name}.cache"
-
-        # Compute current hash the same way Ultralytics does
+        # Compute current hash and cache path the same way Ultralytics does:
+        # cache_path = Path(label_files[0]).parent.with_suffix(".cache")
         try:
             im_files = _resolve_im_files(split_name)
-            label_files = img2label_paths(im_files) if im_files else []
-            current_hash = get_hash(label_files + im_files) if im_files else "no_images"
+            if not im_files:
+                job_storage.append_job_log(job_id, "DEBUG",
+                    f"Cache diag: split={split_name} — no images resolved from data.yaml")
+                continue
+            label_files = img2label_paths(im_files)
+            current_hash = get_hash(label_files + im_files)
+            # Cache path = first label file's parent dir with .cache suffix
+            cache_file = Path(label_files[0]).parent.with_suffix(".cache")
         except Exception as _he:
-            current_hash = f"hash_error({_he})"
+            job_storage.append_job_log(job_id, "DEBUG",
+                f"Cache diag: split={split_name} hash error: {_he}")
+            continue
 
         if cache_file.exists():
             try:
@@ -1530,14 +1537,14 @@ def _preflight_cache_diag(data_arg: Any, job_id: str) -> None:
                 stored_hash = cached.get("hash", "?")
                 match = "✅ MATCH" if stored_hash == current_hash else "❌ MISMATCH"
                 job_storage.append_job_log(job_id, "DEBUG",
-                    f"Cache diag: {cache_file.name} | version={ver} | {match} | "
+                    f"Cache diag: {cache_file.name} ({split_name}) | version={ver} | {match} | "
                     f"stored={str(stored_hash)[:12]} current={current_hash[:12]} | writable={writeable}")
             except Exception as e:
                 job_storage.append_job_log(job_id, "WARNING",
                     f"Cache diag: {cache_file.name} UNREADABLE ({e}) — will rescan")
         else:
             job_storage.append_job_log(job_id, "DEBUG",
-                f"Cache diag: {cache_file.name} NOT FOUND | "
+                f"Cache diag: {cache_file.name} ({split_name}) NOT FOUND | "
                 f"writable={writeable} — {'will save after scan' if writeable else 'NOT saving (read-only!)'}")
 
 
@@ -1584,6 +1591,9 @@ def _cleanup_corrupt_dataset_cache(data_arg: Any, job_id: str) -> dict[str, Any]
         return result
 
     import numpy as np
+
+    job_storage.append_job_log(job_id, "DEBUG",
+        f"Dataset cache files found: {[str(p.relative_to(dataset_root)) for p in cache_files]}")
 
     for cache_path in cache_files:
         result["scanned"] += 1
