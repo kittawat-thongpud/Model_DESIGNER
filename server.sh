@@ -7,6 +7,7 @@
 #   ./server.sh logs    — tail server log file
 #   ./server.sh stop    — kill server session
 #   ./server.sh status  — show if session is running
+#   ./server.sh restart — restart server without git pull
 #   ./server.sh update  — git pull latest code and restart server
 
 SESSION="model-designer"
@@ -21,9 +22,7 @@ if [ ! -f "${VENV_PYTHON}" ]; then
     VENV_PYTHON="$(which python3)"
 fi
 
-CMD="cd ${APP_DIR}/backend && ${VENV_PYTHON} -m uvicorn app.main:app \
-    --host 0.0.0.0 --port 8000 --workers 1 --no-access-log \
-    2>&1 | tee ${LOG_FILE}"
+CMD="cd ${APP_DIR} && bash run.sh 2>&1 | tee ${LOG_FILE}"
 
 case "${1}" in
     start)
@@ -77,6 +76,21 @@ case "${1}" in
         else
             echo "⛔ Session '${SESSION}' is NOT running."
             echo "   Use: ./server.sh start   — to start"
+        fi
+        ;;
+    restart)
+        if tmux has-session -t "${SESSION}" 2>/dev/null; then
+            echo "🔁 Stopping session '${SESSION}'..."
+            tmux kill-session -t "${SESSION}"
+            sleep 1
+        fi
+        tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
+        sleep 1
+        if tmux has-session -t "${SESSION}" 2>/dev/null; then
+            echo "✅ Server restarted in tmux session '${SESSION}'"
+            echo "   Use: ./server.sh logs  — to verify"
+        else
+            echo "❌ Failed to restart. Check: cat ${LOG_FILE}"
         fi
         ;;
     update)
