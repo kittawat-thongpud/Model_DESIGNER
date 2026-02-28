@@ -467,6 +467,86 @@ async def download_from_url(name: str, body: dict):
     return _download_tasks[key]
 
 
+def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, progress_end: int = 84) -> int:
+    """Scan dest_dir for nested archive files and extract them in-place.
+
+    Handles patterns like idd-detection.tar.gz sitting inside the extracted dir.
+    Returns number of nested archives extracted.
+    """
+    import zipfile, tarfile as _tarfile
+
+    ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz"}
+
+    # Collect candidate archive files (non-hidden, not starting with _download_)
+    candidates = []
+    for p in sorted(dest_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.name.startswith((".", "_download_")):
+            continue
+        name_lower = p.name.lower()
+        if any(name_lower.endswith(s) for s in ARCHIVE_SUFFIXES):
+            candidates.append(p)
+        else:
+            # Check magic bytes for unrecognised extensions
+            try:
+                with open(p, "rb") as _mf:
+                    hdr = _mf.read(8)
+                if (hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b"
+                        or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"):
+                    candidates.append(p)
+            except Exception:
+                pass
+
+    if not candidates:
+        return 0
+
+    extracted = 0
+    for idx, arc in enumerate(candidates):
+        arc_lower = arc.name.lower()
+        extract_to = arc.parent  # extract beside the archive file
+
+        state["message"] = f"Extracting nested archive: {arc.name} ..."
+        pct = progress_start + int((idx / len(candidates)) * (progress_end - progress_start))
+        state["progress"] = pct
+
+        try:
+            with open(arc, "rb") as _mf:
+                hdr = _mf.read(8)
+            is_zip    = hdr[:4] == b"PK\x03\x04"
+            is_tar_gz  = hdr[:2] == b"\x1f\x8b"
+            is_tar_bz2 = hdr[:3] == b"BZh"
+            is_tar_raw = hdr[:5] == b"ustar"
+            is_tar_ext = arc_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar", ".tar.xz"))
+
+            if is_zip or arc_lower.endswith(".zip"):
+                with zipfile.ZipFile(arc) as zf:
+                    members = zf.namelist()
+                    total_m = max(len(members), 1)
+                    for i, member in enumerate(members):
+                        zf.extract(member, extract_to)
+                        if i % 500 == 0:
+                            state["message"] = f"Extracting {arc.name}: {i}/{total_m} files..."
+            elif is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext:
+                with _tarfile.open(arc) as tf:
+                    i = 0
+                    for member in tf:
+                        tf.extract(member, extract_to, filter="data")
+                        i += 1
+                        if i % 500 == 0:
+                            state["message"] = f"Extracting {arc.name}: {i} files..."
+            else:
+                continue  # not a recognised archive despite name/magic — skip
+
+            arc.unlink(missing_ok=True)
+            extracted += 1
+        except Exception as _ne:
+            # Don't fail the whole job for one nested archive
+            state["message"] = f"Warning: could not extract {arc.name}: {_ne}"
+
+    return extracted
+
+
 def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
     """Download a Google Drive file handling large-file virus-scan confirmation.
 
@@ -560,13 +640,18 @@ def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
             )
 
     # Sanity check: if we got HTML instead of a real file, fail loudly
-    if received < 1024:
+    with open(dest_path, "rb") as _sf:
+        _magic = _sf.read(8)
+    _is_html = _magic[:5] in (b"<!DOC", b"<html", b"<HTML") or _magic[:2] == b"<!"
+    if _is_html or received < 1024:
         import os
         os.unlink(dest_path)
         raise RuntimeError(
-            "Google Drive returned an unexpectedly small response. "
-            "The file may require authentication or the link may have changed. "
-            "Try installing gdown (pip install gdown) for better Drive support."
+            "Google Drive returned an HTML page instead of the file. "
+            "The file is likely restricted or requires sign-in. "
+            "Fix: share the file as 'Anyone with the link → Viewer', "
+            "then retry. Alternatively, install gdown (pip install gdown) "
+            "or download manually and use the Upload option."
         )
 
 
@@ -647,6 +732,18 @@ def _bg_url_download(name: str, url: str):
         lower = str(tmp_path).lower()
         is_tar_ext = lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar"))
 
+        # Detect HTML response (Google Drive login/virus-scan page returned instead of file)
+        is_html = magic[:5] in (b"<!DOC", b"<html", b"<HTML") or magic[:2] == b"<!"
+        if is_html:
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError(
+                "Google Drive returned an HTML page instead of the file. "
+                "The file may be restricted, require sign-in, or the sharing link has expired. "
+                "Try: (1) Make sure the file is shared as 'Anyone with the link', "
+                "(2) Install gdown on the server: pip install gdown, "
+                "(3) Download the file manually and use the Upload option instead."
+            )
+
         state["message"] = "Extracting..."
 
         if is_zip or lower.endswith(".zip"):
@@ -690,6 +787,11 @@ def _bg_url_download(name: str, url: str):
                 inner.rmdir()
             except Exception:
                 pass
+
+        # Extract any nested archives (e.g. idd-detection.tar.gz inside the zip)
+        nested = _extract_nested_archives(dest_dir, state, progress_start=70, progress_end=84)
+        if nested:
+            state["message"] = f"Extracted {nested} nested archive(s). Building index..."
 
         state["progress"] = 85
         state["message"] = "Building index..."
@@ -855,6 +957,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                 inner.rmdir()
             except Exception:
                 pass
+
+        # Extract any nested archives (e.g. idd-detection.tar.gz inside the zip)
+        nested = _extract_nested_archives(dest, state, progress_start=70, progress_end=88)
+        if nested:
+            state["message"] = f"Extracted {nested} nested archive(s). Building index..."
 
         state["progress"] = 90
         state["message"] = "Building index..."

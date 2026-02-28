@@ -12,7 +12,7 @@ import type {
   MappingPreview, MappingKey, ApplyMapResult,
   CompatCheckResult, LayerDetailResult,
   LogEntry, DashboardStats,
-  InferenceResult, InferenceHistoryEntry,
+  InferenceResult, InferenceHistoryEntry, InferResult,
   BenchmarkResult, JobCheckpoint,
 } from '../types';
 
@@ -341,6 +341,38 @@ export const api = {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.detail || `HTTP ${res.status}`);
     }
+    return res.json();
+  },
+  infer: async (
+    weightId: string, file: File, conf = 0.25, iou = 0.45, imgsz = 640, visualizeSgbg = false
+  ): Promise<InferResult> => {
+    const fd = new FormData();
+    fd.append('weight_id', weightId);
+    fd.append('conf', String(conf));
+    fd.append('iou', String(iou));
+    fd.append('imgsz', String(imgsz));
+    fd.append('visualize_sgbg', String(visualizeSgbg));
+    fd.append('file', file);
+    const res = await fetch('/api/inference/infer', { method: 'POST', body: fd });
+    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.detail || `HTTP ${res.status}`); }
+    return res.json();
+  },
+  inferAttention: async (
+    weightId: string, file: File, imgsz: number,
+    bbox: [number, number, number, number],  // [x1,y1,x2,y2]
+    detLabel: string,
+  ): Promise<{ weight_id: string; det_label: string; bbox_centroid: number[]; scales: Record<string, { scale: string; feature_hw: number[]; query_pixel: number[]; attention: string }> }> => {
+    const fd = new FormData();
+    fd.append('weight_id', weightId);
+    fd.append('imgsz', String(imgsz));
+    fd.append('bbox_x1', String(bbox[0]));
+    fd.append('bbox_y1', String(bbox[1]));
+    fd.append('bbox_x2', String(bbox[2]));
+    fd.append('bbox_y2', String(bbox[3]));
+    fd.append('det_label', detLabel);
+    fd.append('file', file);
+    const res = await fetch('/api/inference/infer/attention', { method: 'POST', body: fd });
+    if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.detail || `HTTP ${res.status}`); }
     return res.json();
   },
   getInferenceHistory: (limit = 50) => get<InferenceHistoryEntry[]>(`/api/inference/history?limit=${limit}`),

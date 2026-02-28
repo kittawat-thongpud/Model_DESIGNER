@@ -615,6 +615,37 @@ export interface InferenceHistoryEntry {
   type: 'image' | 'video';
 }
 
+// ─── Inference /infer (single image, with optional SGBG vis) ─────────────────
+
+export interface InferDetection {
+  class_id: number;
+  class_name: string;
+  confidence: number;
+  bbox: [number, number, number, number]; // [x1, y1, x2, y2]
+}
+
+export interface SgbgScaleVis {
+  scale: string;
+  feature_hw: [number, number];
+  k: number;
+  gate: number;
+  selection: string;  // data:image/jpeg;base64,...
+  attention: string;
+  delta: string;
+}
+
+export interface InferResult {
+  weight_id: string;
+  filename: string | null;
+  elapsed_ms: number;
+  total_detections: number;
+  is_hsg_det: boolean;
+  detections: InferDetection[];
+  image_b64: string | null;
+  speed: { preprocess_ms: number; inference_ms: number; postprocess_ms: number };
+  sgbg_vis: Record<string, SgbgScaleVis> | { error: string } | null;
+}
+
 // ─── Benchmark ───────────────────────────────────────────────────────────────
 
 export interface BenchmarkPerClass {
