@@ -363,7 +363,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         done = threading.Event()
         start_t = _time.time()
-        timeout_s = 90
+        timeout_s = 600  # 10 min — large datasets (IDD ~47k images) need time to scan+cache
 
         def _watchdog():
             if not done.wait(timeout_s):

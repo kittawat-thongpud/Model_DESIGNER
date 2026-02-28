@@ -910,10 +910,13 @@ def _training_worker(
                 job_storage.append_job_log(job_id, "INFO",
                     f"Auto-tuned dataloader workers: {optimal_workers}")
 
-        # Enable Ultralytics disk cache (cache=True) so label scan results are
-        # stored in a .cache file and reused on subsequent runs — avoids rescanning
-        # 118k images every time.  Only set if user did not already configure it.
-        if "cache" not in train_kwargs:
+        # Force disk cache (cache=True) so label scan results are stored in a
+        # .cache file and reused on subsequent runs — avoids rescanning 100k+
+        # images every time.  Override even if user passed cache=False, since
+        # label scanning is extremely slow for large datasets like COCO/IDD.
+        # Only honour explicit non-False user setting (e.g. "ram" or "disk").
+        _user_cache = train_kwargs.get("cache", None)
+        if not _user_cache or str(_user_cache).lower() in ("false", "0", "none", ""):
             train_kwargs["cache"] = True
 
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
@@ -977,6 +980,9 @@ def _training_worker(
             f"resume={train_kwargs.get('resume', '<unset>')!r}, "
             f"data={train_kwargs.get('data', '<unset>')!r}",
         )
+
+        # Preflight: diagnose label cache state (writability + hash)
+        _preflight_cache_diag(train_kwargs.get("data"), job_id)
 
         # Preflight: scan and remove corrupted Ultralytics dataset cache files (*.cache)
         cache_cleanup = _cleanup_corrupt_dataset_cache(train_kwargs.get("data"), job_id)
@@ -1450,6 +1456,62 @@ def _read_dataset_root_from_data_yaml(data_yaml_path: Path) -> Path | None:
     except Exception:
         return None
     return None
+
+
+def _preflight_cache_diag(data_arg: Any, job_id: str) -> None:
+    """Log label cache writability and hash validity for each split before training."""
+    if not data_arg:
+        return
+    data_path = Path(str(data_arg))
+    if not (data_path.exists() and data_path.suffix.lower() in {".yaml", ".yml"}):
+        return
+
+    dataset_root = _read_dataset_root_from_data_yaml(data_path)
+    if not dataset_root:
+        return
+
+    labels_dir = dataset_root / "labels"
+    if not labels_dir.exists():
+        job_storage.append_job_log(job_id, "DEBUG",
+            f"Cache diag: labels dir not found at {labels_dir}")
+        return
+
+    import numpy as np
+    from ultralytics.utils.files import is_dir_writeable
+    from ultralytics.data.utils import get_hash, img2label_paths
+
+    writeable = is_dir_writeable(labels_dir)
+
+    for split_dir in sorted(labels_dir.iterdir()):
+        if not split_dir.is_dir():
+            continue
+        # Ultralytics stores: labels/<split>.cache  (Path(label_files[0]).parent.with_suffix(".cache"))
+        cache_file = labels_dir / f"{split_dir.name}.cache"
+
+        # Compute current hash the same way Ultralytics does
+        try:
+            label_files = sorted(str(p) for p in split_dir.rglob("*.txt") if p.is_file())
+            im_files = img2label_paths(label_files)
+            current_hash = get_hash(label_files + im_files) if label_files else "no_labels"
+        except Exception:
+            current_hash = "hash_error"
+
+        if cache_file.exists():
+            try:
+                cached = np.load(str(cache_file), allow_pickle=True).item()
+                ver = cached.get("version", "?")
+                stored_hash = cached.get("hash", "?")
+                match = "✅ MATCH" if stored_hash == current_hash else "❌ MISMATCH"
+                job_storage.append_job_log(job_id, "DEBUG",
+                    f"Cache diag: {cache_file.name} | version={ver} | {match} | "
+                    f"stored={str(stored_hash)[:12]} current={current_hash[:12]} | writable={writeable}")
+            except Exception as e:
+                job_storage.append_job_log(job_id, "WARNING",
+                    f"Cache diag: {cache_file.name} UNREADABLE ({e}) — will rescan")
+        else:
+            job_storage.append_job_log(job_id, "DEBUG",
+                f"Cache diag: {cache_file.name} NOT FOUND | "
+                f"writable={writeable} — {'will save after scan' if writeable else 'NOT saving (read-only!)'}")
 
 
 def _cleanup_corrupt_dataset_cache(data_arg: Any, job_id: str) -> dict[str, Any]:

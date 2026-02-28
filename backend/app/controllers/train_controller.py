@@ -355,7 +355,12 @@ async def create_weight_from_checkpoint(job_id: str, checkpoint_name: str):
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
         try:
-            sd = torch.load(str(dest), map_location="cpu", weights_only=True)
+            import ultralytics.nn.tasks as _ult_tasks
+            _sg = [_ult_tasks.DetectionModel, _ult_tasks.SegmentationModel,
+                   _ult_tasks.PoseModel, _ult_tasks.ClassificationModel,
+                   _ult_tasks.OBBModel, _ult_tasks.WorldModel]
+            with torch.serialization.safe_globals(_sg):
+                sd = torch.load(str(dest), map_location="cpu", weights_only=True)
             meta["key_count"] = len(sd)
             meta["param_count"] = sum(v.numel() for v in sd.values() if hasattr(v, "numel"))
         except Exception:

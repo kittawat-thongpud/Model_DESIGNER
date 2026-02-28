@@ -552,8 +552,13 @@ async def compat_check(weight_id: str, body: CompatCheckRequest):
     if not tgt_path.exists():
         raise HTTPException(status_code=404, detail=f"Target weight not found: {weight_id}")
 
-    src_sd: dict = torch.load(src_path, map_location="cpu", weights_only=True)
-    tgt_sd: dict = torch.load(tgt_path, map_location="cpu", weights_only=True)
+    import ultralytics.nn.tasks as _ult_tasks
+    _safe_globals = [_ult_tasks.DetectionModel, _ult_tasks.SegmentationModel,
+                     _ult_tasks.PoseModel, _ult_tasks.ClassificationModel,
+                     _ult_tasks.OBBModel, _ult_tasks.WorldModel]
+    with torch.serialization.safe_globals(_safe_globals):
+        src_sd: dict = torch.load(src_path, map_location="cpu", weights_only=True)
+        tgt_sd: dict = torch.load(tgt_path, map_location="cpu", weights_only=True)
 
     from ..services.weight_transfer import _match_keys_smart
 
@@ -705,7 +710,12 @@ async def layer_detail(weight_id: str, key: str, bins: int = 50):
     if not pt_path.exists():
         raise HTTPException(status_code=404, detail=f"Weight not found: {weight_id}")
 
-    sd: dict = torch.load(pt_path, map_location="cpu", weights_only=True)
+    import ultralytics.nn.tasks as _ult_tasks
+    _safe_globals = [_ult_tasks.DetectionModel, _ult_tasks.SegmentationModel,
+                     _ult_tasks.PoseModel, _ult_tasks.ClassificationModel,
+                     _ult_tasks.OBBModel, _ult_tasks.WorldModel]
+    with torch.serialization.safe_globals(_safe_globals):
+        sd: dict = torch.load(pt_path, map_location="cpu", weights_only=True)
     if key not in sd:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found in weight {weight_id}")
 
