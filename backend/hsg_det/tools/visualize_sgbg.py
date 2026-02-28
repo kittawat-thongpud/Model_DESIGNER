@@ -164,6 +164,7 @@ class SGBGHooks:
             store["delta"] = delta.detach().cpu()
             store["feature_hw"] = (H, W)
             store["k_actual"] = k_actual
+            store["k_config"] = int(inner_block.k)
 
             return delta
 
@@ -203,6 +204,7 @@ def vis_selection_map(
     img_bgr: np.ndarray,
     scale_label: str,
     out_path: Path,
+    k_config: int | None = None,
 ) -> np.ndarray:
     """Render Top-K token selection as a sparse dot overlay."""
     H, W = feature_hw
@@ -232,7 +234,9 @@ def vis_selection_map(
     title_h = 36
     canvas = np.zeros((ih + title_h, iw, 3), dtype=np.uint8)
     canvas[title_h:] = result_hm
-    cv2.putText(canvas, f"{scale_label}: Top-K Selection Map  (k={len(idx)})",
+    k_actual = int(len(idx))
+    k_str = f"k={k_actual}" if (k_config is None or int(k_config) == k_actual) else f"k={k_actual} (set={int(k_config)})"
+    cv2.putText(canvas, f"{scale_label}: Top-K Selection Map  ({k_str})",
                 (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
 
     cv2.imwrite(str(out_path), canvas)
@@ -478,7 +482,8 @@ def run(
         scale_label = _infer_scale_label(mod_name, all_names)
         scale_slug = scale_label.split()[0].lower()  # "p3", "p4", "p5"
         print(f"\n[{scale_label}]  module: {mod_name}")
-        print(f"  feature_hw={store['feature_hw']}  k={store['k_actual']}  "
+        k_conf = store.get("k_config", store["k_actual"])
+        print(f"  feature_hw={store['feature_hw']}  k={store['k_actual']} (set={k_conf})  "
               f"gate α={store.get('gate_value', 1.0):.4f}")
 
         topk_idx = store["topk_idx"]    # [B, k]
@@ -486,12 +491,13 @@ def run(
         delta     = store["delta"]       # [B, C, H, W]
         fhw       = store["feature_hw"]  # (H, W)
         gate      = store.get("gate_value", 1.0)
+        k_config  = store.get("k_config")
 
         p_sel   = out_dir / f"{stem}_{scale_slug}_selection.png"
         p_attn  = out_dir / f"{stem}_{scale_slug}_attn.png"
         p_delta = out_dir / f"{stem}_{scale_slug}_delta.png"
 
-        pan_sel   = vis_selection_map(topk_idx, fhw, img_display, scale_label, p_sel)
+        pan_sel   = vis_selection_map(topk_idx, fhw, img_display, scale_label, p_sel, k_config=k_config)
         pan_attn  = vis_attention_heatmap(attn, topk_idx, fhw, img_display, scale_label, p_attn, query_frac)
         pan_delta = vis_refinement_delta(delta, img_display, scale_label, p_delta, gate)
 
