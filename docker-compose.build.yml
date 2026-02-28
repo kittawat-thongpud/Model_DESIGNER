@@ -1,0 +1,8 @@
+# Override for local build (development)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+services:
+  model-designer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: model-designer:local

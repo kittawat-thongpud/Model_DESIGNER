@@ -1,9 +1,8 @@
 services:
   model-designer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: model-designer:local
+    # Pre-built image from GitHub Actions (fast — no local build needed)
+    # To build locally instead: docker compose -f docker-compose.yml -f docker-compose.build.yml up
+    image: ghcr.io/kittawat-thongpud/model-designer:latest
     container_name: model-designer
 
     # ── Ports ──────────────────────────────────────────────────────────────────
