@@ -38,9 +38,12 @@ def has_coco_annotations(dataset_path: Path) -> bool:
     if not anno_dir.exists():
         return False
     
-    # Look for COCO JSON files
-    json_files = list(anno_dir.glob("instances_*.json"))
-    return len(json_files) > 0
+    # Look for COCO JSON files — instances_*.json or any *_train/val*.json
+    return bool(
+        list(anno_dir.glob("instances_*.json"))
+        or list(anno_dir.glob("*_train*.json"))
+        or list(anno_dir.glob("*_val*.json"))
+    )
 
 
 def is_already_converted(dataset_path: Path) -> bool:
@@ -141,11 +144,19 @@ def convert_coco_to_yolo(
         "test":      "test",
     }
 
+    # Collect annotation JSON files: instances_*.json OR *_train*.json / *_val*.json
     instances_files = list(anno_dir.glob("instances_*.json"))
+    if not instances_files:
+        # Fallback: any JSON containing a split keyword in the name
+        instances_files = [
+            p for p in sorted(anno_dir.glob("*.json"))
+            if any(kw in p.stem.lower() for kw in ("train", "val", "test"))
+            and not p.name.startswith(".")
+        ]
     if not instances_files:
         return {
             "status": "error",
-            "message": "No instances_*.json files found",
+            "message": "No annotation JSON files containing train/val/test found",
             "error": "No detection annotations found",
         }
 
@@ -155,9 +166,19 @@ def convert_coco_to_yolo(
 
     try:
         for json_path in instances_files:
-            # Determine split subdir from filename, e.g. instances_train2017.json → train2017
-            stem = json_path.stem  # "instances_train2017"
+            # Determine split subdir from filename stem
+            # e.g. instances_train2017 → train2017
+            #      idd_detection_train → train
+            #      idd_detection_val   → val
+            stem = json_path.stem
             split_key = stem.replace("instances_", "")
+            # For patterns like idd_detection_train, take the last token after "_"
+            # that matches a known split keyword
+            if split_key not in SPLIT_MAP:
+                for kw in ("train2017", "val2017", "test2017", "train", "val", "test"):
+                    if kw in split_key:
+                        split_key = kw
+                        break
             out_subdir = SPLIT_MAP.get(split_key, split_key)
             out_dir = labels_root / out_subdir
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -197,8 +218,14 @@ def convert_coco_to_yolo(
 
             # Write one .txt per image (even empty = background, consistent with YOLO)
             for img_id, info in img_info.items():
-                stem_name = Path(info["file"]).stem  # "000000000001"
-                txt_path = out_dir / f"{stem_name}.txt"
+                # Preserve relative subdir structure from file_name so YOLO can find
+                # labels by replacing images/ → labels/ in the full path.
+                # e.g. file_name="frontFar/BLR-.../001542_r.jpg"
+                #      → labels/train/frontFar/BLR-.../001542_r.txt
+                file_path = Path(info["file"])
+                rel_dir = file_path.parent  # e.g. "frontFar/BLR-..."
+                txt_path = out_dir / rel_dir / f"{file_path.stem}.txt"
+                txt_path.parent.mkdir(parents=True, exist_ok=True)
                 w, h = info["w"], info["h"]
                 lines: list[str] = []
                 for cls_idx, bbox in ann_by_img.get(img_id, []):
@@ -268,5 +295,9 @@ def auto_convert_if_needed(dataset_name: str) -> dict[str, Any] | None:
     if is_already_converted(dataset_path):
         return None
     
+    # IDD uses its own 15-class scheme — do NOT remap via COCO 91→80
+    no_remap = {"idd", "idd_detection"}
+    cls91to80 = dataset_name.lower() not in no_remap
+
     # Auto-convert
-    return convert_coco_to_yolo(dataset_name)
+    return convert_coco_to_yolo(dataset_name, cls91to80=cls91to80)

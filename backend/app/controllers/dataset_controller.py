@@ -563,14 +563,17 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
 
     Handles patterns like idd-detection.tar.gz sitting inside the extracted dir.
     Returns number of nested archives extracted.
+    Only scans one level deep to avoid false positives on image/data files.
+    Strips absolute/rooted paths inside archives to prevent path pollution.
     """
     import zipfile, tarfile as _tarfile
 
     ARCHIVE_SUFFIXES = {".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz"}
 
-    # Collect candidate archive files (non-hidden, not starting with _download_)
+    # Collect candidate archive files — TOP-LEVEL ONLY (no rglob) to avoid
+    # false-positives on image/binary files buried in subdirectories.
     candidates = []
-    for p in sorted(dest_dir.rglob("*")):
+    for p in sorted(dest_dir.iterdir()):
         if not p.is_file():
             continue
         if p.name.startswith((".", "_download_")):
@@ -578,19 +581,48 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
         name_lower = p.name.lower()
         if any(name_lower.endswith(s) for s in ARCHIVE_SUFFIXES):
             candidates.append(p)
-        else:
-            # Check magic bytes for unrecognised extensions
-            try:
-                with open(p, "rb") as _mf:
-                    hdr = _mf.read(8)
-                if (hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b"
-                        or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"):
-                    candidates.append(p)
-            except Exception:
-                pass
+            continue
+        # Check magic bytes only for files without a recognised extension
+        try:
+            with open(p, "rb") as _mf:
+                hdr = _mf.read(8)
+            if (hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b"
+                    or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"):
+                candidates.append(p)
+        except Exception:
+            pass
 
     if not candidates:
         return 0
+
+    def _safe_tar_extract(tf: "_tarfile.TarFile", extract_to: "Path") -> int:
+        """Extract tar members, stripping absolute/rooted paths to prevent
+        path pollution (e.g. archive built from /home/user/... would otherwise
+        extract to dest/home/user/... creating unwanted nested directories)."""
+        import posixpath
+        count = 0
+        for member in tf:
+            # Strip leading slashes and any ../.. traversal
+            safe_name = member.name.lstrip("/")
+            # Remove leading path components that are absolute system paths
+            # e.g. "home/rase/kittawat_ws/.../IDD_Detection/JPEGImages/..."
+            # → keep only the meaningful relative portion after the archive root
+            parts = safe_name.replace("\\", "/").split("/")
+            # Drop leading parts that look like absolute system dirs (home, usr, etc.)
+            while parts and parts[0] in ("home", "usr", "etc", "var", "opt", "root", "tmp"):
+                parts = parts[1:]
+            if not parts or not parts[0]:
+                continue
+            safe_name = posixpath.join(*parts)
+            member.name = safe_name
+            try:
+                tf.extract(member, extract_to, filter="data")
+            except Exception:
+                pass
+            count += 1
+            if count % 500 == 0:
+                state["message"] = f"Extracting nested archive: {count} files..."
+        return count
 
     extracted = 0
     for idx, arc in enumerate(candidates):
@@ -612,20 +644,24 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
 
             if is_zip or arc_lower.endswith(".zip"):
                 with zipfile.ZipFile(arc) as zf:
-                    members = zf.namelist()
+                    members = zf.infolist()
                     total_m = max(len(members), 1)
-                    for i, member in enumerate(members):
-                        zf.extract(member, extract_to)
+                    for i, info in enumerate(members):
+                        # Strip absolute/rooted paths to prevent home/rase/... pollution
+                        import posixpath as _pp
+                        safe = info.filename.lstrip("/").replace("\\", "/")
+                        parts = safe.split("/")
+                        while parts and parts[0] in ("home", "usr", "etc", "var", "opt", "root", "tmp"):
+                            parts = parts[1:]
+                        if not parts or not parts[0]:
+                            continue
+                        info.filename = _pp.join(*parts)
+                        zf.extract(info, extract_to)
                         if i % 500 == 0:
                             state["message"] = f"Extracting {arc.name}: {i}/{total_m} files..."
             elif is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext:
                 with _tarfile.open(arc) as tf:
-                    i = 0
-                    for member in tf:
-                        tf.extract(member, extract_to, filter="data")
-                        i += 1
-                        if i % 500 == 0:
-                            state["message"] = f"Extracting {arc.name}: {i} files..."
+                    _safe_tar_extract(tf, extract_to)
             else:
                 continue  # not a recognised archive despite name/magic — skip
 
@@ -975,12 +1011,24 @@ def _bg_url_download(name: str, url: str):
 
         state["message"] = "Extracting..."
 
+        def _strip_abs_path(name: str) -> str:
+            """Strip leading absolute path components (home/usr/etc...) from archive member names."""
+            import posixpath as _pp
+            parts = name.lstrip("/").replace("\\", "/").split("/")
+            while parts and parts[0] in ("home", "usr", "etc", "var", "opt", "root", "tmp"):
+                parts = parts[1:]
+            return _pp.join(*parts) if parts and parts[0] else ""
+
         if is_zip or lower.endswith(".zip"):
             with zipfile.ZipFile(tmp_path) as zf:
-                members = zf.namelist()
+                members = zf.infolist()
                 total_m = max(len(members), 1)
-                for i, member in enumerate(members):
-                    zf.extract(member, dest_dir)
+                for i, info in enumerate(members):
+                    safe = _strip_abs_path(info.filename)
+                    if not safe:
+                        continue
+                    info.filename = safe
+                    zf.extract(info, dest_dir)
                     if i % 200 == 0:
                         pct = 50 + int((i / total_m) * 35)
                         state["progress"] = pct
@@ -989,6 +1037,10 @@ def _bg_url_download(name: str, url: str):
             with tarfile.open(tmp_path) as tf:
                 i = 0
                 for member in tf:
+                    safe = _strip_abs_path(member.name)
+                    if not safe:
+                        continue
+                    member.name = safe
                     tf.extract(member, dest_dir, filter="data")
                     i += 1
                     if i % 200 == 0:
@@ -1145,14 +1197,25 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
         state["message"] = "Extracting..."
 
+        def _strip_abs(n: str) -> str:
+            import posixpath as _pp
+            parts = n.lstrip("/").replace("\\", "/").split("/")
+            while parts and parts[0] in ("home", "usr", "etc", "var", "opt", "root", "tmp"):
+                parts = parts[1:]
+            return _pp.join(*parts) if parts and parts[0] else ""
+
         is_zip_valid = zipfile.is_zipfile(str(arc)) if (is_zip or lower.endswith(".zip")) else False
         if is_zip_valid:
             try:
                 with zipfile.ZipFile(arc) as zf:
-                    members = zf.namelist()
+                    members = zf.infolist()
                     total_m = max(len(members), 1)
-                    for i, member in enumerate(members):
-                        zf.extract(member, dest)
+                    for i, info in enumerate(members):
+                        safe = _strip_abs(info.filename)
+                        if not safe:
+                            continue
+                        info.filename = safe
+                        zf.extract(info, dest)
                         if i % 200 == 0:
                             pct = 55 + int((i / total_m) * 33)
                             state["progress"] = pct
@@ -1166,6 +1229,10 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     with _tarfile.open(arc) as tf:
                         i = 0
                         for member in tf:
+                            safe = _strip_abs(member.name)
+                            if not safe:
+                                continue
+                            member.name = safe
                             tf.extract(member, dest, filter="data")
                             i += 1
                             if i % 200 == 0:

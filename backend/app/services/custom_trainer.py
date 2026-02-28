@@ -883,9 +883,15 @@ class CustomDetectionTrainer(DetectionTrainer):
             if isinstance(val, (int, float)):
                 return float(val)
             if isinstance(val, torch.Tensor):
-                return val.tolist() if val.numel() > 1 else val.item()
+                if val.numel() == 0:
+                    return []
+                return val.tolist() if val.numel() > 1 else float(val.item())
             if isinstance(val, np.ndarray):
-                return val.tolist() if val.size > 1 else val.item()
+                if val.size == 0:
+                    return []
+                if val.ndim == 0:
+                    return float(val)
+                return val.tolist() if val.size > 1 else float(val.flat[0])
             return val
         
         # Extract all available metrics
