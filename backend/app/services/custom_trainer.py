@@ -538,10 +538,19 @@ class CustomDetectionTrainer(DetectionTrainer):
         gpu_mem_gb = None
         gpu_mem_reserved_gb = None
         if torch.cuda.is_available():
-            dev_idx = torch.cuda.current_device()
-            device_str = f'cuda:{dev_idx}'
-            gpu_mem_gb = round(torch.cuda.memory_allocated(dev_idx) / (1024**3), 2)
-            gpu_mem_reserved_gb = round(torch.cuda.memory_reserved(dev_idx) / (1024**3), 2)
+            n_gpus = torch.cuda.device_count()
+            if n_gpus > 1:
+                # DDP: sum memory across all GPUs
+                device_str = ",".join(f"cuda:{i}" for i in range(n_gpus))
+                gpu_mem_gb = round(
+                    sum(torch.cuda.memory_allocated(i) for i in range(n_gpus)) / (1024**3), 2)
+                gpu_mem_reserved_gb = round(
+                    sum(torch.cuda.memory_reserved(i) for i in range(n_gpus)) / (1024**3), 2)
+            else:
+                dev_idx = torch.cuda.current_device()
+                device_str = f'cuda:{dev_idx}'
+                gpu_mem_gb = round(torch.cuda.memory_allocated(dev_idx) / (1024**3), 2)
+                gpu_mem_reserved_gb = round(torch.cuda.memory_reserved(dev_idx) / (1024**3), 2)
         vm = psutil.virtual_memory()
         ram_used_gb = round(vm.used / (1024**3), 2)
         ram_total_gb = round(vm.total / (1024**3), 2)

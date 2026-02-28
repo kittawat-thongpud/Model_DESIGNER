@@ -847,13 +847,22 @@ def _training_worker(
         train_kwargs = {k: v for k, v in config.items() if v != ""}
         train_kwargs["project"] = str(job_dir / "runs")
 
-        # ── Device validation ─────────────────────────────────────────────────
+        # ── Device validation & multi-GPU setup ──────────────────────────────
         # Strip GPU indices that exceed the actual device count so Ultralytics
         # doesn't raise ValueError (e.g. user set "0,1,2" but only 1 GPU exists).
         import torch as _torch
+        _avail = _torch.cuda.device_count()
         _device_val = str(train_kwargs.get("device", "")).strip()
+
+        # Log available hardware
+        if _avail > 0:
+            _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
+            job_storage.append_job_log(job_id, "INFO",
+                f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
+        else:
+            job_storage.append_job_log(job_id, "INFO", "No CUDA GPUs detected — using CPU")
+
         if _device_val and _device_val not in ("cpu", "mps", ""):
-            _avail = _torch.cuda.device_count()
             _indices = []
             for _idx in _device_val.split(","):
                 _idx = _idx.strip()
@@ -865,11 +874,57 @@ def _training_worker(
                 job_storage.append_job_log(job_id, "WARNING",
                     f"Requested device='{_device_val}' but only {_avail} GPU(s) available. "
                     "Falling back to automatic device selection.")
-            elif len(_indices) < len([x for x in _device_val.split(",") if x.strip()]):
-                train_kwargs["device"] = ",".join(_indices)
-                job_storage.append_job_log(job_id, "WARNING",
-                    f"Requested device='{_device_val}' but only {_avail} GPU(s) available. "
-                    f"Using device='{train_kwargs['device']}'.")
+            else:
+                if len(_indices) < len([x for x in _device_val.split(",") if x.strip()]):
+                    train_kwargs["device"] = ",".join(_indices)
+                    job_storage.append_job_log(job_id, "WARNING",
+                        f"Requested device='{_device_val}' but only {_avail} GPU(s) available. "
+                        f"Using device='{train_kwargs['device']}'.")
+                _indices = train_kwargs.get("device", _device_val).split(",")
+
+        # Resolve effective device indices for DDP check
+        _final_device = str(train_kwargs.get("device", "")).strip()
+        _is_multi_gpu = (
+            _avail > 1
+            and _final_device not in ("cpu", "mps", "")
+            and len([x for x in _final_device.split(",") if x.strip()]) > 1
+        )
+
+        if _is_multi_gpu:
+            # Ultralytics DDP spawns child processes via torch.multiprocessing.
+            # In a forked uvicorn worker the default 'fork' start method can
+            # cause deadlocks with CUDA.  Switch to 'spawn' before training.
+            import multiprocessing as _mp
+            try:
+                _current_method = _mp.get_start_method(allow_none=True)
+                if _current_method != "spawn":
+                    _mp.set_start_method("spawn", force=True)
+                    job_storage.append_job_log(job_id, "INFO",
+                        f"Multi-GPU DDP: set multiprocessing start method "
+                        f"'spawn' (was '{_current_method}')")
+            except RuntimeError:
+                # Already set — OK if already spawn; warn otherwise
+                _current_method = _mp.get_start_method(allow_none=True)
+                if _current_method != "spawn":
+                    job_storage.append_job_log(job_id, "WARNING",
+                        f"Multi-GPU DDP: could not change start method from "
+                        f"'{_current_method}' to 'spawn' — DDP may deadlock")
+
+            job_storage.append_job_log(job_id, "INFO",
+                f"Multi-GPU training enabled: device='{_final_device}' "
+                f"({len(_final_device.split(','))} GPUs) — using DDP")
+        elif _avail > 1 and not _final_device:
+            # User left device blank but multiple GPUs exist — use all of them
+            all_indices = ",".join(str(i) for i in range(_avail))
+            train_kwargs["device"] = all_indices
+            job_storage.append_job_log(job_id, "INFO",
+                f"Auto-selected all {_avail} GPUs: device='{all_indices}'")
+            # Apply spawn for this case too
+            import multiprocessing as _mp
+            try:
+                _mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
         # ─────────────────────────────────────────────────────────────────────
 
         # ── ema / pin_memory note ─────────────────────────────────────────────

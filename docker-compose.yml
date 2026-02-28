@@ -24,6 +24,9 @@ services:
       - MODEL_DESIGNER_PYTHON=/opt/venv/bin/python3
       - PYTHONUNBUFFERED=1
 
+    # ── Shared memory (required for multi-GPU DDP via torch.multiprocessing) ───
+    shm_size: '2gb'
+
     # ── GPU ────────────────────────────────────────────────────────────────────
     deploy:
       resources:
