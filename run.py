@@ -98,15 +98,10 @@ def run():
     # ── Clean boot: kill stale workers ───────────────────────────────────────
     clean_boot()
 
-    # ── Detect virtualenv ────────────────────────────────────────────────────
+    # ── Select python interpreter ─────────────────────────────────────────────
     print("🔹 Launching Backend (FastAPI)...")
-    venv_python = BACKEND_DIR / "venv" / "bin" / "python"
-    if venv_python.exists():
-        print(f"   Using venv: {venv_python}")
-        python_exec = str(venv_python)
-    else:
-        print("   Using system python (ensure dependencies are installed)")
-        python_exec = sys.executable
+    python_exec = os.environ.get("MODEL_DESIGNER_PYTHON") or sys.executable
+    print(f"   Python: {python_exec}")
 
     # ── Build frontend if missing ─────────────────────────────────────────────
     dist_dir = FRONTEND_DIR / "dist"

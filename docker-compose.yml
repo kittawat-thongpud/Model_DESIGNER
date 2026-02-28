@@ -1,28 +1,27 @@
 services:
   model-designer:
-    image: ghcr.io/kittawat-thongpud/model-designer:sha-925f089
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: model-designer:local
     container_name: model-designer
 
     # ── Ports ──────────────────────────────────────────────────────────────────
     ports:
       - "8000:8000"
 
-    # ── RunPod Network Volume ──────────────────────────────────────────────────
-    # RunPod mounts the network volume at /workspace on the host.
-    # Mount the ENTIRE /workspace so the project, venv, and data all persist.
-    #
-    # First boot layout (auto-created by entrypoint.sh):
-    #   /workspace/Model_DESIGNER/  ← git clone + venv
-    #   /workspace/data/            ← datasets, weights, jobs, logs
+    # ── Persistent data volume ─────────────────────────────────────────────────
+    # RunPod Network Volume is mounted at /workspace on the host.
+    # Map it to /app/backend/data so DATA_DIR default resolves correctly
+    # and all datasets, weights, jobs, logs persist across container restarts.
     volumes:
-      - /workspace:/workspace
+      - /workspace/data:/app/backend/data
 
     # ── Environment ────────────────────────────────────────────────────────────
     environment:
-      - APP_DIR=/workspace/Model_DESIGNER
-      - DATA_DIR=/workspace/data
-      - GIT_REPO=https://github.com/kittawat-thongpud/Model_DESIGNER
-      - GIT_BRANCH=main
+      - APP_DIR=/app
+      - DATA_DIR=/app/backend/data
+      - MODEL_DESIGNER_PYTHON=/opt/venv/bin/python3
       - PYTHONUNBUFFERED=1
 
     # ── GPU ────────────────────────────────────────────────────────────────────

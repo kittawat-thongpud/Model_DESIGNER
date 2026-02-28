@@ -1,46 +1,67 @@
-# ── Model DESIGNER — Base Runtime Image ───────────────────────────────────────
+# ── Model DESIGNER — Self-contained Runtime Image ────────────────────────────
 #
-# Project-from-volume mode:
-#   - This image contains ONLY the OS runtime (CUDA + system libs + Node + git).
-#   - The actual project code, venv, and data live on the RunPod Network Volume.
-#   - entrypoint.sh handles:
-#       1. git clone on first boot (if /workspace/Model_DESIGNER is missing)
-#       2. python3 -m venv + pip install (if venv is missing)
-#       3. npm run build (if frontend/dist is missing)
-#       4. uvicorn startup
+# All Python deps and frontend dist are baked into the image.
+# On container start, entrypoint.sh:
+#   1. Creates data directories on the mounted volume (idempotent)
+#   2. Runs run.sh (which uses the baked-in venv) as PID 1
 #
+# Build:  docker build -t model-designer .
+# Run:    docker compose up
+
+# ══ Stage 1 — Frontend build ═════════════════════════════════════════════════
+FROM node:20-slim AS frontend-builder
+WORKDIR /build/frontend
+COPY frontend/package*.json ./
+RUN npm ci --prefer-offline
+COPY frontend/ ./
+RUN npm run build
+
+# ══ Stage 2 — Python deps ════════════════════════════════════════════════════
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 AS python-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        gcc g++ \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip -q \
+    && /opt/venv/bin/pip install -r /tmp/requirements.txt
+
+# ══ Stage 3 — Final runtime ══════════════════════════════════════════════════
 FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
-# ── System dependencies ────────────────────────────────────────────────────────
-# libgl1 + friends: OpenCV headless
-# gcc/g++: pycocotools build
-# nodejs/npm: frontend build (runs inside container on first boot)
-# git: repo clone on first boot
+# ── System libs ───────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 \
-        libglib2.0-0 \
-        libsm6 \
-        libxext6 \
-        libxrender1 \
-        gcc \
-        g++ \
-        git \
-        curl \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        git curl tmux \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Default environment ────────────────────────────────────────────────────────
-ENV APP_DIR=/workspace/Model_DESIGNER
+# ── Copy baked venv from builder ──────────────────────────────────────────────
+COPY --from=python-builder /opt/venv /opt/venv
+
+# ── Copy project source ───────────────────────────────────────────────────────
+ENV APP_DIR=/app
+WORKDIR /app
+COPY . /app/
+
+# ── Copy built frontend dist ──────────────────────────────────────────────────
+COPY --from=frontend-builder /build/frontend/dist /app/frontend/dist
+
+# ── Point run.sh / run.py at the baked venv ───────────────────────────────────
+# MODEL_DESIGNER_PYTHON lets run.py skip re-detection and use the baked venv.
+ENV MODEL_DESIGNER_PYTHON=/opt/venv/bin/python3
+ENV PATH=/opt/venv/bin:$PATH
 ENV DATA_DIR=/workspace/data
-ENV GIT_REPO=https://github.com/kittawat-thongpud/Model_DESIGNER
-ENV GIT_BRANCH=main
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# ── Entrypoint (the only file baked into the image) ───────────────────────────
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /app/run.sh /app/server.sh
 
 EXPOSE 8000
 
