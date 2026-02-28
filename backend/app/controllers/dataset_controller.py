@@ -684,11 +684,12 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
             if not jpg_src.exists() or not xml_src.exists():
                 continue
 
-            jpg_link = yolo_img_dir / split / (str(rel_path) + ".jpg")
-            jpg_link.parent.mkdir(parents=True, exist_ok=True)
+            jpg_dest = yolo_img_dir / split / (str(rel_path) + ".jpg")
+            jpg_dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                if not jpg_link.exists():
-                    _os.symlink(jpg_src, jpg_link)
+                if not jpg_dest.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(jpg_src, jpg_dest)
             except Exception:
                 pass
 
@@ -753,7 +754,26 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
 
     out_train = _convert_split("train", train_list)
     out_val = _convert_split("val", val_list)
-    return out_train.exists() and out_val.exists()
+    
+    success = out_train.exists() and out_val.exists()
+    if success:
+        # Cleanup raw files after successful reorganization
+        try:
+            import shutil as _shutil
+            if ann_dir.exists():
+                _shutil.rmtree(ann_dir)
+            if img_dir.exists():
+                _shutil.rmtree(img_dir)
+            for txt_file in [train_list, val_list, root / "test.txt"]:
+                if txt_file.exists():
+                    txt_file.unlink()
+            # Also remove IDD_Detection folder if it exists
+            idd_det_dir = root / "IDD_Detection"
+            if idd_det_dir.exists():
+                _shutil.rmtree(idd_det_dir)
+        except Exception:
+            pass
+    return success
 
 
 def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
@@ -1225,6 +1245,17 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     if not jpg_src.exists() or not xml_src.exists():
                         continue
 
+                    # Copy image to YOLO structure
+                    yolo_img_dir = _root / "images"
+                    (yolo_img_dir / split).mkdir(parents=True, exist_ok=True)
+                    jpg_dest = yolo_img_dir / split / (str(rel_path) + ".jpg")
+                    try:
+                        if not jpg_dest.exists():
+                            import shutil as _shutil
+                            _shutil.copy2(jpg_src, jpg_dest)
+                    except Exception:
+                        pass
+
                     try:
                         tree = _ET.parse(str(xml_src))
                         root = tree.getroot()
@@ -1286,7 +1317,26 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
             out_train = _convert_split("train", train_list)
             out_val = _convert_split("val", val_list)
-            return out_train.exists() and out_val.exists()
+            
+            success = out_train.exists() and out_val.exists()
+            if success:
+                # Cleanup raw files after successful reorganization
+                try:
+                    import shutil as _shutil
+                    if ann_dir.exists():
+                        _shutil.rmtree(ann_dir)
+                    if img_dir.exists():
+                        _shutil.rmtree(img_dir)
+                    for txt_file in [train_list, val_list, _root / "test.txt"]:
+                        if txt_file.exists():
+                            txt_file.unlink()
+                    # Also remove IDD_Detection folder if it exists
+                    idd_det_dir = _root / "IDD_Detection"
+                    if idd_det_dir.exists():
+                        _shutil.rmtree(idd_det_dir)
+                except Exception:
+                    pass
+            return success
 
         if name.lower() == "idd":
             try:
@@ -1295,6 +1345,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     state["message"] = "Converting IDD dataset to COCO JSON..."
                     state["progress"] = max(state.get("progress", 70), 70)
                     _auto_convert_idd_voc_to_coco(dest, state)
+                
+                # Auto-convert COCO to YOLO format for training
+                state["message"] = "Converting COCO annotations to YOLO format..."
+                state["progress"] = 91
+                coco_converter.auto_convert_if_needed("idd")
             except Exception:
                 pass
 
