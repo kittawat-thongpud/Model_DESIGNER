@@ -41,8 +41,8 @@ backbone:
   - [-1, 6, C2f, [256, True]] # 4 — P3 features
   - [-1, 1, Conv, [512, 3, 2]] # 5 — stride 2  → 68×120  (P4)
   - [-1, 6, C2f, [512, True]] # 6 — P4 features
-  - [-1, 1, Conv, [512, 3, 2]] # 7 — stride 2  → 34×60   (P5)
-  - [-1, 3, C2f, [512, True]] # 8 — P5 features
+  - [-1, 1, Conv, [1024, 3, 2]] # 7 — stride 2  → 34×60   (P5)
+  - [-1, 3, C2f, [1024, True]] # 8 — P5 features
   - [-1, 1, SPPF, [1024, 5]] # 9 — Context enrichment (multi-kernel pool)
 
 # ─── Neck ─────────────────────────────────────────────────────────────────────

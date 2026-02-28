@@ -96,6 +96,33 @@ case "${1}" in
     update)
         echo "🔄 Pulling latest code from git..."
         git -C "${APP_DIR}" pull
+
+        # ── Install Node.js / npm if missing ──────────────────────────────────
+        if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+            echo "📦 Node.js/npm not found. Installing via NodeSource (LTS)..."
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+            apt-get install -y nodejs
+        fi
+        echo "   Node: $(node --version)  npm: $(npm --version)"
+
+        # ── Build frontend ────────────────────────────────────────────────────
+        FRONTEND_DIR="${APP_DIR}/frontend"
+        if [ -d "${FRONTEND_DIR}" ]; then
+            echo "📦 Installing npm dependencies..."
+            npm --prefix "${FRONTEND_DIR}" install
+            echo "🔨 Building frontend..."
+            npm --prefix "${FRONTEND_DIR}" run build
+            if [ $? -eq 0 ]; then
+                echo "✅ Frontend built successfully."
+            else
+                echo "❌ Frontend build failed. Aborting restart."
+                exit 1
+            fi
+        else
+            echo "⚠️  No frontend/ directory found — skipping build."
+        fi
+
+        # ── Restart server ────────────────────────────────────────────────────
         if tmux has-session -t "${SESSION}" 2>/dev/null; then
             echo "🔁 Restarting server..."
             tmux kill-session -t "${SESSION}"
