@@ -1476,25 +1476,52 @@ def _preflight_cache_diag(data_arg: Any, job_id: str) -> None:
             f"Cache diag: labels dir not found at {labels_dir}")
         return
 
+    import os
     import numpy as np
-    from ultralytics.utils.files import is_dir_writeable
     from ultralytics.data.utils import get_hash, img2label_paths
 
-    writeable = is_dir_writeable(labels_dir)
+    writeable = os.access(str(labels_dir), os.W_OK)
 
-    for split_dir in sorted(labels_dir.iterdir()):
-        if not split_dir.is_dir():
-            continue
-        # Ultralytics stores: labels/<split>.cache  (Path(label_files[0]).parent.with_suffix(".cache"))
-        cache_file = labels_dir / f"{split_dir.name}.cache"
+    # Read im_paths from data.yaml the same way Ultralytics does
+    # Ultralytics resolves: path + train/val → list of image files, then img2label_paths()
+    try:
+        import yaml as _yaml
+        data_cfg = _yaml.safe_load(data_path.read_text())
+    except Exception:
+        data_cfg = {}
+
+    ds_root_str = data_cfg.get("path", str(dataset_root))
+    ds_root_p = Path(ds_root_str)
+
+    def _resolve_im_files(split_key: str) -> list[str]:
+        """Resolve image paths for a split the same way Ultralytics does."""
+        split_val = data_cfg.get(split_key, "")
+        if not split_val:
+            return []
+        split_val = str(split_val).strip()
+        p = Path(split_val)
+        if not p.is_absolute():
+            p = ds_root_p / p
+        if p.suffix in {".txt"}:
+            # txt file list mode
+            if not p.exists():
+                return []
+            return [ln.strip() for ln in p.read_text().splitlines() if ln.strip()]
+        elif p.is_dir():
+            exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+            return sorted(str(f) for f in p.rglob("*") if f.suffix.lower() in exts)
+        return []
+
+    for split_name in ("train", "val"):
+        cache_file = labels_dir / f"{split_name}.cache"
 
         # Compute current hash the same way Ultralytics does
         try:
-            label_files = sorted(str(p) for p in split_dir.rglob("*.txt") if p.is_file())
-            im_files = img2label_paths(label_files)
-            current_hash = get_hash(label_files + im_files) if label_files else "no_labels"
-        except Exception:
-            current_hash = "hash_error"
+            im_files = _resolve_im_files(split_name)
+            label_files = img2label_paths(im_files) if im_files else []
+            current_hash = get_hash(label_files + im_files) if im_files else "no_images"
+        except Exception as _he:
+            current_hash = f"hash_error({_he})"
 
         if cache_file.exists():
             try:
