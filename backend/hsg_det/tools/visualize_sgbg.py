@@ -184,7 +184,10 @@ def _to_heatmap(arr: np.ndarray, colormap=cv2.COLORMAP_JET) -> np.ndarray:
     if mx > mn:
         arr = (arr - mn) / (mx - mn)
     else:
-        arr = np.zeros_like(arr)
+        # Constant array.
+        # If it's constant non-zero (e.g. selection mask is all-ones when k>=H*W),
+        # render as full-intensity rather than a blank heatmap.
+        arr = np.ones_like(arr) if mx > 0 else np.zeros_like(arr)
     return cv2.applyColorMap((arr * 255).astype(np.uint8), colormap)
 
 

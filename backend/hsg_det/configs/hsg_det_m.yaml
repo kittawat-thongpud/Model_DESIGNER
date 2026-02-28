@@ -1,82 +1,82 @@
-# HSG-DET Medium — Hybrid Sparse-Global Detector
-#
-# Architecture: Conservative CNN-first design (HSG-DET from docs/novel/)
-#   - Backbone : C2f/CSP stages at stride 8/16/32 (YOLOv8-m scale)
-#   - Neck     : PAN/FPN + SparseGlobalBlock at P4 and P5 only
-#   - Head     : Decoupled anchor-free detection (standard YOLOv8 Detect)
-#
-# Complexity (1080p):
-#   - Backbone/Neck: ~558 GFLOPs (grid-dominant, same as YOLO-L)
-#   - SparseGlobalBlock: ~120 GFLOPs (k=512, O(k²·d) per scale)
-#   - Total: ~680 GFLOPs, latency +4–6 ms vs plain YOLO-L
-#
-# Parameters: ~38.5M total (backbone 22M + neck 9M + head 7.5M)
-#
-# How to use:
-#   import hsg_det          # registers SparseGlobalBlock into ultralytics
-#   from ultralytics import YOLO
-#   model = YOLO("hsg_det/configs/hsg_det_m.yaml")
-#   model.train(data="data.yaml", epochs=100, imgsz=1280)
+  # HSG-DET Medium — Hybrid Sparse-Global Detector
+  #
+  # Architecture: Conservative CNN-first design (HSG-DET from docs/novel/)
+  #   - Backbone : C2f/CSP stages at stride 8/16/32 (YOLOv8-m scale)
+  #   - Neck     : PAN/FPN + SparseGlobalBlock at P4 and P5 only
+  #   - Head     : Decoupled anchor-free detection (standard YOLOv8 Detect)
+  #
+  # Complexity (1080p):
+  #   - Backbone/Neck: ~558 GFLOPs (grid-dominant, same as YOLO-L)
+  #   - SparseGlobalBlock: ~120 GFLOPs (k=512, O(k²·d) per scale)
+  #   - Total: ~680 GFLOPs, latency +4–6 ms vs plain YOLO-L
+  #
+  # Parameters: ~38.5M total (backbone 22M + neck 9M + head 7.5M)
+  #
+  # How to use:
+  #   import hsg_det          # registers SparseGlobalBlock into ultralytics
+  #   from ultralytics import YOLO
+  #   model = YOLO("hsg_det/configs/hsg_det_m.yaml")
+  #   model.train(data="data.yaml", epochs=100, imgsz=1280)
 
-# ─── Global ──────────────────────────────────────────────────────────────────
-nc: 80 # default num classes — overridden by dataset plugin at runtime
+  # ─── Global ──────────────────────────────────────────────────────────────────
+  nc: 80 # default num classes — overridden by dataset plugin at runtime
 
-scales:
-  # [depth, width, max_channels]  — 'm' scale matches YOLOv8-m
-  n: [0.33, 0.25, 1024]
-  s: [0.33, 0.50, 1024]
-  m: [0.67, 0.75, 768]
-  l: [1.00, 1.00, 768]
-  x: [1.00, 1.25, 1024]
+  scales:
+    # [depth, width, max_channels]  — 'm' scale matches YOLOv8-m
+    n: [0.33, 0.25, 1024]
+    s: [0.33, 0.50, 1024]
+    m: [0.67, 0.75, 768]
+    l: [1.00, 1.00, 768]
+    x: [1.00, 1.25, 1024]
 
-# ─── Backbone ────────────────────────────────────────────────────────────────
-# Standard YOLOv8-m backbone (C2f-based CSP) — unchanged from YOLO design.
-# Stride pyramid: stride-2 → P3(s8) → P4(s16) → P5(s32)
-backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]] # 0 — Stem: 3→64, stride 2  → 540×960
-  - [-1, 1, Conv, [128, 3, 2]] # 1 — stride 2  → 270×480
-  - [-1, 3, C2f, [128, True]] # 2 — Low-level features
-  - [-1, 1, Conv, [256, 3, 2]] # 3 — stride 2  → 135×240 (P3)
-  - [-1, 6, C2f, [256, True]] # 4 — P3 features
-  - [-1, 1, Conv, [512, 3, 2]] # 5 — stride 2  → 68×120  (P4)
-  - [-1, 6, C2f, [512, True]] # 6 — P4 features
-  - [-1, 1, Conv, [1024, 3, 2]] # 7 — stride 2  → 34×60   (P5)
-  - [-1, 3, C2f, [1024, True]] # 8 — P5 features
-  - [-1, 1, SPPF, [1024, 5]] # 9 — Context enrichment (multi-kernel pool)
+  # ─── Backbone ────────────────────────────────────────────────────────────────
+  # Standard YOLOv8-m backbone (C2f-based CSP) — unchanged from YOLO design.
+  # Stride pyramid: stride-2 → P3(s8) → P4(s16) → P5(s32)
+  backbone:
+    # [from, repeats, module, args]
+    - [-1, 1, Conv, [64, 3, 2]] # 0 — Stem: 3→64, stride 2  → 540×960
+    - [-1, 1, Conv, [128, 3, 2]] # 1 — stride 2  → 270×480
+    - [-1, 3, C2f, [128, True]] # 2 — Low-level features
+    - [-1, 1, Conv, [256, 3, 2]] # 3 — stride 2  → 135×240 (P3)
+    - [-1, 6, C2f, [256, True]] # 4 — P3 features
+    - [-1, 1, Conv, [512, 3, 2]] # 5 — stride 2  → 68×120  (P4)
+    - [-1, 6, C2f, [512, True]] # 6 — P4 features
+    - [-1, 1, Conv, [1024, 3, 2]] # 7 — stride 2  → 34×60   (P5)
+    - [-1, 3, C2f, [1024, True]] # 8 — P5 features
+    - [-1, 1, SPPF, [1024, 5]] # 9 — Context enrichment (multi-kernel pool)
 
-# ─── Neck ─────────────────────────────────────────────────────────────────────
-# PAN/FPN local path (standard) + SparseGlobalBlock at P4 and P5.
-# Local path: preserves spatial detail (dense objects).
-# Sparse path: injects global contextual reasoning (occlusion, scale ambiguity).
-head:
-  # ── FPN Top-down ──────────────────────────────────────────────────────────
+  # ─── Neck ─────────────────────────────────────────────────────────────────────
+  # PAN/FPN local path (standard) + SparseGlobalBlock at P4 and P5.
+  # Local path: preserves spatial detail (dense objects).
+  # Sparse path: injects global contextual reasoning (occlusion, scale ambiguity).
+  head:
+    # ── FPN Top-down ──────────────────────────────────────────────────────────
 
-  # P5' — Sparse global at P5 
-  - [-1, 1, SparseGlobalBlockGated, [1024, 512]] # 10 
+    # P5' — Sparse global at P5 
+    - [-1, 1, SparseGlobalBlockGated, [1024, 512]] # 10 
 
-  # Upsample P5' and fuse with P4
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 11
-  - [[-1, 6], 1, Concat, [1]] # 12 
-  - [-1, 3, C2f, [512]] # 13 — เอา True ออกเพื่อให้ตรงกับ YOLOv8
+    # Upsample P5' and fuse with P4
+    - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 11
+    - [[-1, 6], 1, Concat, [1]] # 12 
+    - [-1, 3, C2f, [512]] # 13 — เอา True ออกเพื่อให้ตรงกับ YOLOv8
 
-  # P4' — Sparse global at P4 
-  - [-1, 1, SparseGlobalBlockGated, [512, 512]] # 14 
+    # P4' — Sparse global at P4 
+    - [-1, 1, SparseGlobalBlockGated, [512, 512]] # 14 
 
-  # Upsample P4' and fuse with P3
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15
-  - [[-1, 4], 1, Concat, [1]] # 16 
-  - [-1, 3, C2f, [256]] # 17 — เอา True ออก
+    # Upsample P4' and fuse with P3
+    - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15
+    - [[-1, 4], 1, Concat, [1]] # 16 
+    - [-1, 3, C2f, [256]] # 17 — เอา True ออก
 
-  # ── PAN Bottom-up ─────────────────────────────────────────────────────────
+    # ── PAN Bottom-up ─────────────────────────────────────────────────────────
 
-  - [-1, 1, Conv, [256, 3, 2]] # 18 
-  - [[-1, 14], 1, Concat, [1]] # 19 
-  - [-1, 3, C2f, [512]] # 20 — เอา True ออก
+    - [-1, 1, Conv, [256, 3, 2]] # 18 
+    - [[-1, 14], 1, Concat, [1]] # 19 
+    - [-1, 3, C2f, [512]] # 20 — เอา True ออก
 
-  - [-1, 1, Conv, [512, 3, 2]] # 21 
-  - [[-1, 10], 1, Concat, [1]] # 22 
-  - [-1, 3, C2f, [1024]] # 23 — *** แก้เป็น 1024 และเอา True ออก ***
+    - [-1, 1, Conv, [512, 3, 2]] # 21 
+    - [[-1, 10], 1, Concat, [1]] # 22 
+    - [-1, 3, C2f, [1024]] # 23 — *** แก้เป็น 1024 และเอา True ออก ***
 
-  # ── Decoupled Detection Head ──────────────────────────────────────────────
-  - [[17, 20, 23], 1, Detect, [nc]] # 24
+    # ── Decoupled Detection Head ──────────────────────────────────────────────
+    - [[17, 20, 23], 1, Detect, [nc]] # 24
