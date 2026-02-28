@@ -7,6 +7,7 @@
 #   ./server.sh logs    — tail server log file
 #   ./server.sh stop    — kill server session
 #   ./server.sh status  — show if session is running
+#   ./server.sh update  — git pull latest code and restart server
 
 SESSION="model-designer"
 # Auto-detect APP_DIR from script location; allow override via env var

@@ -333,14 +333,44 @@ class IDDPlugin(DatasetPlugin):
         )
 
     def is_available(self) -> bool:
+        """Return True only when both annotation JSON files (with idd/detection
+        keywords inside) AND at least one image file are present."""
         if not _IDD_ROOT.exists():
             return False
-        return (
-            _find_ann_file("train") is not None
-            or _find_ann_file("val") is not None
-            or (_IDD_ROOT / "images").exists()
-            or (_IDD_ROOT / "JPEGImages").exists()
-        )
+
+        # Must have at least one annotation file that actually contains IDD content
+        ann_ok = False
+        for split in ("train", "val"):
+            ann_path = _find_ann_file(split)
+            if ann_path and ann_path.exists() and ann_path.stat().st_size > 1024:
+                try:
+                    # Quick keyword scan — don't fully parse the (potentially huge) JSON
+                    header = ann_path.read_bytes()[:4096].lower()
+                    keywords = (b"idd", b"detection", b"idd-detection",
+                                b"india driving", b"insaan")
+                    if any(kw in header for kw in keywords):
+                        ann_ok = True
+                        break
+                    # Fallback: check filename itself
+                    if any(kw in ann_path.name.lower().encode()
+                           for kw in (b"idd", b"detection")):
+                        ann_ok = True
+                        break
+                except Exception:
+                    pass
+
+        if not ann_ok:
+            return False
+
+        # Must also have at least one actual image file
+        img_dir_train = _find_img_dir("train")
+        img_dir_val   = _find_img_dir("val")
+        for img_dir in (img_dir_train, img_dir_val):
+            if img_dir and img_dir.exists():
+                for ext in ("*.jpg", "*.jpeg", "*.png"):
+                    if next(img_dir.rglob(ext), None) is not None:
+                        return True
+        return False
 
     # ── Index management ──────────────────────────────────────────────────────
 

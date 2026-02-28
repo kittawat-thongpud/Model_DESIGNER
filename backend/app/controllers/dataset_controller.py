@@ -409,6 +409,109 @@ async def download_from_url(name: str, body: dict):
     return _download_tasks[key]
 
 
+def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
+    """Download a Google Drive file handling large-file virus-scan confirmation.
+
+    Strategy:
+    1. Try gdown (handles all edge-cases natively) if available.
+    2. Fall back to requests session: first request may return HTML warning page;
+       extract the confirm token from the page and retry with it.
+    """
+    import time as _time, re as _re
+
+    state["message"] = "Connecting to Google Drive..."
+
+    # ── Strategy 1: gdown ────────────────────────────────────────────────────
+    try:
+        import gdown  # type: ignore
+        state["message"] = "Downloading via gdown..."
+
+        def _hook(received: int, total: int):
+            state["bytes_downloaded"] = received
+            state["bytes_total"] = total
+            elapsed = max(_time.time() - _hook._t0, 0.001)
+            state["rate_bps"] = int(received / elapsed)
+            state["progress"] = int(received / total * 50) if total else 10
+            mb = received / (1024 * 1024)
+            tmb = total / (1024 * 1024)
+            state["message"] = f"Downloading {mb:.0f} / {tmb:.0f} MB"
+
+        _hook._t0 = _time.time()
+        gdown.download(id=file_id, output=dest_path, quiet=True,
+                       fuzzy=False, resume=False)
+        return
+    except ImportError:
+        pass  # gdown not installed, fall through
+    except Exception as e:
+        # gdown failed (e.g. quota exceeded) — fall through to requests
+        state["message"] = f"gdown failed ({e}), retrying with requests..."
+
+    # ── Strategy 2: requests session with confirm token ───────────────────────
+    try:
+        import requests as _req
+    except ImportError:
+        raise RuntimeError(
+            "Neither 'gdown' nor 'requests' is installed. "
+            "Install one: pip install gdown  OR  pip install requests"
+        )
+
+    session = _req.Session()
+    base_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    resp = session.get(base_url, headers=headers, stream=True, timeout=60)
+
+    # Google Drive returns HTML for large files (virus-scan warning)
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        html = resp.content.decode("utf-8", errors="replace")
+        # Extract confirm token from the warning form
+        m = _re.search(r'confirm=([0-9A-Za-z_\-]+)', html)
+        if not m:
+            # Newer Drive: look for a download form action with token
+            m = _re.search(r'["\']([0-9A-Za-z_\-]{4,})["\'].*?virus', html)
+        if m:
+            confirm = m.group(1)
+            dl_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm}"
+        else:
+            # Try the newer /uc bypass endpoint
+            dl_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+        resp = session.get(dl_url, headers=headers, stream=True, timeout=60)
+
+    total = int(resp.headers.get("Content-Length", 0) or 0)
+    state["bytes_total"] = total
+
+    received = 0
+    t0 = _time.time()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=4 * 1024 * 1024):
+            if not chunk:
+                continue
+            f.write(chunk)
+            received += len(chunk)
+            elapsed = max(_time.time() - t0, 0.001)
+            state["bytes_downloaded"] = received
+            state["rate_bps"] = int(received / elapsed)
+            state["progress"] = int(received / total * 50) if total else 10
+            mb = received / (1024 * 1024)
+            tmb = total / (1024 * 1024)
+            state["message"] = f"Downloading {mb:.0f} / {tmb:.0f} MB"
+            state["eta_seconds"] = (
+                int((total - received) / state["rate_bps"])
+                if state["rate_bps"] > 0 and total > 0 else -1
+            )
+
+    # Sanity check: if we got HTML instead of a real file, fail loudly
+    if received < 1024:
+        import os
+        os.unlink(dest_path)
+        raise RuntimeError(
+            "Google Drive returned an unexpectedly small response. "
+            "The file may require authentication or the link may have changed. "
+            "Try installing gdown (pip install gdown) for better Drive support."
+        )
+
+
 def _bg_url_download(name: str, url: str):
     """Download from URL, detect Google Drive links, extract, index."""
     import os, re
@@ -417,11 +520,16 @@ def _bg_url_download(name: str, url: str):
     state = _download_tasks[name]
     try:
         # Resolve Google Drive share links → direct download URL
-        gdrive = re.match(r'https://drive\.google\.com/file/d/([^/]+)', url)
+        gdrive = re.match(r'https://drive\.google\.com/file/d/([^/?]+)', url)
         gdrive_folder = re.match(r'https://drive\.google\.com/drive/folders/([^?]+)', url)
+        gdrive_open = re.match(r'https://drive\.google\.com/open\?id=([^&]+)', url)
+
+        is_gdrive = bool(gdrive or gdrive_open)
+        gdrive_file_id = None
         if gdrive:
-            file_id = gdrive.group(1)
-            url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+            gdrive_file_id = gdrive.group(1)
+        elif gdrive_open:
+            gdrive_file_id = gdrive_open.group(1)
         elif gdrive_folder:
             state["status"] = "error"
             state["message"] = "Google Drive folder links not supported. Share individual file links."
@@ -433,50 +541,65 @@ def _bg_url_download(name: str, url: str):
         dest_dir = DATASETS_DIR / name
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        # Determine filename from URL or Content-Disposition
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            cd = resp.headers.get("Content-Disposition", "")
-            fname_match = re.search(r'filename[^;=\n]*=([\'"]?)([^\n;"\']+)\1', cd)
-            if fname_match:
-                fname = fname_match.group(2).strip()
-            else:
-                fname = url.split("?")[0].split("/")[-1] or "dataset.zip"
-            total = int(resp.headers.get("Content-Length", 0) or 0)
-            state["bytes_total"] = total
-
+        if is_gdrive and gdrive_file_id:
+            # Use dedicated GDrive downloader that handles virus-scan confirmation
+            fname = f"gdrive_{gdrive_file_id}.bin"
             tmp_path = dest_dir / f"_download_{fname}"
-            received = 0
-            t0 = _time.time()
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = resp.read(4 * 1024 * 1024)  # 4 MB chunks
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    received += len(chunk)
-                    elapsed = max(_time.time() - t0, 0.001)
-                    state["bytes_downloaded"] = received
-                    state["rate_bps"] = int(received / elapsed)
-                    state["progress"] = int(received / total * 50) if total else 10
-                    state["message"] = f"Downloading {received // (1024*1024):.0f} / {total // (1024*1024):.0f} MB"
-                    state["eta_seconds"] = int((total - received) / state["rate_bps"]) if state["rate_bps"] > 0 and total > 0 else -1
+            _gdrive_download(gdrive_file_id, str(tmp_path), state)
+        else:
+            # Generic URL download
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                cd = resp.headers.get("Content-Disposition", "")
+                fname_match = re.search(r'filename[^;=\n]*=([\'"]?)([^\n;"\']+)\1', cd)
+                if fname_match:
+                    fname = fname_match.group(2).strip()
+                else:
+                    fname = url.split("?")[0].split("/")[-1] or "dataset.zip"
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                state["bytes_total"] = total
+
+                tmp_path = dest_dir / f"_download_{fname}"
+                received = 0
+                t0 = _time.time()
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                        elapsed = max(_time.time() - t0, 0.001)
+                        state["bytes_downloaded"] = received
+                        state["rate_bps"] = int(received / elapsed)
+                        state["progress"] = int(received / total * 50) if total else 10
+                        state["message"] = f"Downloading {received // (1024*1024):.0f} / {total // (1024*1024):.0f} MB"
+                        state["eta_seconds"] = int((total - received) / state["rate_bps"]) if state["rate_bps"] > 0 and total > 0 else -1
 
         state["progress"] = 50
         state["message"] = "Extracting..."
 
-        # Extract
-        lower = fname.lower()
-        if lower.endswith(".zip"):
-            import zipfile
+        # Detect archive format from magic bytes (reliable even for GDrive .bin downloads)
+        import zipfile, tarfile
+        with open(tmp_path, "rb") as _mf:
+            magic = _mf.read(8)
+        is_zip = magic[:4] == b"PK\x03\x04"
+        is_tar_gz = magic[:2] == b"\x1f\x8b"          # gzip magic
+        is_tar_bz2 = magic[:3] == b"BZh"               # bzip2 magic
+        is_tar = magic[:5] in (b"ustar",) or (not is_zip and tarfile.is_tarfile(str(tmp_path)))
+
+        lower = str(tmp_path).lower()
+        if is_zip or lower.endswith(".zip"):
             with zipfile.ZipFile(tmp_path) as zf:
                 zf.extractall(dest_dir)
-        elif lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
-            import tarfile
+        elif is_tar_gz or is_tar_bz2 or is_tar or lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
             with tarfile.open(tmp_path) as tf:
                 tf.extractall(dest_dir, filter="data")
         else:
-            # Not an archive — treat as-is (e.g. already extracted via some other means)
-            pass
+            raise ValueError(
+                f"Downloaded file does not appear to be a zip or tar archive "
+                f"(magic bytes: {magic[:4].hex()}). "
+                "If this is a Google Drive link, the file may require authentication."
+            )
 
         tmp_path.unlink(missing_ok=True)
 
@@ -502,6 +625,18 @@ def _bg_url_download(name: str, url: str):
 
         _invalidate_cache(name)
         _scan_dataset_meta(name)
+
+        # Verify dataset is actually usable after extraction
+        if plugin and not plugin.is_available():
+            state["status"] = "error"
+            state["progress"] = 0
+            state["message"] = (
+                "Extraction complete but dataset files are incomplete or invalid. "
+                "Expected annotation JSON files containing 'idd'/'detection' keywords "
+                "and at least one image file. Please check the archive structure and re-upload."
+            )
+            return
+
         state["status"] = "complete"
         state["progress"] = 100
         state["message"] = "Dataset ready!"
@@ -632,6 +767,17 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
         _invalidate_cache(name)
         _scan_dataset_meta(name)
+
+        # Verify dataset is actually usable after extraction
+        if plugin and not plugin.is_available():
+            state["status"] = "error"
+            state["progress"] = 0
+            state["message"] = (
+                "Extraction complete but dataset files are incomplete or invalid. "
+                "Expected annotation JSON files containing 'idd'/'detection' keywords "
+                "and at least one image file. Please check the archive structure and re-upload."
+            )
+            return
 
         state["status"] = "complete"
         state["progress"] = 100

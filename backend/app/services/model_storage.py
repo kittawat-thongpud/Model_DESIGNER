@@ -147,7 +147,10 @@ def list_models() -> list[dict]:
         yp = d / "model.yaml"
         if not rp.exists():
             continue
-        rec = json.loads(rp.read_text())
+        try:
+            rec = json.loads(rp.read_text())
+        except (json.JSONDecodeError, ValueError):
+            continue
         
         # Count layers and determine input shape
         layer_count = 0
