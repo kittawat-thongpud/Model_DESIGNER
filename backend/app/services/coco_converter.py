@@ -133,18 +133,23 @@ def convert_coco_to_yolo(
         85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79,
     }
 
-    # Map: split name in annotation filename → output subdir name
-    # COCO-style (train2017/val2017) keeps the subdir because images are in images/train2017/.
-    # IDD-style (flat JPEGImages/) must NOT add a split subdir — labels go directly to labels/.
+    # Map: split name in annotation filename → output subdir name.
+    # COCO-2017 style uses explicit subdir names that are already final.
+    # For generic train/val/test splits we detect at runtime whether a
+    # split-specific images/<split>/ directory exists:
+    #   - If images/train/ exists  → labels must go to labels/train/   (YOLO path resolution)
+    #   - If only images/ is flat  → labels go directly to labels/
     SPLIT_MAP = {
         "train2017": "train2017",
         "val2017":   "val2017",
         "test2017":  "test2017",
-        # For flat-image datasets (IDD, VOC-style), no split subdir:
-        "train":     "",
-        "val":       "",
-        "test":      "",
     }
+    img_root = dataset_path / "images"
+    for _sp in ("train", "val", "test"):
+        if (img_root / _sp).is_dir():
+            SPLIT_MAP[_sp] = _sp   # split-specific image dir → matching label subdir
+        else:
+            SPLIT_MAP[_sp] = ""    # flat image layout → flat label layout
 
     # Collect annotation JSON files: instances_*.json OR *_train*.json / *_val*.json
     instances_files = list(anno_dir.glob("instances_*.json"))
@@ -165,6 +170,7 @@ def convert_coco_to_yolo(
     total_written = 0
     total_non_empty = 0
     labels_root = dataset_path / "labels"
+    loaded_data: dict[str, Any] = {}  # split_key → parsed annotation dict
 
     try:
         for json_path in instances_files:
@@ -182,14 +188,12 @@ def convert_coco_to_yolo(
                         split_key = kw
                         break
             out_subdir = SPLIT_MAP.get(split_key, split_key)
-            # If the dataset has split-specific image dirs (e.g. images/train2017/),
-            # keep the subdir. For flat datasets (JPEGImages/ or images/ shared across splits)
-            # out_subdir is empty so labels go directly into labels/.
             out_dir = labels_root / out_subdir if out_subdir else labels_root
             out_dir.mkdir(parents=True, exist_ok=True)
 
             with open(json_path) as f:
                 data = json.load(f)
+            loaded_data[split_key] = data
 
             # Build contiguous class map from this annotation file's categories
             cats_sorted = sorted(data.get("categories", []), key=lambda c: c["id"])
@@ -273,6 +277,7 @@ def convert_coco_to_yolo(
             "message": f"Converted {total_written} annotation files to YOLO format",
             "labels_dir": str(labels_root),
             "file_count": total_written,
+            "loaded_data": loaded_data,
         }
     except Exception as e:
         return {
@@ -304,5 +309,5 @@ def auto_convert_if_needed(dataset_name: str) -> dict[str, Any] | None:
     no_remap = {"idd", "idd_detection"}
     cls91to80 = dataset_name.lower() not in no_remap
 
-    # Auto-convert
+    # Auto-convert — result may contain loaded_data for callers that want to reuse parsed JSON
     return convert_coco_to_yolo(dataset_name, cls91to80=cls91to80)

@@ -88,10 +88,20 @@ def _find_img_dir(split: str) -> Path | None:
 
 # ── Index builder ─────────────────────────────────────────────────────────────
 
-def _build_index(ann_path: Path, img_dir: Path, index_path: Path) -> list[dict]:
-    """Build lightweight per-image index from COCO-style JSON."""
-    with open(ann_path) as f:
-        data = json.load(f)
+def _build_index(
+    ann_path: Path,
+    img_dir: Path,
+    index_path: Path,
+    data: dict | None = None,
+) -> list[dict]:
+    """Build lightweight per-image index from COCO-style JSON.
+
+    *data* may be passed in pre-loaded to avoid a redundant ``json.load`` when
+    the caller already has the annotation dict in memory.
+    """
+    if data is None:
+        with open(ann_path) as f:
+            data = json.load(f)
 
     # Build image lookup
     img_lookup: dict[int, dict] = {}
@@ -426,6 +436,30 @@ class IDDPlugin(DatasetPlugin):
             shutil.rmtree(_INDEX_DIR)
         for split in ("train", "val"):
             self._get_index(split)
+
+    def rebuild_index_with_data(self, split_data: dict[str, dict]) -> None:
+        """Rebuild indices using pre-loaded annotation dicts to avoid re-parsing JSON.
+
+        *split_data* maps split name (e.g. ``"train"``, ``"val"``) to the
+        already-parsed COCO annotation dict for that split.  Any split absent
+        from the mapping is built normally from disk.
+        """
+        with self._lock:
+            self._index_cache.clear()
+            self._categories = None
+        if _INDEX_DIR.exists():
+            import shutil
+            shutil.rmtree(_INDEX_DIR)
+        for split in ("train", "val"):
+            index_path = _INDEX_DIR / f"{split}_index.json"
+            ann_path = _find_ann_file(split)
+            img_dir = _find_img_dir(split)
+            if not ann_path or not img_dir:
+                continue
+            preloaded = split_data.get(split)
+            index = _build_index(ann_path, img_dir, index_path, data=preloaded)
+            with self._lock:
+                self._index_cache[split] = index
 
     # ── Scan splits ───────────────────────────────────────────────────────────
 

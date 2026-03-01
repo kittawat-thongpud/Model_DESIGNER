@@ -31,6 +31,24 @@ from ..plugins.loader import get_dataset_plugin
 router = APIRouter(prefix="/api/datasets", tags=["Datasets"])
 
 
+# ── Shared archive-detection helper ──────────────────────────────────────────
+
+def _looks_like_archive(p: Path) -> bool:
+    """Return True if *p* is a file that looks like a supported archive."""
+    if not p.is_file():
+        return False
+    n = p.name.lower()
+    if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+        return True
+    try:
+        with open(p, "rb") as _mf:
+            hdr = _mf.read(8)
+        return (hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b"
+                or hdr[:3] == b"BZh" or hdr[:5] == b"ustar")
+    except Exception:
+        return False
+
+
 # ── Plugin helper ────────────────────────────────────────────────────────────
 
 def _get_plugin(name: str):
@@ -348,19 +366,6 @@ async def workspace_scan(name: str):
         return {"found": False, "path": str(dest), "file_count": 0,
                 "pending_archive": None}
 
-    def _looks_like_archive(p: Path) -> bool:
-        if not p.is_file():
-            return False
-        n = p.name.lower()
-        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
-            return True
-        try:
-            with open(p, "rb") as _mf:
-                hdr = _mf.read(8)
-            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
-        except Exception:
-            return False
-
     # Fast: only iterate top-level entries (no recursive stat)
     top_entries = list(dest.iterdir())
     file_count = sum(1 for f in top_entries if f.is_file())
@@ -394,19 +399,6 @@ async def resume_extract(name: str):
     key = name.lower()
     plugin = _get_plugin(key)
     dest = DATASETS_DIR / key
-
-    def _looks_like_archive(p: Path) -> bool:
-        if not p.is_file():
-            return False
-        n = p.name.lower()
-        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
-            return True
-        try:
-            with open(p, "rb") as _mf:
-                hdr = _mf.read(8)
-            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
-        except Exception:
-            return False
 
     # Find the pending archive
     pending = None
@@ -453,36 +445,22 @@ async def import_local(name: str):
 
     dest = DATASETS_DIR / key
 
-    def _looks_like_archive(p: Path) -> bool:
-        if not p.is_file():
-            return False
-        n = p.name.lower()
-        if n.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
-            return True
-        try:
-            with open(p, "rb") as _mf:
-                hdr = _mf.read(8)
-            return hdr[:4] == b"PK\x03\x04" or hdr[:2] == b"\x1f\x8b" or hdr[:3] == b"BZh" or hdr[:5] == b"ustar"
-        except Exception:
-            return False
-
     archive_to_extract: Path | None = None
     if dest.exists():
         extracted_dirs = {p.name for p in dest.iterdir() if p.is_dir()}
         looks_extracted = any(d in extracted_dirs for d in ("JPEGImages", "Annotations", "images", "annotations"))
 
-        for f in dest.iterdir():
-            if looks_extracted:
-                break
-            if _looks_like_archive(f):
-                archive_to_extract = f
-                break
+        if not looks_extracted:
+            for f in dest.iterdir():
+                if _looks_like_archive(f):
+                    archive_to_extract = f
+                    break
 
     if archive_to_extract is not None:
         state: dict = {
             "status": "extracting",
             "progress": 50,
-            "message": f"Extracting {archive_to_extract.name}…",
+            "message": f"Extracting {archive_to_extract.name}\u2026",
         }
         _upload_tasks[key] = state
         threading.Thread(
@@ -684,6 +662,44 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     img_dir = root / "JPEGImages"
     train_list = root / "train.txt"
     val_list = root / "val.txt"
+
+    # Fallback: files may still be inside IDD_Detection/ if flatten hasn't run yet
+    # or if the archive places everything under that subdirectory.
+    if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
+        _IDD_WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
+        _sub = next(
+            (d for d in root.iterdir()
+             if d.is_dir() and d.name.lower().replace(" ", "_") in _IDD_WRAPPER_NAMES),
+            None,
+        )
+        if _sub is not None:
+            _ann = _sub / "Annotations"
+            _img = _sub / "JPEGImages"
+            _tr  = _sub / "train.txt"
+            _vl  = _sub / "val.txt"
+            if _ann.exists() and _img.exists() and _tr.exists() and _vl.exists():
+                # Flatten the wrapper dir first, then re-resolve paths
+                state["message"] = f"Flattening {_sub.name}/ before conversion..."
+                import shutil as _sh
+                for _item in list(_sub.iterdir()):
+                    _target = root / _item.name
+                    if _target.exists():
+                        if _item.is_dir() and _target.is_dir():
+                            for _s in list(_item.iterdir()):
+                                _st = _target / _s.name
+                                if not _st.exists():
+                                    _sh.move(str(_s), str(_st))
+                    else:
+                        _sh.move(str(_item), str(_target))
+                try:
+                    _sh.rmtree(str(_sub))
+                except Exception:
+                    pass
+                ann_dir    = root / "Annotations"
+                img_dir    = root / "JPEGImages"
+                train_list = root / "train.txt"
+                val_list   = root / "val.txt"
+
     if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
         return False
 
@@ -725,7 +741,7 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
             try:
                 if not jpg_dest.exists():
                     import shutil as _shutil
-                    _shutil.copy2(jpg_src, jpg_dest)
+                    _shutil.move(str(jpg_src), jpg_dest)
             except Exception:
                 pass
 
@@ -793,17 +809,17 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     
     success = out_train.exists() and out_val.exists()
     if success:
-        # Cleanup raw files after successful reorganization
+        # Images were moved out of img_dir — remove now-empty dir tree and raw files
         try:
             import shutil as _shutil
             if ann_dir.exists():
                 _shutil.rmtree(ann_dir)
+            # img_dir is now empty (all files were moved); remove the skeleton dirs
             if img_dir.exists():
                 _shutil.rmtree(img_dir)
             for txt_file in [train_list, val_list, root / "test.txt"]:
                 if txt_file.exists():
                     txt_file.unlink()
-            # Also remove IDD_Detection folder if it exists
             idd_det_dir = root / "IDD_Detection"
             if idd_det_dir.exists():
                 _shutil.rmtree(idd_det_dir)
@@ -1252,18 +1268,39 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                 )
         state["progress"] = 88
 
-        # Flatten single-root-dir extraction (e.g. idd/ inside zip)
+        # Flatten single-root-dir extraction (e.g. IDD_Detection/ or idd/ inside tar)
+        # Strategy:
+        #   1. If a well-known IDD wrapper dir exists at dest root, always flatten it.
+        #   2. Otherwise fall back to the classic "only one subdir" heuristic.
+        _IDD_WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
+        _idd_wrapper = next(
+            (d for d in dest.iterdir()
+             if d.is_dir() and d.name.lower().replace(" ", "_") in _IDD_WRAPPER_NAMES),
+            None,
+        )
         subdirs = [d for d in dest.iterdir() if d.is_dir()]
-        if len(subdirs) == 1 and not any(dest.iterdir().__next__() == d for d in [dest / "images", dest / "labels", dest / "annotations"]):
-            inner = subdirs[0]
-            # Move contents up one level if the subdir name matches dataset name or common names
-            inner_items = list(inner.iterdir())
-            for item in inner_items:
+        _flatten_dir = _idd_wrapper
+        if _flatten_dir is None and len(subdirs) == 1:
+            inner_candidate = subdirs[0]
+            # Only flatten if the single subdir is not already a final-layout dir
+            _FINAL_DIRS = {"images", "labels", "annotations", "jpegimages"}
+            if inner_candidate.name.lower() not in _FINAL_DIRS:
+                _flatten_dir = inner_candidate
+        if _flatten_dir is not None:
+            state["message"] = f"Flattening {_flatten_dir.name}/ into dataset root..."
+            for item in list(_flatten_dir.iterdir()):
                 target = dest / item.name
-                if not target.exists():
+                if target.exists():
+                    # Destination already exists — merge directories, skip files
+                    if item.is_dir() and target.is_dir():
+                        for sub in list(item.iterdir()):
+                            sub_target = target / sub.name
+                            if not sub_target.exists():
+                                shutil.move(str(sub), str(sub_target))
+                else:
                     shutil.move(str(item), str(target))
             try:
-                inner.rmdir()
+                shutil.rmtree(str(_flatten_dir))
             except Exception:
                 pass
 
@@ -1272,139 +1309,7 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         if nested:
             state["message"] = f"Extracted {nested} nested archive(s). Building index..."
 
-        def _auto_convert_idd_voc_to_coco(_root: _Path, _state: dict) -> bool:
-            import json as _json
-            import xml.etree.ElementTree as _ET
-
-            ann_dir = _root / "Annotations"
-            img_dir = _root / "JPEGImages"
-            train_list = _root / "train.txt"
-            val_list = _root / "val.txt"
-            if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
-                return False
-
-            coco_ann_dir = _root / "annotations"
-            coco_ann_dir.mkdir(parents=True, exist_ok=True)
-
-            cats = [
-                "person", "rider", "car", "truck", "bus", "motorcycle",
-                "bicycle", "autorickshaw", "animal", "traffic light",
-                "traffic sign", "utility pole", "misc", "drivable area", "non-drivable area",
-            ]
-            cat_name_to_id = {n: i for i, n in enumerate(cats)}
-            categories = [{"id": i, "name": n} for i, n in enumerate(cats)]
-
-            def _convert_split(split: str, list_path: _Path) -> _Path:
-                lines = [ln.strip() for ln in list_path.read_text().splitlines() if ln.strip()]
-                images = []
-                annotations = []
-                img_id = 1
-                ann_id = 1
-
-                for idx, rel in enumerate(lines):
-                    if idx % 500 == 0:
-                        _state["message"] = f"Converting IDD VOC→COCO ({split}): {idx}/{len(lines)}"
-                        _state["progress"] = min(_state.get("progress", 70) + 1, 89)
-
-                    rel_path = _Path(rel)
-                    jpg_src = img_dir / (str(rel_path) + ".jpg")
-                    xml_src = ann_dir / (str(rel_path) + ".xml")
-                    if not jpg_src.exists() or not xml_src.exists():
-                        continue
-
-                    # Copy image to YOLO structure
-                    yolo_img_dir = _root / "images"
-                    (yolo_img_dir / split).mkdir(parents=True, exist_ok=True)
-                    jpg_dest = yolo_img_dir / split / (str(rel_path) + ".jpg")
-                    try:
-                        if not jpg_dest.exists():
-                            import shutil as _shutil
-                            _shutil.copy2(jpg_src, jpg_dest)
-                    except Exception:
-                        pass
-
-                    try:
-                        tree = _ET.parse(str(xml_src))
-                        root = tree.getroot()
-                        size = root.find("size")
-                        w = int(size.findtext("width", default="0")) if size is not None else 0
-                        h = int(size.findtext("height", default="0")) if size is not None else 0
-                    except Exception:
-                        continue
-
-                    images.append({
-                        "id": img_id,
-                        "file_name": str(rel_path) + ".jpg",
-                        "width": w,
-                        "height": h,
-                    })
-
-                    for obj in root.findall("object"):
-                        name_node = obj.find("name")
-                        cls = (name_node.text or "").strip() if name_node is not None else ""
-                        cat_id = cat_name_to_id.get(cls)
-                        if cat_id is None:
-                            continue
-                        bnd = obj.find("bndbox")
-                        if bnd is None:
-                            continue
-                        try:
-                            xmin = float(bnd.findtext("xmin"))
-                            ymin = float(bnd.findtext("ymin"))
-                            xmax = float(bnd.findtext("xmax"))
-                            ymax = float(bnd.findtext("ymax"))
-                        except Exception:
-                            continue
-                        bw = max(0.0, xmax - xmin)
-                        bh = max(0.0, ymax - ymin)
-                        if bw <= 0 or bh <= 0:
-                            continue
-                        annotations.append({
-                            "id": ann_id,
-                            "image_id": img_id,
-                            "category_id": cat_id,
-                            "bbox": [xmin, ymin, bw, bh],
-                            "area": bw * bh,
-                            "iscrowd": 0,
-                        })
-                        ann_id += 1
-
-                    img_id += 1
-
-                out_path = coco_ann_dir / f"idd_detection_{split}.json"
-                out = {
-                    "info": {"description": "IDD Detection"},
-                    "images": images,
-                    "annotations": annotations,
-                    "categories": categories,
-                }
-                with open(out_path, "w") as f:
-                    _json.dump(out, f)
-                return out_path
-
-            out_train = _convert_split("train", train_list)
-            out_val = _convert_split("val", val_list)
-            
-            success = out_train.exists() and out_val.exists()
-            if success:
-                # Cleanup raw files after successful reorganization
-                try:
-                    import shutil as _shutil
-                    if ann_dir.exists():
-                        _shutil.rmtree(ann_dir)
-                    if img_dir.exists():
-                        _shutil.rmtree(img_dir)
-                    for txt_file in [train_list, val_list, _root / "test.txt"]:
-                        if txt_file.exists():
-                            txt_file.unlink()
-                    # Also remove IDD_Detection folder if it exists
-                    idd_det_dir = _root / "IDD_Detection"
-                    if idd_det_dir.exists():
-                        _shutil.rmtree(idd_det_dir)
-                except Exception:
-                    pass
-            return success
-
+        _coco_loaded_data: dict = {}
         if name.lower() == "idd":
             try:
                 has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
@@ -1412,20 +1317,24 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     state["message"] = "Converting IDD dataset to COCO JSON..."
                     state["progress"] = max(state.get("progress", 70), 70)
                     _auto_convert_idd_voc_to_coco(dest, state)
-                
-                # Auto-convert COCO to YOLO format for training
+
+                # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
                 state["message"] = "Converting COCO annotations to YOLO format..."
                 state["progress"] = 91
-                coco_converter.auto_convert_if_needed("idd")
+                _conv_result = coco_converter.auto_convert_if_needed("idd")
+                if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
+                    _coco_loaded_data = _conv_result["loaded_data"]
             except Exception:
                 pass
 
         state["progress"] = 90
         state["message"] = "Building index..."
 
-        # Let plugin rebuild index
+        # Let plugin rebuild index — reuse pre-loaded JSON for IDD to avoid double parse
         plugin = get_dataset_plugin(name)
-        if plugin and hasattr(plugin, "rebuild_index"):
+        if plugin and _coco_loaded_data and hasattr(plugin, "rebuild_index_with_data"):
+            plugin.rebuild_index_with_data(_coco_loaded_data)
+        elif plugin and hasattr(plugin, "rebuild_index"):
             plugin.rebuild_index()
 
         _invalidate_cache(name)
