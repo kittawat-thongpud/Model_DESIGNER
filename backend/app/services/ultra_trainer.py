@@ -1270,6 +1270,41 @@ def _training_worker(
                 return YOLO(f"{yolo_model}.pt") if use_yolo_pretrained else YOLO(f"{yolo_model}.yaml")
             return YOLO(yaml_path, task=task)
 
+        # Patch subprocess.run to capture DDP worker stderr before re-raising.
+        # Without this, DDP failures only show "exit code 1" with no details.
+        import subprocess as _subprocess
+        _orig_subprocess_run = _subprocess.run
+        def _patched_subprocess_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and "torch.distributed.run" in " ".join(str(c) for c in cmd):
+                kwargs.setdefault("capture_output", False)
+                import io as _io
+                _stderr_buf = _io.StringIO()
+                try:
+                    result = _orig_subprocess_run(cmd, *args, **kwargs)
+                    return result
+                except _subprocess.CalledProcessError as _ddp_err:
+                    # Re-run with stderr captured to get the real error message
+                    try:
+                        _cap = _orig_subprocess_run(
+                            cmd, *[a for a in args],
+                            **{**{k: v for k, v in kwargs.items() if k not in ("check",)},
+                               "capture_output": True, "check": False}
+                        )
+                        _err_txt = (_cap.stderr or b"").decode(errors="replace").strip()
+                        _out_txt = (_cap.stdout or b"").decode(errors="replace").strip()
+                        if _err_txt:
+                            job_storage.append_job_log(job_id, "ERROR",
+                                f"DDP subprocess stderr:\n{_err_txt[-4000:]}")
+                        if _out_txt:
+                            job_storage.append_job_log(job_id, "ERROR",
+                                f"DDP subprocess stdout:\n{_out_txt[-2000:]}")
+                    except Exception as _cap_err:
+                        job_storage.append_job_log(job_id, "WARNING",
+                            f"Could not capture DDP stderr: {_cap_err}")
+                    raise _ddp_err
+            return _orig_subprocess_run(cmd, *args, **kwargs)
+        _subprocess.run = _patched_subprocess_run
+
         while True:
             try:
                 with contextlib.redirect_stdout(log_writer), contextlib.redirect_stderr(log_writer):
