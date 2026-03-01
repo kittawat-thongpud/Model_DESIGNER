@@ -988,7 +988,21 @@ def _training_worker(
         # cache=False:  no caching (fallback for remote FS where .cache write is slow).
         _user_cache = train_kwargs.get("cache", None)
         if not _user_cache or str(_user_cache).lower() in ("false", "0", "none", ""):
-            _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs)
+            _ddp_gpus = train_kwargs.get("device", None)
+            _num_ddp = 1
+            try:
+                import torch as _torch
+                if _ddp_gpus is None:
+                    _num_ddp = max(1, _torch.cuda.device_count())
+                elif isinstance(_ddp_gpus, (list, tuple)):
+                    _num_ddp = max(1, len(_ddp_gpus))
+                elif isinstance(_ddp_gpus, str) and "," in _ddp_gpus:
+                    _num_ddp = max(1, len(_ddp_gpus.split(",")))
+                else:
+                    _num_ddp = 1
+            except Exception:
+                _num_ddp = 1
+            _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs, num_gpus=_num_ddp)
             train_kwargs["cache"] = _chosen_cache
 
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
@@ -1007,9 +1021,15 @@ def _training_worker(
             if "workers" not in config:
                 train_kwargs["workers"] = 2
 
-            # If smart cache chose ram → keep it (best option on any FS).
-            # Otherwise fall back to False — disk cache on NFS is slow.
-            if str(train_kwargs.get("cache", "")).lower() not in ("ram", "true", "1", "disk"):
+            # Never use cache='ram' on remote/RunPod FS — each DDP process allocates
+            # its own independent copy, easily OOMing the container.
+            # Downgrade ram → disk; disk cache on RunPod /workspace works fine.
+            if str(train_kwargs.get("cache", "")).lower() in ("ram",):
+                train_kwargs["cache"] = True
+                job_storage.append_job_log(job_id, "WARNING",
+                    "Remote FS mitigation: downgraded cache='ram' → cache=True (disk) "
+                    "to prevent DDP multi-process RAM OOM")
+            elif str(train_kwargs.get("cache", "")).lower() not in ("true", "1", "disk"):
                 train_kwargs["cache"] = False
 
             # Redirect Ultralytics .cache files to /tmp (fast local storage) so
@@ -1528,12 +1548,16 @@ def _training_worker(
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool) -> "str | bool":
+def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool, num_gpus: int = 1) -> "str | bool":
     """Choose the best Ultralytics cache mode given available RAM and dataset size.
+
+    *num_gpus* is the number of DDP processes that will each independently
+    allocate their own RAM image cache.  Available RAM is divided by this
+    count before comparing with the estimated dataset size.
 
     Returns:
         "ram"  — load all images into shared memory (zero I/O per batch).
-                 Chosen when free RAM >= estimated_dataset_bytes * 1.5.
+                 Chosen when free RAM >= estimated_dataset_bytes * 1.5 * num_gpus.
         True   — disk .cache file (label scan saved, images read per batch).
         False  — no caching (last resort for remote FS when RAM is tight).
     """
@@ -1609,13 +1633,16 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
         except Exception:
             dataset_bytes = 0
 
-    required_ram = int(dataset_bytes * 1.5)
+    # Each DDP process allocates its own independent RAM cache, so multiply
+    # the required RAM by the number of parallel processes.
+    _ddp_factor = max(1, num_gpus)
+    required_ram = int(dataset_bytes * 1.5 * _ddp_factor)
     if free_ram > 0 and dataset_bytes > 0 and free_ram >= required_ram:
         gb = dataset_bytes / (1024 ** 3)
         free_gb = free_ram / (1024 ** 3)
         job_storage.append_job_log(job_id, "INFO",
-            f"Cache strategy: ram — dataset ~{gb:.1f} GB, free RAM {free_gb:.1f} GB "
-            f"(>= {required_ram/(1024**3):.1f} GB threshold)")
+            f"Cache strategy: ram — dataset ~{gb:.1f} GB x{_ddp_factor} DDP processes, "
+            f"free RAM {free_gb:.1f} GB (>= {required_ram/(1024**3):.1f} GB threshold)")
         return "ram"
 
     # Not enough RAM for full image cache — fall back to disk .cache (label scan only).
