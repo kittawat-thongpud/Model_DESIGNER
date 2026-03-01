@@ -347,8 +347,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Override training loop to add custom logging."""
         self.log(f"Starting training for {self.epochs} epochs", "INFO")
         
-        # Pass world_size so Ultralytics 8.4.19+ _setup_ddp(world_size) works in DDP mode.
-        result = super()._do_train(world_size)
+        # BaseTrainer._do_train() takes no positional args in Ultralytics 8.4.x
+        result = super()._do_train()
         
         self.log("Training loop completed", "INFO")
         return result
@@ -656,10 +656,12 @@ class CustomDetectionTrainer(DetectionTrainer):
         self.log("Final evaluation complete", "INFO")
         return result
     
-    def _setup_ddp(self, world_size):
-        """Override DDP setup to add logging."""
+    def _setup_ddp(self, world_size=None, *args, **kwargs):
+        """Override DDP setup to add logging — forward-compatible signature."""
         self.log(f"Setting up DDP with world_size={world_size}", "INFO")
-        return super()._setup_ddp(world_size)
+        if world_size is not None:
+            return super()._setup_ddp(world_size, *args, **kwargs)
+        return super()._setup_ddp(*args, **kwargs)
     
     def validate(self):
         """Run validation and collect extended metrics.
