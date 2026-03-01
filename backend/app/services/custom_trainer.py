@@ -415,33 +415,6 @@ class CustomDetectionTrainer(DetectionTrainer):
         )
         return result
 
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
-        """Override to enable persistent_workers and prefetch_factor.
-
-        ``persistent_workers=True`` keeps worker processes alive between epochs
-        so Python does not re-fork ~4 processes each epoch (saves ~2-5s/epoch).
-        ``prefetch_factor=2`` lets workers pre-load the next batch while GPU
-        is processing the current one — overlaps I/O with compute.
-        Both are no-ops when workers=0 (single-process mode).
-
-        We patch the existing loader in-place rather than rebuilding it, so that
-        Ultralytics' sampler / batch_sampler / drop_last settings are preserved.
-        Rebuilding from scratch loses those and causes tensor size mismatches.
-        """
-        loader = super().get_dataloader(dataset_path, batch_size=batch_size, rank=rank, mode=mode)
-        try:
-            nw = getattr(loader, 'num_workers', 0)
-            if nw > 0:
-                loader.persistent_workers = True
-                loader.prefetch_factor = 2
-                self.log(
-                    f"DataLoader ({mode}): workers={nw}, persistent_workers=True, prefetch_factor=2",
-                    "DEBUG",
-                )
-        except Exception as _dl_err:
-            self.log(f"persistent_workers patch skipped: {_dl_err}", "DEBUG")
-        return loader
-
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
         if ckpt.get("optimizer") is not None:
@@ -1191,42 +1164,62 @@ class JobCustomTrainer(CustomDetectionTrainer):
 
     custom_params must be registered before calling model.train() via:
         JobCustomTrainer.set_params(custom_params)
+
+    Uses threading.local() so parallel jobs (each in their own thread) never
+    read each other's params even when both call set_params() concurrently.
     """
 
     _registry_lock = threading.Lock()
-    _params_registry: "dict[str, dict]" = {}
-    _active_job_id: "str | None" = None
+    _params_registry: "dict[str, dict]" = {}   # shared: job_id → params
+    _thread_local = threading.local()           # per-thread: active_job_id
 
     @classmethod
     def set_params(cls, custom_params: dict) -> None:
-        """Register custom_params for the next training run."""
+        """Register custom_params for this thread's training run."""
         job_id = custom_params.get("job_id")
         with cls._registry_lock:
             cls._params_registry[job_id] = custom_params
-            cls._active_job_id = job_id
+        # Store active job_id per-thread so parallel jobs don't overwrite each other
+        cls._thread_local.active_job_id = job_id
 
     @classmethod
     def _get_params(cls) -> dict:
+        # Prefer thread-local job_id (set by the calling training thread)
+        job_id = getattr(cls._thread_local, "active_job_id", None)
         with cls._registry_lock:
-            if cls._active_job_id and cls._active_job_id in cls._params_registry:
-                return cls._params_registry[cls._active_job_id]
-            # Fallback: return last registered params
-            if cls._params_registry:
-                return next(reversed(cls._params_registry.values()))
+            if job_id and job_id in cls._params_registry:
+                return cls._params_registry[job_id]
+            # Fallback for DDP subprocess (different thread/process, no thread-local):
+            # return the only registered params if exactly one job is running
+            if len(cls._params_registry) == 1:
+                return next(iter(cls._params_registry.values()))
         return {}
 
-    # Class-level cache — populated by set_params() before model.train()
-    _custom_params: dict = {}
+    @classmethod
+    def cleanup_params(cls, job_id: str) -> None:
+        """Remove params after training completes to avoid stale state."""
+        with cls._registry_lock:
+            cls._params_registry.pop(job_id, None)
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
         if overrides is None:
             overrides = {}
-        # Read params from registry (works in both main process and DDP subprocess)
+        # Read params from per-thread registry — safe for parallel jobs.
+        # In DDP subprocess (fresh spawn process) the registry is empty;
+        # params will be read from overrides instead (injected below).
         params = self._get_params()
-        if params:
-            self.__class__._custom_params = params
+        self._custom_params = params or {}
+
+        # Inject custom_params into overrides so DDP subprocess receives them
+        # via the Ultralytics-generated temp file (the only channel available).
+        # CustomDetectionTrainer.__init__ pops these keys from clean_overrides.
+        if self._custom_params:
+            for k, v in self._custom_params.items():
+                if k not in overrides:
+                    overrides[k] = v
+
         from . import job_storage as js
-        _job_id = (self._custom_params or {}).get("job_id", "unknown")
+        _job_id = self._custom_params.get("job_id") or overrides.get("job_id", "unknown")
         js.append_job_log(_job_id, "INFO",
             f"JobCustomTrainer.__init__ called with job_id: {_job_id}")
         super().__init__(cfg, overrides, _callbacks)

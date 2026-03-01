@@ -890,29 +890,32 @@ def _training_worker(
             and len([x for x in _final_device.split(",") if x.strip()]) > 1
         )
 
-        # ── DDP guard ─────────────────────────────────────────────────────────
-        # JobCustomTrainer is an inner class (closure) defined inside
-        # _training_worker.  Ultralytics DDP spawns a fresh subprocess via
-        # torch.distributed.run which tries to import the trainer class by
-        # module path — inner classes are not importable → exit code 1.
-        #
-        # Until JobCustomTrainer is refactored into a top-level importable
-        # class, we MUST force single-GPU mode in ALL cases where Ultralytics
-        # would trigger DDP (i.e. when device has more than one GPU index).
+        # ── Multi-GPU / DDP setup ─────────────────────────────────────────────
+        # JobCustomTrainer is now a top-level importable class in custom_trainer.py
+        # so Ultralytics DDP subprocess can import it correctly.
         if _is_multi_gpu:
-            # User explicitly requested multi-GPU — downgrade to GPU 0
-            first_gpu = [x.strip() for x in _final_device.split(",") if x.strip()][0]
-            train_kwargs["device"] = first_gpu
-            job_storage.append_job_log(job_id, "WARNING",
-                f"Multi-GPU DDP is not supported with the custom trainer "
-                f"(JobCustomTrainer is a closure — DDP subprocess cannot import it). "
-                f"Downgrading device='{_final_device}' → device='{first_gpu}' (single-GPU).")
-        elif _avail > 1 and not _final_device:
-            # device blank + multiple GPUs → Ultralytics would auto-enable DDP
-            train_kwargs["device"] = "0"
+            # User explicitly set multi-GPU (e.g. device="0,1") — enable DDP.
+            import multiprocessing as _mp
+            try:
+                if _mp.get_start_method(allow_none=True) != "spawn":
+                    _mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+            _gpu_count = len([x for x in _final_device.split(",") if x.strip()])
             job_storage.append_job_log(job_id, "INFO",
-                f"{_avail} GPUs available — using GPU 0 only (single-GPU mode). "
-                "Multi-GPU DDP is not supported with the custom trainer.")
+                f"Multi-GPU DDP enabled: device='{_final_device}' ({_gpu_count} GPUs)")
+        elif _avail > 1 and not _final_device:
+            # device blank + multiple GPUs → use all GPUs via DDP
+            all_indices = ",".join(str(i) for i in range(_avail))
+            train_kwargs["device"] = all_indices
+            import multiprocessing as _mp
+            try:
+                if _mp.get_start_method(allow_none=True) != "spawn":
+                    _mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+            job_storage.append_job_log(job_id, "INFO",
+                f"Auto-selected all {_avail} GPUs: device='{all_indices}' (DDP)")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── ema / pin_memory note ─────────────────────────────────────────────
@@ -1402,6 +1405,11 @@ def _training_worker(
         event_bus.clear_last_event(train_channel(job_id))
         
         job_storage.append_job_log(job_id, "INFO", "Worker thread cleanup completed")
+        try:
+            from .custom_trainer import JobCustomTrainer
+            JobCustomTrainer.cleanup_params(job_id)
+        except Exception:
+            pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
