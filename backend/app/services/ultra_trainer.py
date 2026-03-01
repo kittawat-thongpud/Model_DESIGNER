@@ -898,12 +898,13 @@ def _training_worker(
         # access to the project directory, so 'from app.services.custom_trainer'
         # fails with ModuleNotFoundError.  We must inject the backend directory
         # into PYTHONPATH *before* torch.distributed.run spawns the subprocess.
+        import sys as _sys
         _backend_dir = str(Path(__file__).resolve().parent.parent.parent)  # .../backend
         _cur_pythonpath = os.environ.get("PYTHONPATH", "")
         if _backend_dir not in _cur_pythonpath.split(os.pathsep):
             os.environ["PYTHONPATH"] = _backend_dir + (os.pathsep + _cur_pythonpath if _cur_pythonpath else "")
-        if _backend_dir not in sys.path:
-            sys.path.insert(0, _backend_dir)
+        if _backend_dir not in _sys.path:
+            _sys.path.insert(0, _backend_dir)
         job_storage.append_job_log(job_id, "DEBUG",
             f"DDP PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
 
