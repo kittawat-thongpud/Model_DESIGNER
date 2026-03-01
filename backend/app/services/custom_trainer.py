@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import threading
 import torch
 import numpy as np
 from copy import copy
@@ -1174,3 +1175,58 @@ class CustomDetectionTrainer(DetectionTrainer):
         if hasattr(self, 'epoch') and hasattr(self, 'epochs'):
             return f"Epoch {self.epoch + 1}/{self.epochs}"
         return "Training..."
+
+
+# ── Top-level importable trainer (required for Ultralytics DDP) ───────────────
+# Ultralytics DDP spawns a subprocess via torch.distributed.run and imports the
+# trainer class by its fully-qualified module path.  Inner classes (closures)
+# inside functions are not importable and cause CalledProcessError exit 1.
+#
+# JobCustomTrainer must be a top-level class here.  custom_params are injected
+# via the class-level registry _params_registry (keyed by job_id) before
+# model.train() is called, and read back inside __init__.
+
+class JobCustomTrainer(CustomDetectionTrainer):
+    """Top-level trainer class used by model.train(trainer=JobCustomTrainer).
+
+    custom_params must be registered before calling model.train() via:
+        JobCustomTrainer.set_params(custom_params)
+    """
+
+    _registry_lock = threading.Lock()
+    _params_registry: "dict[str, dict]" = {}
+    _active_job_id: "str | None" = None
+
+    @classmethod
+    def set_params(cls, custom_params: dict) -> None:
+        """Register custom_params for the next training run."""
+        job_id = custom_params.get("job_id")
+        with cls._registry_lock:
+            cls._params_registry[job_id] = custom_params
+            cls._active_job_id = job_id
+
+    @classmethod
+    def _get_params(cls) -> dict:
+        with cls._registry_lock:
+            if cls._active_job_id and cls._active_job_id in cls._params_registry:
+                return cls._params_registry[cls._active_job_id]
+            # Fallback: return last registered params
+            if cls._params_registry:
+                return next(reversed(cls._params_registry.values()))
+        return {}
+
+    # Class-level cache — populated by set_params() before model.train()
+    _custom_params: dict = {}
+
+    def __init__(self, cfg=None, overrides=None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        # Read params from registry (works in both main process and DDP subprocess)
+        params = self._get_params()
+        if params:
+            self.__class__._custom_params = params
+        from . import job_storage as js
+        _job_id = (self._custom_params or {}).get("job_id", "unknown")
+        js.append_job_log(_job_id, "INFO",
+            f"JobCustomTrainer.__init__ called with job_id: {_job_id}")
+        super().__init__(cfg, overrides, _callbacks)

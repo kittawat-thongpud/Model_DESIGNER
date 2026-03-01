@@ -890,41 +890,29 @@ def _training_worker(
             and len([x for x in _final_device.split(",") if x.strip()]) > 1
         )
 
+        # ── DDP guard ─────────────────────────────────────────────────────────
+        # JobCustomTrainer is an inner class (closure) defined inside
+        # _training_worker.  Ultralytics DDP spawns a fresh subprocess via
+        # torch.distributed.run which tries to import the trainer class by
+        # module path — inner classes are not importable → exit code 1.
+        #
+        # Until JobCustomTrainer is refactored into a top-level importable
+        # class, we MUST force single-GPU mode in ALL cases where Ultralytics
+        # would trigger DDP (i.e. when device has more than one GPU index).
         if _is_multi_gpu:
-            # Ultralytics DDP spawns child processes via torch.multiprocessing.
-            # In a forked uvicorn worker the default 'fork' start method can
-            # cause deadlocks with CUDA.  Switch to 'spawn' before training.
-            import multiprocessing as _mp
-            try:
-                _current_method = _mp.get_start_method(allow_none=True)
-                if _current_method != "spawn":
-                    _mp.set_start_method("spawn", force=True)
-                    job_storage.append_job_log(job_id, "INFO",
-                        f"Multi-GPU DDP: set multiprocessing start method "
-                        f"'spawn' (was '{_current_method}')")
-            except RuntimeError:
-                # Already set — OK if already spawn; warn otherwise
-                _current_method = _mp.get_start_method(allow_none=True)
-                if _current_method != "spawn":
-                    job_storage.append_job_log(job_id, "WARNING",
-                        f"Multi-GPU DDP: could not change start method from "
-                        f"'{_current_method}' to 'spawn' — DDP may deadlock")
-
-            job_storage.append_job_log(job_id, "INFO",
-                f"Multi-GPU training enabled: device='{_final_device}' "
-                f"({len(_final_device.split(','))} GPUs) — using DDP")
+            # User explicitly requested multi-GPU — downgrade to GPU 0
+            first_gpu = [x.strip() for x in _final_device.split(",") if x.strip()][0]
+            train_kwargs["device"] = first_gpu
+            job_storage.append_job_log(job_id, "WARNING",
+                f"Multi-GPU DDP is not supported with the custom trainer "
+                f"(JobCustomTrainer is a closure — DDP subprocess cannot import it). "
+                f"Downgrading device='{_final_device}' → device='{first_gpu}' (single-GPU).")
         elif _avail > 1 and not _final_device:
-            # User left device blank but multiple GPUs exist — use all of them
-            all_indices = ",".join(str(i) for i in range(_avail))
-            train_kwargs["device"] = all_indices
+            # device blank + multiple GPUs → Ultralytics would auto-enable DDP
+            train_kwargs["device"] = "0"
             job_storage.append_job_log(job_id, "INFO",
-                f"Auto-selected all {_avail} GPUs: device='{all_indices}'")
-            # Apply spawn for this case too
-            import multiprocessing as _mp
-            try:
-                _mp.set_start_method("spawn", force=True)
-            except RuntimeError:
-                pass
+                f"{_avail} GPUs available — using GPU 0 only (single-GPU mode). "
+                "Multi-GPU DDP is not supported with the custom trainer.")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── ema / pin_memory note ─────────────────────────────────────────────
@@ -1243,30 +1231,11 @@ def _training_worker(
         job_storage.append_job_log(job_id, "INFO",
             f"Starting model.train() with {len(train_kwargs)} kwargs")
         
-        # Create a dynamic trainer class with custom params injected
-        # This ensures Ultralytics receives a proper class, not a factory function
-        class JobCustomTrainer(CustomDetectionTrainer):
-            # Store custom params as class attribute
-            _custom_params = custom_params
-            
-            def __init__(self, cfg=None, overrides=None, _callbacks=None):
-                # Inject custom params into overrides
-                if overrides is None:
-                    overrides = {}
-                # DO NOT inject into overrides, as it triggers Ultralytics validation
-                # CustomDetectionTrainer will read from self._custom_params instead
-                # overrides.update(self._custom_params)
-                
-                # Debug log
-                from . import job_storage as js
-                js.append_job_log(
-                    self._custom_params['job_id'],
-                    "INFO",
-                    f"JobCustomTrainer.__init__ called with job_id: {self._custom_params['job_id']}"
-                )
-                
-                super().__init__(cfg, overrides, _callbacks)
-        
+        # Register custom_params in the top-level JobCustomTrainer registry so
+        # the class can be imported by Ultralytics DDP subprocess without closures.
+        from .custom_trainer import JobCustomTrainer
+        JobCustomTrainer.set_params(custom_params)
+
         # Continue using the same log_writer for training
         # CRITICAL: Prevent Ultralytics from entering CLI mode
         # Ultralytics checks sys.argv in multiple places and tries to parse CLI args
