@@ -1344,8 +1344,9 @@ def _training_worker(
         _tailer_stop = threading.Event()
 
         def _log_tailer():
+            import json as _json
             from . import event_bus as _eb
-            from ..constants import job_log_channel as _jlc
+            from ..constants import job_log_channel as _jlc, train_channel as _tc
             log_path = job_storage._log_path(job_id)
             last_pos = 0
             while not _tailer_stop.is_set():
@@ -1357,9 +1358,15 @@ def _training_worker(
                                 _line = _line.strip()
                                 if _line:
                                     try:
-                                        import json as _json
                                         _entry = _json.loads(_line)
+                                        # Re-broadcast log entry to log channel
                                         _eb.publish_sync(_jlc(job_id), _entry)
+                                        # If entry carries progress data, also
+                                        # publish to train_channel so the UI
+                                        # updates epoch/batch/GPU stats.
+                                        _data = _entry.get("data")
+                                        if _data and isinstance(_data, dict):
+                                            _eb.publish_sync(_tc(job_id), _data)
                                     except Exception:
                                         pass
                             last_pos = _lf.tell()

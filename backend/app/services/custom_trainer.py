@@ -702,11 +702,10 @@ class CustomDetectionTrainer(DetectionTrainer):
         else:
             self.log(f"Running validation for epoch {self.epoch + 1}...", "PROGRESS")
         
-        # Emit SSE progress event for validation phase to train_channel (frontend listens here)
+        # Emit SSE progress event for validation phase to train_channel (frontend listens here).
+        # Also write to log file so the DDP log tailer can forward it to the main process.
         if self.job_id:
-            from . import event_bus
-            from ..constants import train_channel
-            event_bus.publish_sync(train_channel(self.job_id), {
+            _val_progress = {
                 "type": "progress",
                 "phase": "validation",
                 "epoch": self.epoch + 1,
@@ -716,7 +715,12 @@ class CustomDetectionTrainer(DetectionTrainer):
                 "percent": 100.0,
                 "losses": {},
                 "message": f"Validating epoch {self.epoch + 1}...",
-            })
+            }
+            job_storage.append_job_log(self.job_id, "PROGRESS",
+                f"Validation phase epoch {self.epoch + 1}", _val_progress)
+            from . import event_bus
+            from ..constants import train_channel
+            event_bus.publish_sync(train_channel(self.job_id), _val_progress)
         
         # Run parent validation
         val_start = time.time()
