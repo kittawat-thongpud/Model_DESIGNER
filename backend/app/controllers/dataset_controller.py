@@ -1139,6 +1139,7 @@ def _bg_url_download(name: str, url: str):
             plugin.rebuild_index()
 
         _invalidate_cache(name)
+        _invalidate_partition_cache(name)
         _scan_dataset_meta(name)
 
         # Verify dataset is actually usable after extraction
@@ -1382,6 +1383,7 @@ def _bg_extract(name: str, archive_path: str, state: dict):
             plugin.rebuild_index()
 
         _invalidate_cache(name)
+        _invalidate_partition_cache(name)
         _scan_dataset_meta(name)
 
         # Verify dataset is actually usable after extraction
