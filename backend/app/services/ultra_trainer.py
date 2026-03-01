@@ -1254,6 +1254,14 @@ def _training_worker(
         from .custom_trainer import JobCustomTrainer
         JobCustomTrainer.set_params(custom_params)
 
+        # Inject custom_params into train_kwargs so Ultralytics includes them in
+        # the DDP temp file overrides dict.  The subprocess reads job_id from
+        # overrides via CustomDetectionTrainer.__init__._get() helper.
+        # CustomDetectionTrainer strips these keys before passing to Ultralytics parent.
+        for _cp_key, _cp_val in custom_params.items():
+            if _cp_key not in train_kwargs:
+                train_kwargs[_cp_key] = _cp_val
+
         # Continue using the same log_writer for training
         # CRITICAL: Prevent Ultralytics from entering CLI mode
         # Ultralytics checks sys.argv in multiple places and tries to parse CLI args
