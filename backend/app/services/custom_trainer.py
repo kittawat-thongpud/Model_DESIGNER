@@ -422,24 +422,17 @@ class CustomDetectionTrainer(DetectionTrainer):
         ``prefetch_factor=2`` lets workers pre-load the next batch while GPU
         is processing the current one — overlaps I/O with compute.
         Both are no-ops when workers=0 (single-process mode).
+
+        We patch the existing loader in-place rather than rebuilding it, so that
+        Ultralytics' sampler / batch_sampler / drop_last settings are preserved.
+        Rebuilding from scratch loses those and causes tensor size mismatches.
         """
         loader = super().get_dataloader(dataset_path, batch_size=batch_size, rank=rank, mode=mode)
         try:
             nw = getattr(loader, 'num_workers', 0)
             if nw > 0:
-                # Rebuild DataLoader with persistent_workers + prefetch_factor
-                from torch.utils.data import DataLoader
-                loader = DataLoader(
-                    loader.dataset,
-                    batch_size=loader.batch_size,
-                    shuffle=(mode == "train" and rank == -1),
-                    num_workers=nw,
-                    pin_memory=getattr(loader, 'pin_memory', False),
-                    collate_fn=getattr(loader, 'collate_fn', None),
-                    worker_init_fn=getattr(loader, 'worker_init_fn', None),
-                    persistent_workers=True,
-                    prefetch_factor=2,
-                )
+                loader.persistent_workers = True
+                loader.prefetch_factor = 2
                 self.log(
                     f"DataLoader ({mode}): workers={nw}, persistent_workers=True, prefetch_factor=2",
                     "DEBUG",
