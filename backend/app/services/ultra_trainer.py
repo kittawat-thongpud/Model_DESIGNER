@@ -1291,6 +1291,15 @@ def _training_worker(
         _orig_subprocess_run = _subprocess.run
         def _patched_subprocess_run(cmd, *args, **kwargs):
             if isinstance(cmd, list) and "torch.distributed.run" in " ".join(str(c) for c in cmd):
+                # Log temp file contents so we can see what Ultralytics generates
+                try:
+                    _tmp_py = [c for c in cmd if str(c).endswith(".py")]
+                    if _tmp_py:
+                        _tmp_contents = Path(_tmp_py[0]).read_text()
+                        job_storage.append_job_log(job_id, "DEBUG",
+                            f"DDP temp file ({_tmp_py[0]}):\n{_tmp_contents}")
+                except Exception:
+                    pass
                 kwargs.setdefault("capture_output", False)
                 import io as _io
                 _stderr_buf = _io.StringIO()
@@ -1319,6 +1328,40 @@ def _training_worker(
                     raise _ddp_err
             return _orig_subprocess_run(cmd, *args, **kwargs)
         _subprocess.run = _patched_subprocess_run
+
+        # ── Log-tailer: re-broadcast DDP subprocess log entries to SSE ──────────
+        # DDP subprocess writes log entries to the job log file but cannot reach
+        # the in-process event bus (different memory space).  This thread tails
+        # the log file and re-broadcasts new entries so the UI stays updated.
+        _tailer_stop = threading.Event()
+
+        def _log_tailer():
+            from . import event_bus as _eb
+            from ..constants import job_log_channel as _jlc
+            log_path = job_storage._log_path(job_id)
+            last_pos = 0
+            while not _tailer_stop.is_set():
+                try:
+                    if log_path.exists():
+                        with open(log_path, "r") as _lf:
+                            _lf.seek(last_pos)
+                            for _line in _lf:
+                                _line = _line.strip()
+                                if _line:
+                                    try:
+                                        import json as _json
+                                        _entry = _json.loads(_line)
+                                        _eb.publish_sync(_jlc(job_id), _entry)
+                                    except Exception:
+                                        pass
+                            last_pos = _lf.tell()
+                except Exception:
+                    pass
+                _tailer_stop.wait(1.0)
+
+        _tailer_thread = threading.Thread(
+            target=_log_tailer, daemon=True, name=f"log_tailer_{job_id}")
+        _tailer_thread.start()
 
         while True:
             try:
@@ -1449,6 +1492,12 @@ def _training_worker(
         except Exception as e:
             job_storage.append_job_log(job_id, "WARNING", f"Cleanup warning: {e}")
         
+        # Stop log tailer thread
+        try:
+            _tailer_stop.set()
+        except Exception:
+            pass
+
         with _lock:
             _active_jobs.pop(job_id, None)
         # Clear cached last progress event so future subscribers don't get stale data

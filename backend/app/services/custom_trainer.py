@@ -231,20 +231,29 @@ class CustomDetectionTrainer(DetectionTrainer):
         # Ensure overrides is a dict
         if overrides is None:
             overrides = {}
-        
+
+        # In DDP subprocess Ultralytics passes trainer config as cfg dict (not overrides).
+        # We must read custom params from cfg first, then overrides, then _custom_params.
+        cfg_source = cfg if isinstance(cfg, dict) else {}
+        custom_source = getattr(self, '_custom_params', {})
+
         # 1. Create a copy of overrides to modify
         clean_overrides = overrides.copy()
-        
-        # Helper to get extraction source (overrides priority, then _custom_params)
-        custom_source = getattr(self, '_custom_params', {})
-        
-        # 2. Extract and remove custom params
-        self.job_id = clean_overrides.pop('job_id', custom_source.get('job_id'))
-        self.record_gradients = clean_overrides.pop('record_gradients', custom_source.get('record_gradients', False))
-        self.record_weights = clean_overrides.pop('record_weights', custom_source.get('record_weights', False))
-        self.gradient_interval = clean_overrides.pop('gradient_interval', custom_source.get('gradient_interval', 1))
-        self.weight_interval = clean_overrides.pop('weight_interval', custom_source.get('weight_interval', 1))
-        self.sample_per_class = clean_overrides.pop('sample_per_class', custom_source.get('sample_per_class', 0))
+
+        # 2. Extract and remove custom params (cfg_source → overrides → _custom_params)
+        def _get(key, default=None):
+            if key in clean_overrides:
+                return clean_overrides.pop(key)
+            if key in cfg_source:
+                return cfg_source[key]
+            return custom_source.get(key, default)
+
+        self.job_id = _get('job_id')
+        self.record_gradients = _get('record_gradients', False)
+        self.record_weights = _get('record_weights', False)
+        self.gradient_interval = _get('gradient_interval', 1)
+        self.weight_interval = _get('weight_interval', 1)
+        self.sample_per_class = _get('sample_per_class', 0)
         
         # _partition_configs / _dataset_name no longer needed — TXT splits in data.yaml handle partition filtering
         clean_overrides.pop('_partition_configs', None)
@@ -259,8 +268,13 @@ class CustomDetectionTrainer(DetectionTrainer):
         from ultralytics.cfg import get_cfg, DEFAULT_CFG_DICT, check_dict_alignment
         
         # List of keys to remove (invalid for YOLO training)
-        INVALID_KEYS = {'session', 'sample_per_class', 'record_gradients', 'gradient_interval', 
-                        'record_weights', 'weight_interval', '_partition_configs', '_dataset_name'}
+        # Must include all custom params injected by JobCustomTrainer.set_params()
+        INVALID_KEYS = {
+            'session', 'job_id',
+            'sample_per_class', 'record_gradients', 'gradient_interval',
+            'record_weights', 'weight_interval',
+            '_partition_configs', '_dataset_name',
+        }
         
         # Build complete config by merging defaults with our overrides
         if cfg is None:
