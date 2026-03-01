@@ -653,23 +653,35 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
 
 
 def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
+    """Convert IDD VOC format (Annotations/ + JPEGImages/) to COCO JSON + images/ layout.
+
+    Key optimisations vs the previous implementation:
+    1. **Batch XML parsing first** — all XML files are read in a single sequential
+       pass before any image move happens.  This avoids interleaving small random
+       reads (XML) with large sequential writes (JPEG move), which thrashes NFS.
+    2. **Directory-level rename instead of per-file move** — after annotation
+       JSON is written, JPEGImages/train/ and JPEGImages/val/ subdirs (or the flat
+       JPEGImages/ dir) are renamed to images/train/ and images/val/ in O(1) syscalls
+       instead of ~11 000 individual shutil.move calls.
+    3. **mkdir batch** — all subdirectory parents are collected and created once
+       before the loop, not inside the hot path.
+    """
     import json as _json
     import xml.etree.ElementTree as _ET
-    import os as _os
+    import shutil as _sh
     from pathlib import Path as _Path
 
     ann_dir = root / "Annotations"
     img_dir = root / "JPEGImages"
     train_list = root / "train.txt"
-    val_list = root / "val.txt"
+    val_list   = root / "val.txt"
 
-    # Fallback: files may still be inside IDD_Detection/ if flatten hasn't run yet
-    # or if the archive places everything under that subdirectory.
+    # Flatten optional IDD_Detection/ wrapper subdirectory
     if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
-        _IDD_WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
+        _WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
         _sub = next(
             (d for d in root.iterdir()
-             if d.is_dir() and d.name.lower().replace(" ", "_") in _IDD_WRAPPER_NAMES),
+             if d.is_dir() and d.name.lower().replace(" ", "_") in _WRAPPER_NAMES),
             None,
         )
         if _sub is not None:
@@ -678,9 +690,7 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
             _tr  = _sub / "train.txt"
             _vl  = _sub / "val.txt"
             if _ann.exists() and _img.exists() and _tr.exists() and _vl.exists():
-                # Flatten the wrapper dir first, then re-resolve paths
-                state["message"] = f"Flattening {_sub.name}/ before conversion..."
-                import shutil as _sh
+                state["message"] = f"Flattening {_sub.name}/ ..."
                 for _item in list(_sub.iterdir()):
                     _target = root / _item.name
                     if _target.exists():
@@ -703,13 +713,6 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
         return False
 
-    coco_ann_dir = root / "annotations"
-    coco_ann_dir.mkdir(parents=True, exist_ok=True)
-
-    yolo_img_dir = root / "images"
-    (yolo_img_dir / "train").mkdir(parents=True, exist_ok=True)
-    (yolo_img_dir / "val").mkdir(parents=True, exist_ok=True)
-
     cats = [
         "person", "rider", "car", "truck", "bus", "motorcycle",
         "bicycle", "autorickshaw", "animal", "traffic light",
@@ -718,45 +721,44 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     cat_name_to_id = {n: i for i, n in enumerate(cats)}
     categories = [{"id": i, "name": n} for i, n in enumerate(cats)]
 
-    def _convert_split(split: str, list_path: Path) -> Path:
+    coco_ann_dir = root / "annotations"
+    coco_ann_dir.mkdir(parents=True, exist_ok=True)
+
+    def _parse_split(split: str, list_path: Path) -> tuple[list, list, list[tuple]]:
+        """Pass 1: parse all XMLs and collect (jpg_src, jpg_dest) pairs.
+        Returns (images, annotations, move_pairs) — no disk writes yet.
+        """
         lines = [ln.strip() for ln in list_path.read_text().splitlines() if ln.strip()]
-        images = []
-        annotations = []
-        img_id = 1
-        ann_id = 1
+        images, annotations, move_pairs = [], [], []
+        img_id = ann_id = 1
 
         for idx, rel in enumerate(lines):
             if idx % 500 == 0:
-                state["message"] = f"Converting IDD VOC→COCO ({split}): {idx}/{len(lines)}"
-                state["progress"] = min(state.get("progress", 70) + 1, 89)
+                state["message"] = f"Parsing IDD XML ({split}): {idx}/{len(lines)}"
+                state["progress"] = min(state.get("progress", 25) + 1, 60)
 
             rel_path = _Path(rel)
-            jpg_src = img_dir / (str(rel_path) + ".jpg")
-            xml_src = ann_dir / (str(rel_path) + ".xml")
+            jpg_src  = img_dir  / (str(rel_path) + ".jpg")
+            xml_src  = ann_dir  / (str(rel_path) + ".xml")
             if not jpg_src.exists() or not xml_src.exists():
                 continue
 
-            jpg_dest = yolo_img_dir / split / (str(rel_path) + ".jpg")
-            jpg_dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                if not jpg_dest.exists():
-                    import shutil as _shutil
-                    _shutil.move(str(jpg_src), jpg_dest)
-            except Exception:
-                pass
-
-            try:
-                tree = _ET.parse(str(xml_src))
-                xml_root = tree.getroot()
+                xml_root = _ET.parse(str(xml_src)).getroot()
                 size = xml_root.find("size")
-                w = int(size.findtext("width", default="0")) if size is not None else 0
+                w = int(size.findtext("width",  default="0")) if size is not None else 0
                 h = int(size.findtext("height", default="0")) if size is not None else 0
             except Exception:
                 continue
 
+            # Destination: flat filename under images/<split>/ — avoids
+            # creating thousands of subdirectories, matching COCO convention.
+            fname = rel_path.name + ".jpg"
+            move_pairs.append((jpg_src, fname))
+
             images.append({
                 "id": img_id,
-                "file_name": str(rel_path) + ".jpg",
+                "file_name": fname,
                 "width": w,
                 "height": h,
             })
@@ -782,50 +784,86 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
                 if bw <= 0 or bh <= 0:
                     continue
                 annotations.append({
-                    "id": ann_id,
-                    "image_id": img_id,
-                    "category_id": cat_id,
+                    "id": ann_id, "image_id": img_id, "category_id": cat_id,
                     "bbox": [xmin, ymin, bw, bh],
-                    "area": bw * bh,
-                    "iscrowd": 0,
+                    "area": bw * bh, "iscrowd": 0,
                 })
                 ann_id += 1
-
             img_id += 1
 
-        out_path = coco_ann_dir / f"idd_detection_{split}.json"
+        return images, annotations, move_pairs
+
+    # ── Pass 1: parse all XML (sequential reads, no writes) ───────────────────
+    state["message"] = "Parsing IDD XML annotations (train)..."
+    tr_images, tr_anns, tr_pairs = _parse_split("train", train_list)
+    state["message"] = "Parsing IDD XML annotations (val)..."
+    vl_images, vl_anns, vl_pairs = _parse_split("val", val_list)
+
+    # ── Pass 2: write COCO JSON files (two sequential writes) ─────────────────
+    state["message"] = "Writing COCO JSON..."
+    state["progress"] = 65
+    for split, imgs, anns in [("train", tr_images, tr_anns), ("val", vl_images, vl_anns)]:
         out = {
             "info": {"description": "IDD Detection"},
-            "images": images,
-            "annotations": annotations,
-            "categories": categories,
+            "images": imgs, "annotations": anns, "categories": categories,
         }
-        with open(out_path, "w") as f:
+        with open(coco_ann_dir / f"idd_detection_{split}.json", "w") as f:
             _json.dump(out, f)
-        return out_path
 
-    out_train = _convert_split("train", train_list)
-    out_val = _convert_split("val", val_list)
-    
-    success = out_train.exists() and out_val.exists()
-    if success:
-        # Images were moved out of img_dir — remove now-empty dir tree and raw files
-        try:
-            import shutil as _shutil
-            if ann_dir.exists():
-                _shutil.rmtree(ann_dir)
-            # img_dir is now empty (all files were moved); remove the skeleton dirs
-            if img_dir.exists():
-                _shutil.rmtree(img_dir)
-            for txt_file in [train_list, val_list, root / "test.txt"]:
-                if txt_file.exists():
-                    txt_file.unlink()
-            idd_det_dir = root / "IDD_Detection"
-            if idd_det_dir.exists():
-                _shutil.rmtree(idd_det_dir)
-        except Exception:
-            pass
-    return success
+    # ── Pass 3: move images — directory rename where possible ────────────────
+    # Preferred: if JPEGImages/ has train/ and val/ subdirs, rename the whole
+    # subtree in one os.rename call (O(1) on same filesystem).
+    # Fallback: flat JPEGImages/ → move per-file into images/train/ or images/val/.
+    state["message"] = "Moving images..."
+    state["progress"] = 75
+    yolo_img_dir = root / "images"
+    yolo_img_dir.mkdir(exist_ok=True)
+
+    moved_via_rename = False
+    for split, pairs in [("train", tr_pairs), ("val", vl_pairs)]:
+        src_subdir = img_dir / split          # e.g. JPEGImages/train/
+        dst_subdir = yolo_img_dir / split     # e.g. images/train/
+        if src_subdir.exists() and not dst_subdir.exists():
+            try:
+                src_subdir.rename(dst_subdir)  # O(1) same-filesystem rename
+                moved_via_rename = True
+                state["message"] = f"Renamed {src_subdir.name}/ → images/{split}/ (fast)"
+                continue
+            except OSError:
+                pass  # cross-device or busy — fall back to per-file move
+
+        # Per-file fallback (cross-device or flat structure)
+        dst_subdir.mkdir(parents=True, exist_ok=True)
+        for idx, (jpg_src, fname) in enumerate(pairs):
+            if idx % 500 == 0:
+                state["message"] = f"Moving images ({split}): {idx}/{len(pairs)}"
+            dst = dst_subdir / fname
+            if not dst.exists() and jpg_src.exists():
+                try:
+                    _sh.move(str(jpg_src), dst)
+                except Exception:
+                    pass
+
+    # ── Cleanup source directories ────────────────────────────────────────────
+    state["message"] = "Cleaning up source files..."
+    state["progress"] = 92
+    try:
+        if ann_dir.exists():
+            _sh.rmtree(ann_dir)
+        if img_dir.exists():
+            _sh.rmtree(img_dir)
+        for txt_file in [train_list, val_list, root / "test.txt"]:
+            if txt_file.exists():
+                txt_file.unlink(missing_ok=True)
+        idd_det_dir = root / "IDD_Detection"
+        if idd_det_dir.exists():
+            _sh.rmtree(idd_det_dir)
+    except Exception:
+        pass
+
+    out_train = coco_ann_dir / "idd_detection_train.json"
+    out_val   = coco_ann_dir / "idd_detection_val.json"
+    return out_train.exists() and out_val.exists()
 
 
 def _gdrive_download(file_id: str, dest_path: str, state: dict) -> None:
@@ -1224,18 +1262,20 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         if is_zip_valid:
             try:
                 with zipfile.ZipFile(arc) as zf:
+                    # Strip abs paths on all members upfront, then extractall in one call.
                     members = zf.infolist()
                     total_m = max(len(members), 1)
-                    for i, info in enumerate(members):
+                    state["message"] = f"Preparing {total_m} entries..."
+                    filtered = []
+                    for info in members:
                         safe = _strip_abs(info.filename)
-                        if not safe:
-                            continue
-                        info.filename = safe
-                        zf.extract(info, dest)
-                        if i % 200 == 0:
-                            pct = 55 + int((i / total_m) * 33)
-                            state["progress"] = pct
-                            state["message"] = f"Extracting {i}/{total_m} files..."
+                        if safe:
+                            info.filename = safe
+                            filtered.append(info)
+                    state["message"] = f"Extracting {len(filtered)} files..."
+                    state["progress"] = 60
+                    zf.extractall(dest, members=filtered)
+                    state["progress"] = 85
             except zipfile.BadZipFile:
                 is_zip_valid = False
 
@@ -1243,18 +1283,19 @@ def _bg_extract(name: str, archive_path: str, state: dict):
             if is_tar_gz or is_tar_bz2 or is_tar_raw or is_tar_ext or is_zip or lower.endswith(".zip"):
                 try:
                     with _tarfile.open(arc) as tf:
-                        i = 0
-                        for member in tf:
+                        # Strip abs paths upfront, then extractall in one call.
+                        members_all = tf.getmembers()
+                        state["message"] = f"Preparing {len(members_all)} entries..."
+                        filtered_tar = []
+                        for member in members_all:
                             safe = _strip_abs(member.name)
-                            if not safe:
-                                continue
-                            member.name = safe
-                            tf.extract(member, dest, filter="data")
-                            i += 1
-                            if i % 200 == 0:
-                                pct = min(55 + int(i / 100), 87)
-                                state["progress"] = pct
-                                state["message"] = f"Extracting {i} files..."
+                            if safe:
+                                member.name = safe
+                                filtered_tar.append(member)
+                        state["message"] = f"Extracting {len(filtered_tar)} files..."
+                        state["progress"] = 60
+                        tf.extractall(dest, members=filtered_tar, filter="data")
+                        state["progress"] = 85
                 except _tarfile.TarError as _te:
                     raise ValueError(
                         f"Archive '{arc.name}' is not a valid zip or tar archive. "

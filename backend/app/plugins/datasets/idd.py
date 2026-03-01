@@ -30,6 +30,9 @@ from ..loader import register_dataset
 _IDD_ROOT = DATASETS_DIR / "idd"
 _INDEX_DIR = _IDD_ROOT / "_index"
 
+# Bump this when the index schema changes so stale indexes are auto-rebuilt.
+_INDEX_VERSION = 2
+
 # IDD Detection classes (15 classes based on official IDD detection benchmark)
 _IDD_CLASSES = [
     "person", "rider", "car", "truck", "bus", "motorcycle",
@@ -131,16 +134,21 @@ def _build_index(
     # Remap category_ids to contiguous indices in each annotation
     index = []
     for entry in img_lookup.values():
-        file_rel = str(entry["file"])
-        img_file = img_dir / file_rel
-        # Handle nested paths in file_name (e.g. "train/img.jpg")
+        file_raw = str(entry["file"])
+
+        # Resolve the canonical relative path under img_dir (like COCO does).
+        # Try 1: use the path as-is.
+        img_file = img_dir / file_raw
+        resolved_rel = file_raw
         if not img_file.exists():
-            file_rel = Path(file_rel).name
-            img_file = img_dir / file_rel
+            # Try 2: basename only (strips any leading subdir in file_name).
+            base = Path(file_raw).name
+            img_file = img_dir / base
+            resolved_rel = base
         if not img_file.exists():
             continue
 
-        # Resolve actual w/h if not stored
+        # Resolve w/h at build time so __getitem__ never needs to open files.
         w, h = entry["w"], entry["h"]
         if w == 0 or h == 0:
             try:
@@ -162,7 +170,7 @@ def _build_index(
             })
 
         index.append({
-            "file": file_rel,
+            "file": resolved_rel,   # canonical path guaranteed to exist under img_dir
             "w": w,
             "h": h,
             "anns": remapped_anns,
@@ -170,8 +178,16 @@ def _build_index(
 
     index.sort(key=lambda e: e["file"])
     index_path.parent.mkdir(parents=True, exist_ok=True)
+    # Wrap in versioned envelope (same pattern as COCO categories.json side-file).
+    payload = {"version": _INDEX_VERSION, "images": index}
     with open(index_path, "w") as f:
-        json.dump(index, f, separators=(",", ":"))
+        json.dump(payload, f, separators=(",", ":"))
+
+    # Save categories alongside index so callers don't need to re-parse the full JSON.
+    cats_path = index_path.parent / "categories.json"
+    if not cats_path.exists():
+        with open(cats_path, "w") as f:
+            json.dump(sorted(data.get("categories", []), key=lambda c: c["id"]), f, indent=1)
 
     return index
 
@@ -185,29 +201,15 @@ class IDDRawDataset(Dataset):
         self._img_dir = img_dir
         self._index = index
         self._transform = transform
-        self._path_cache: dict[str, str] = {}
 
     def __len__(self):
         return len(self._index)
 
     def __getitem__(self, idx):
         entry = self._index[idx]
-        rel = str(entry["file"])
-        p = self._img_dir / Path(rel)
-        if not p.exists():
-            base = Path(rel).name
-            cached = self._path_cache.get(base)
-            if cached:
-                p = self._img_dir / Path(cached)
-            else:
-                hit = next(self._img_dir.rglob(base), None)
-                if hit is not None:
-                    try:
-                        rel_hit = hit.relative_to(self._img_dir)
-                        self._path_cache[base] = str(rel_hit)
-                        p = hit
-                    except Exception:
-                        p = hit
+        # Index stores canonical resolved paths (guaranteed by _build_index).
+        # Direct lookup — no rglob fallback needed.
+        p = self._img_dir / entry["file"]
         img = PILImage.open(p).convert("RGB")
         if self._transform is not None:
             img = self._transform(img)
@@ -291,6 +293,18 @@ class IDDPlugin(DatasetPlugin):
     def _load_categories(self) -> list[dict]:
         if self._categories is not None:
             return self._categories
+        # 1. Prefer pre-built categories.json (fast, same pattern as COCO).
+        cats_path = _INDEX_DIR / "categories.json"
+        if cats_path.exists():
+            try:
+                with open(cats_path) as f:
+                    cats = json.load(f)
+                if cats:
+                    self._categories = cats
+                    return self._categories
+            except Exception:
+                pass
+        # 2. Parse annotation JSON once and cache the result.
         for split in ("train", "val"):
             ann_path = _find_ann_file(split)
             if ann_path:
@@ -303,7 +317,7 @@ class IDDPlugin(DatasetPlugin):
                         return self._categories
                 except Exception:
                     pass
-        # Fallback to hardcoded IDD classes
+        # 3. Fallback to hardcoded IDD classes.
         self._categories = [{"id": i, "name": n} for i, n in enumerate(_IDD_CLASSES)]
         return self._categories
 
@@ -362,43 +376,33 @@ class IDDPlugin(DatasetPlugin):
         )
 
     def is_available(self) -> bool:
-        """Return True only when both annotation JSON files (with idd/detection
-        keywords inside) AND at least one image file are present."""
+        """Fast availability check — no rglob, no full JSON parse.
+
+        Strategy (cheapest first):
+        1. Pre-built index exists and is non-empty  → available.
+        2. Annotation JSON exists (size > 1 KB) AND images dir exists → available.
+           (After conversion the annotation JSON is always present and named
+           idd_detection_train.json; its existence is a reliable sentinel.)
+        """
         if not _IDD_ROOT.exists():
             return False
 
-        # Must have at least one annotation file that actually contains IDD content
-        ann_ok = False
-        for split in ("train", "val"):
-            ann_path = _find_ann_file(split)
-            if ann_path and ann_path.exists() and ann_path.stat().st_size > 1024:
-                try:
-                    # Quick keyword scan — don't fully parse the (potentially huge) JSON
-                    header = ann_path.read_bytes()[:4096].lower()
-                    keywords = (b"idd", b"detection", b"idd-detection",
-                                b"india driving", b"insaan")
-                    if any(kw in header for kw in keywords):
-                        ann_ok = True
-                        break
-                    # Fallback: check filename itself
-                    if any(kw in ann_path.name.lower().encode()
-                           for kw in (b"idd", b"detection")):
-                        ann_ok = True
-                        break
-                except Exception:
-                    pass
+        # 1. Index already built — fastest possible check (single stat call).
+        index_path = _INDEX_DIR / "train_index.json"
+        if index_path.exists() and index_path.stat().st_size > 256:
+            return True
 
-        if not ann_ok:
-            return False
-
-        # Must also have at least one actual image file
-        img_dir_train = _find_img_dir("train")
-        img_dir_val   = _find_img_dir("val")
-        for img_dir in (img_dir_train, img_dir_val):
+        # 2. Annotation sentinel + images dir exist.
+        ann_path = _find_ann_file("train")
+        if ann_path and ann_path.exists() and ann_path.stat().st_size > 1024:
+            img_dir = _find_img_dir("train")
             if img_dir and img_dir.exists():
-                for ext in ("*.jpg", "*.jpeg", "*.png"):
-                    if next(img_dir.rglob(ext), None) is not None:
-                        return True
+                # Check just the directory is non-empty (single iterdir call)
+                try:
+                    next(img_dir.iterdir())
+                    return True
+                except StopIteration:
+                    pass
         return False
 
     # ── Index management ──────────────────────────────────────────────────────
@@ -409,19 +413,30 @@ class IDDPlugin(DatasetPlugin):
                 return self._index_cache[split]
 
         index_path = _INDEX_DIR / f"{split}_index.json"
+        index = None
         if index_path.exists():
-            with open(index_path) as f:
-                index = json.load(f)
-            with self._lock:
-                self._index_cache[split] = index
-            return index
+            try:
+                with open(index_path) as f:
+                    raw = json.load(f)
+                # Support both versioned envelope {"version": N, "images": [...]} and
+                # legacy bare list format — rebuild if version is outdated.
+                if isinstance(raw, dict):
+                    if raw.get("version", 0) >= _INDEX_VERSION:
+                        index = raw["images"]
+                    # else: version mismatch → fall through to rebuild
+                else:
+                    # Legacy bare list — rebuild to get resolved paths.
+                    pass
+            except Exception:
+                pass
 
-        ann_path = _find_ann_file(split)
-        img_dir = _find_img_dir(split)
-        if not ann_path or not img_dir:
-            return []
+        if index is None:
+            ann_path = _find_ann_file(split)
+            img_dir = _find_img_dir(split)
+            if not ann_path or not img_dir:
+                return []
+            index = _build_index(ann_path, img_dir, index_path)
 
-        index = _build_index(ann_path, img_dir, index_path)
         with self._lock:
             self._index_cache[split] = index
         return index

@@ -19,17 +19,19 @@ def _get_conversion_marker_path(dataset_path: Path) -> Path:
 
 def _annotations_fingerprint(dataset_path: Path) -> dict[str, Any]:
     anno_dir = dataset_path / "annotations"
-    files = sorted(anno_dir.glob("instances_*.json"), key=lambda p: p.name)
-    return {
-        "files": [
-            {
-                "name": f.name,
-                "size": f.stat().st_size,
-                "mtime": f.stat().st_mtime,
-            }
-            for f in files
-        ]
-    }
+    # Include both COCO-style (instances_*.json) and IDD-style (idd_detection_*.json / *_train*.json)
+    candidates = sorted(
+        set(anno_dir.glob("instances_*.json")) |
+        set(anno_dir.glob("idd_detection_*.json")) |
+        set(anno_dir.glob("*_train*.json")) |
+        set(anno_dir.glob("*_val*.json")),
+        key=lambda p: p.name,
+    )
+    entries = []
+    for f in candidates:
+        st = f.stat()  # single stat() call per file
+        entries.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
+    return {"files": entries}
 
 
 def has_coco_annotations(dataset_path: Path) -> bool:
@@ -70,9 +72,10 @@ def is_already_converted(dataset_path: Path) -> bool:
         split_labels = labels_dir / split
         if not split_labels.exists():
             continue
-        # Check up to 200 files — if any has content, conversion is valid
+        # Use rglob so nested label dirs (e.g. IDD labels/train/frontFar/.../*.txt)
+        # are detected — flat glob("*.txt") misses them and causes re-conversion every run.
         checked = 0
-        for txt in split_labels.glob("*.txt"):
+        for txt in split_labels.rglob("*.txt"):
             if txt.stat().st_size > 0:
                 return True
             checked += 1
@@ -225,36 +228,39 @@ def convert_coco_to_yolo(
                     continue
                 ann_by_img[img_id].append((cls_idx, ann["bbox"]))
 
-            # Write one .txt per image (even empty = background, consistent with YOLO)
+            # ── Pass A: build all (txt_path, content) pairs in memory ──────
+            # Collecting everything first lets us batch-mkdir unique parent dirs
+            # and avoid interleaving mkdir+open+write syscalls on NFS.
+            pending: list[tuple[Path, str]] = []
             for img_id, info in img_info.items():
-                # Preserve relative subdir structure from file_name so YOLO can find
-                # labels by replacing images/ → labels/ in the full path.
-                # e.g. file_name="frontFar/BLR-.../001542_r.jpg"
-                #      → labels/train/frontFar/BLR-.../001542_r.txt
                 file_path = Path(info["file"])
-                rel_dir = file_path.parent  # e.g. "frontFar/BLR-..."
+                rel_dir = file_path.parent
                 txt_path = out_dir / rel_dir / f"{file_path.stem}.txt"
-                txt_path.parent.mkdir(parents=True, exist_ok=True)
                 w, h = info["w"], info["h"]
                 lines: list[str] = []
                 for cls_idx, bbox in ann_by_img.get(img_id, []):
-                    # COCO bbox: [x_min, y_min, width, height] pixels
                     bx, by, bw, bh = bbox
-                    # Convert to YOLO xywh normalised
-                    cx = (bx + bw / 2) / w
-                    cy = (by + bh / 2) / h
-                    nw = bw / w
-                    nh = bh / h
-                    # Clamp to [0, 1]
-                    cx = max(0.0, min(1.0, cx))
-                    cy = max(0.0, min(1.0, cy))
-                    nw = max(0.0, min(1.0, nw))
-                    nh = max(0.0, min(1.0, nh))
+                    cx = max(0.0, min(1.0, (bx + bw / 2) / w))
+                    cy = max(0.0, min(1.0, (by + bh / 2) / h))
+                    nw = max(0.0, min(1.0, bw / w))
+                    nh = max(0.0, min(1.0, bh / h))
                     if nw > 0 and nh > 0:
                         lines.append(f"{cls_idx} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
-                txt_path.write_text("\n".join(lines))
+                pending.append((txt_path, "\n".join(lines)))
+
+            # ── Pass B: mkdir unique parent dirs (batch, not per-file) ───────
+            seen_parents: set[Path] = set()
+            for txt_path, _ in pending:
+                p = txt_path.parent
+                if p not in seen_parents:
+                    p.mkdir(parents=True, exist_ok=True)
+                    seen_parents.add(p)
+
+            # ── Pass C: write all files sequentially ──────────────────────────
+            for txt_path, content in pending:
+                txt_path.write_text(content)
                 total_written += 1
-                if lines:
+                if content:
                     total_non_empty += 1
 
         try:
@@ -287,6 +293,53 @@ def convert_coco_to_yolo(
         }
 
 
+def _repair_marker_if_needed(dataset_path: Path) -> bool:
+    """Rewrite the conversion marker if labels exist but the marker is stale or has
+    an empty fingerprint (caused by the old bug where only instances_*.json was scanned).
+
+    Returns True if marker was repaired (caller can skip conversion entirely).
+    """
+    labels_dir = dataset_path / "labels"
+    if not labels_dir.exists():
+        return False
+
+    # Fast check: do any non-empty .txt label files exist?
+    has_labels = False
+    for split in ("train2017", "val2017", "train", "val"):
+        split_dir = labels_dir / split
+        if not split_dir.exists():
+            continue
+        for txt in split_dir.rglob("*.txt"):
+            if txt.stat().st_size > 0:
+                has_labels = True
+                break
+        if has_labels:
+            break
+
+    if not has_labels:
+        return False
+
+    # Labels are valid — ensure marker reflects the correct fingerprint.
+    current_fp = _annotations_fingerprint(dataset_path)
+    marker_path = _get_conversion_marker_path(dataset_path)
+    try:
+        if marker_path.exists():
+            existing = json.loads(marker_path.read_text())
+            if existing.get("annotations_fingerprint") == current_fp:
+                return True  # already correct
+        # Rewrite with correct fingerprint
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "annotations_fingerprint": current_fp,
+            "total_written": -1,   # unknown (repaired)
+            "total_non_empty": -1,
+            "repaired": True,
+        }))
+    except Exception:
+        pass
+    return True  # labels are valid, skip conversion
+
+
 def auto_convert_if_needed(dataset_name: str) -> dict[str, Any] | None:
     """Automatically convert COCO dataset to YOLO format if needed.
     
@@ -301,10 +354,15 @@ def auto_convert_if_needed(dataset_name: str) -> dict[str, Any] | None:
     if not has_coco_annotations(dataset_path):
         return None
     
-    # Check if already converted
+    # Fast path: marker matches current fingerprint → already converted.
     if is_already_converted(dataset_path):
         return None
-    
+
+    # Repair path: labels exist but marker was stale (old fingerprint bug).
+    # Rewrite marker and skip conversion — avoids re-converting every train run.
+    if _repair_marker_if_needed(dataset_path):
+        return None
+
     # IDD uses its own 15-class scheme — do NOT remap via COCO 91→80
     no_remap = {"idd", "idd_detection"}
     cls91to80 = dataset_name.lower() not in no_remap

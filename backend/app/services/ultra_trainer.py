@@ -952,6 +952,13 @@ def _training_worker(
                 fstype = _mount_fstype_for_path(ds_root)
                 if fstype and fstype.lower() in {"fuse", "fuseblk", "nfs", "cifs", "sshfs", "overlay"}:
                     is_remote_fs = True
+                # RunPod Network Volume mounts as nfs/overlay but may appear as ext4.
+                # Fallback: treat /workspace (and subdirs) as remote if fstype not caught above.
+                if not is_remote_fs and ds_root:
+                    _ds_str = str(ds_root.resolve())
+                    if _ds_str.startswith("/workspace") or _ds_str.startswith("/runpod-volume"):
+                        is_remote_fs = True
+                        fstype = fstype or "runpod-network-volume"
         except Exception as _fs_err:
             job_storage.append_job_log(job_id, "DEBUG", f"Dataset filesystem detection failed: {_fs_err}")
 
@@ -965,14 +972,18 @@ def _training_worker(
                 job_storage.append_job_log(job_id, "INFO",
                     f"Auto-tuned dataloader workers: {optimal_workers}")
 
-        # Force disk cache (cache=True) so label scan results are stored in a
-        # .cache file and reused on subsequent runs — avoids rescanning 100k+
-        # images every time.  Override even if user passed cache=False, since
-        # label scanning is extremely slow for large datasets like COCO/IDD.
-        # Only honour explicit non-False user setting (e.g. "ram" or "disk").
+        # Smart cache selection (only when user has not set an explicit non-False value).
+        # Priority: cache="ram"  > cache=True (disk)  > cache=False
+        #
+        # cache="ram":  load all images into shared memory once — zero I/O per batch.
+        #               Chosen when free RAM >= dataset_image_size * 1.5.
+        # cache=True:   build a .cache label file on first run, reuse after.
+        #               On NFS this still saves the re-scan cost for later runs.
+        # cache=False:  no caching (fallback for remote FS where .cache write is slow).
         _user_cache = train_kwargs.get("cache", None)
         if not _user_cache or str(_user_cache).lower() in ("false", "0", "none", ""):
-            train_kwargs["cache"] = True
+            _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs)
+            train_kwargs["cache"] = _chosen_cache
 
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
         # due to heavy stat()/glob across 100k+ files and/or multiprocessing overhead.
@@ -985,12 +996,20 @@ def _training_worker(
                 f"dataset_root={str(ds_root)!r}, fstype={fstype!r}",
             )
         if is_remote_fs:
-            # On remote filesystems we keep cache off, but we should NOT force workers=0.
-            # workers=0 avoids multiprocessing overhead but can drastically reduce throughput.
-            # Use a small worker count unless the user explicitly provided one.
+            # On remote filesystems we keep cache off unless RAM cache was chosen,
+            # but we should NOT force workers=0 — use a small worker count instead.
             if "workers" not in config:
                 train_kwargs["workers"] = 2
-            train_kwargs["cache"] = False
+
+            # If smart cache chose ram → keep it (best option on any FS).
+            # Otherwise fall back to False — disk cache on NFS is slow.
+            if str(train_kwargs.get("cache", "")).lower() not in ("ram", "true", "1", "disk"):
+                train_kwargs["cache"] = False
+
+            # Redirect Ultralytics .cache files to /tmp (fast local storage) so
+            # label scan results survive the session without writing to NFS.
+            if train_kwargs.get("cache") in (True, "disk") and ds_root:
+                _redirect_cache_to_tmp(ds_root, job_id)
 
             # Ultralytics label caching scans all images/labels using a ThreadPool(NUM_THREADS).
             # On remote filesystems (FUSE/NFS/etc.) high parallelism can degrade performance
@@ -1417,6 +1436,126 @@ def _training_worker(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool) -> "str | bool":
+    """Choose the best Ultralytics cache mode given available RAM and dataset size.
+
+    Returns:
+        "ram"  — load all images into shared memory (zero I/O per batch).
+                 Chosen when free RAM >= estimated_dataset_bytes * 1.5.
+        True   — disk .cache file (label scan saved, images read per batch).
+        False  — no caching (last resort for remote FS when RAM is tight).
+    """
+    import os
+    try:
+        import psutil
+        free_ram = psutil.virtual_memory().available
+    except Exception:
+        free_ram = 0
+
+    # Estimate dataset image size: count images and multiply by median size.
+    dataset_bytes = 0
+    if ds_root and ds_root.exists():
+        try:
+            _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            sizes = []
+            for split in ("train", "train2017"):
+                img_dir = ds_root / "images" / split
+                if not img_dir.exists():
+                    img_dir = ds_root / "images"
+                if img_dir.exists():
+                    for p in img_dir.iterdir():
+                        if p.suffix.lower() in _IMG_EXTS:
+                            try:
+                                sizes.append(p.stat().st_size)
+                            except OSError:
+                                pass
+                        if len(sizes) >= 200:
+                            break
+                if sizes:
+                    break
+            if sizes:
+                import statistics
+                median_size = statistics.median(sizes)
+                # Count total images cheaply (iterdir once more)
+                total_imgs = sum(
+                    1 for p in img_dir.iterdir()
+                    if p.suffix.lower() in _IMG_EXTS
+                ) if img_dir.exists() else len(sizes)
+                dataset_bytes = int(median_size * total_imgs)
+        except Exception:
+            dataset_bytes = 0
+
+    required_ram = int(dataset_bytes * 1.5)
+    if free_ram > 0 and dataset_bytes > 0 and free_ram >= required_ram:
+        gb = dataset_bytes / (1024 ** 3)
+        free_gb = free_ram / (1024 ** 3)
+        job_storage.append_job_log(job_id, "INFO",
+            f"Cache strategy: ram — dataset ~{gb:.1f} GB, free RAM {free_gb:.1f} GB "
+            f"(>= {required_ram/(1024**3):.1f} GB threshold)")
+        return "ram"
+
+    # Not enough RAM for full image cache — fall back to disk .cache (label scan only).
+    # On remote FS this is still better than False because scan only happens once.
+    chosen = True  # disk .cache
+    if free_ram > 0 and dataset_bytes > 0:
+        gb = dataset_bytes / (1024 ** 3)
+        free_gb = free_ram / (1024 ** 3)
+        job_storage.append_job_log(job_id, "INFO",
+            f"Cache strategy: disk — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB, "
+            "using label .cache file only")
+    else:
+        job_storage.append_job_log(job_id, "INFO",
+            "Cache strategy: disk — could not estimate dataset size, defaulting to disk cache")
+    return chosen
+
+
+def _redirect_cache_to_tmp(ds_root: "Path | None", job_id: str) -> None:
+    """Symlink Ultralytics .cache files from NFS dataset dir to /tmp.
+
+    Ultralytics writes <labels_dir>/<split>.cache next to the label .txt files.
+    On NFS these writes are slow and can hang.  We create a fast local mirror
+    under /tmp and symlink from the NFS path → /tmp path so Ultralytics writes
+    to local disk transparently.
+    """
+    if not ds_root or not ds_root.exists():
+        return
+    import tempfile, os
+
+    tmp_base = Path(tempfile.gettempdir()) / "ultralytics_cache" / ds_root.name
+    try:
+        tmp_base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    redirected = []
+    for split in ("train", "val", "train2017", "val2017", "test"):
+        labels_dir = ds_root / "labels" / split
+        if not labels_dir.exists():
+            continue
+        cache_nfs = labels_dir / f"{split}.cache"
+        cache_tmp = tmp_base / f"{split}.cache"
+        # Only redirect if NFS cache doesn't exist yet (avoid clobbering valid cache)
+        if cache_nfs.exists() and not cache_nfs.is_symlink():
+            continue
+        # Remove stale symlink
+        if cache_nfs.is_symlink():
+            try:
+                cache_nfs.unlink()
+            except Exception:
+                continue
+        # Create symlink NFS path → /tmp path
+        try:
+            cache_nfs.symlink_to(cache_tmp)
+            redirected.append(f"{cache_nfs} → {cache_tmp}")
+        except Exception:
+            pass
+
+    if redirected:
+        job_storage.append_job_log(job_id, "INFO",
+            f"Redirected {len(redirected)} .cache path(s) to /tmp: " +
+            ", ".join(redirected))
+
 
 def _get_optimal_workers() -> int:
     """Return a safe dataloader worker count for the current environment.

@@ -176,12 +176,11 @@ def _load_or_build_filelist_cache(images_dir: Path, cache_path: Path) -> list[Pa
         except Exception:
             pass
 
-    # Build fresh sorted list
-    files = sorted(str(p.resolve()) for p in images_dir.iterdir()
-                   if p.suffix.lower() in {
-                       ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
-                       ".webp", ".gif",
-                   })
+    # Build fresh sorted list — rglob to catch images in subdirectories
+    # (e.g. IDD: images/train/roadSequence001_frame000000.jpg or nested subdirs).
+    _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+    files = sorted(str(p.resolve()) for p in images_dir.rglob("*")
+                   if p.is_file() and p.suffix.lower() in _IMG_EXTS)
     try:
         cache_path.write_text(json.dumps({"mtime": dir_mtime, "files": files}))
     except Exception:

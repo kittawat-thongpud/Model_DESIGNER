@@ -364,27 +364,42 @@ class CustomDetectionTrainer(DetectionTrainer):
         done = threading.Event()
         start_t = _time.time()
         timeout_s = 600  # 10 min — large datasets (IDD ~47k images) need time to scan+cache
+        heartbeat_interval = 30  # log progress every 30s so user knows it is not hung
 
         def _watchdog():
-            if not done.wait(timeout_s):
-                try:
-                    elapsed = _time.time() - start_t
-                    self.log(
-                        f"Training setup watchdog triggered after {elapsed:.1f}s - dumping thread stacks",
-                        "WARNING",
-                    )
-                    frames = sys._current_frames()
-                    for th in threading.enumerate():
-                        try:
-                            frame = frames.get(th.ident)
-                            if frame is None:
+            """Emit heartbeat logs every 30s; dump stacks on timeout."""
+            while True:
+                triggered = not done.wait(heartbeat_interval)
+                if done.is_set():
+                    break
+                elapsed = _time.time() - start_t
+                if elapsed >= timeout_s:
+                    # Timeout — dump stacks
+                    try:
+                        self.log(
+                            f"Training setup watchdog triggered after {elapsed:.1f}s - dumping thread stacks",
+                            "WARNING",
+                        )
+                        frames = sys._current_frames()
+                        for th in threading.enumerate():
+                            try:
+                                frame = frames.get(th.ident)
+                                if frame is None:
+                                    continue
+                                stack = "".join(traceback.format_stack(frame))
+                                self.log(f"Thread stack | name={th.name} ident={th.ident}\n{stack}", "WARNING")
+                            except Exception:
                                 continue
-                            stack = "".join(traceback.format_stack(frame))
-                            self.log(f"Thread stack | name={th.name} ident={th.ident}\n{stack}", "WARNING")
-                        except Exception:
-                            continue
-                except Exception as e:
-                    self.log(f"Training setup watchdog failed: {e}", "WARNING")
+                    except Exception as e:
+                        self.log(f"Training setup watchdog failed: {e}", "WARNING")
+                    break
+                else:
+                    # Heartbeat — user sees setup is still running
+                    self.log(
+                        f"Dataset setup still running ({elapsed:.0f}s elapsed) — "
+                        "scanning labels / building .cache file...",
+                        "INFO",
+                    )
 
         threading.Thread(target=_watchdog, daemon=True, name="setup_train_watchdog").start()
         try:
@@ -393,10 +408,45 @@ class CustomDetectionTrainer(DetectionTrainer):
             done.set()
 
         self.log(
-            f"Training setup complete - {self.train_loader.dataset.ni} train images, {self.test_loader.dataset.ni} val images",
+            f"Training setup complete - {self.train_loader.dataset.ni} train images, "
+            f"{self.test_loader.dataset.ni} val images",
             "INFO",
         )
         return result
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
+        """Override to enable persistent_workers and prefetch_factor.
+
+        ``persistent_workers=True`` keeps worker processes alive between epochs
+        so Python does not re-fork ~4 processes each epoch (saves ~2-5s/epoch).
+        ``prefetch_factor=2`` lets workers pre-load the next batch while GPU
+        is processing the current one — overlaps I/O with compute.
+        Both are no-ops when workers=0 (single-process mode).
+        """
+        loader = super().get_dataloader(dataset_path, batch_size=batch_size, rank=rank, mode=mode)
+        try:
+            nw = getattr(loader, 'num_workers', 0)
+            if nw > 0:
+                # Rebuild DataLoader with persistent_workers + prefetch_factor
+                from torch.utils.data import DataLoader
+                loader = DataLoader(
+                    loader.dataset,
+                    batch_size=loader.batch_size,
+                    shuffle=(mode == "train" and rank == -1),
+                    num_workers=nw,
+                    pin_memory=getattr(loader, 'pin_memory', False),
+                    collate_fn=getattr(loader, 'collate_fn', None),
+                    worker_init_fn=getattr(loader, 'worker_init_fn', None),
+                    persistent_workers=True,
+                    prefetch_factor=2,
+                )
+                self.log(
+                    f"DataLoader ({mode}): workers={nw}, persistent_workers=True, prefetch_factor=2",
+                    "DEBUG",
+                )
+        except Exception as _dl_err:
+            self.log(f"persistent_workers patch skipped: {_dl_err}", "DEBUG")
+        return loader
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
