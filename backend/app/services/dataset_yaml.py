@@ -277,31 +277,44 @@ def generate_data_yaml(
             test_dir = split_config.get("test", test_dir)
 
         # Auto-detect directory structure
-        if ds_path.exists():
-            if (ds_path / "images" / "train2017").exists():
-                train_dir = "images/train2017"
-                val_dir = "images/val2017" if (ds_path / "images" / "val2017").exists() else train_dir
-            elif (ds_path / "train2017").exists():
-                train_dir = "train2017"
-                val_dir = "val2017" if (ds_path / "val2017").exists() else train_dir
-            elif (ds_path / "images" / "train").exists():
-                train_dir = "images/train"
-                val_dir = "images/val" if (ds_path / "images" / "val").exists() else train_dir
-                test_dir = "images/test"
-            elif (ds_path / "train").exists():
-                train_dir = "train"
-                val_dir = "val" if (ds_path / "val").exists() else train_dir
-                test_dir = "test"
-
-        lines.append(f"path: {ds_path}")
-        lines.append(f"train: {train_dir}")
-        # Ultralytics requires 'val' key — use val if exists, else duplicate train
-        if val_dir != train_dir:
-            lines.append(f"val: {val_dir}")
+        # Prefer pre-generated txt file lists (train.txt / val.txt) when they exist.
+        # This avoids symlink-dereferencing issues (e.g. IDD: images/ -> JPEGImages/)
+        # where Ultralytics resolves the real path and then can't find labels/.
+        if ds_path.exists() and (ds_path / "train.txt").exists():
+            lines.append(f"path: {ds_path}")
+            lines.append(f"train: {ds_path / 'train.txt'}")
+            if (ds_path / "val.txt").exists():
+                lines.append(f"val: {ds_path / 'val.txt'}")
+            else:
+                lines.append(f"val: {ds_path / 'train.txt'}  # No val split, using train for validation")
+            if (ds_path / "test.txt").exists():
+                lines.append(f"test: {ds_path / 'test.txt'}")
         else:
-            lines.append(f"val: {val_dir}  # No val split, using train for validation")
-        if ds_path.exists() and (ds_path / test_dir).exists():
-            lines.append(f"test: {test_dir}")
+            if ds_path.exists():
+                if (ds_path / "images" / "train2017").exists():
+                    train_dir = "images/train2017"
+                    val_dir = "images/val2017" if (ds_path / "images" / "val2017").exists() else train_dir
+                elif (ds_path / "train2017").exists():
+                    train_dir = "train2017"
+                    val_dir = "val2017" if (ds_path / "val2017").exists() else train_dir
+                elif (ds_path / "images" / "train").exists():
+                    train_dir = "images/train"
+                    val_dir = "images/val" if (ds_path / "images" / "val").exists() else train_dir
+                    test_dir = "images/test"
+                elif (ds_path / "train").exists():
+                    train_dir = "train"
+                    val_dir = "val" if (ds_path / "val").exists() else train_dir
+                    test_dir = "test"
+
+            lines.append(f"path: {ds_path}")
+            lines.append(f"train: {train_dir}")
+            # Ultralytics requires 'val' key — use val if exists, else duplicate train
+            if val_dir != train_dir:
+                lines.append(f"val: {val_dir}")
+            else:
+                lines.append(f"val: {val_dir}  # No val split, using train for validation")
+            if ds_path.exists() and (ds_path / test_dir).exists():
+                lines.append(f"test: {test_dir}")
 
     lines.extend([
         f"",

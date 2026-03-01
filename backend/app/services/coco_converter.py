@@ -134,14 +134,16 @@ def convert_coco_to_yolo(
     }
 
     # Map: split name in annotation filename → output subdir name
-    # e.g. instances_train2017.json → labels/train2017/
+    # COCO-style (train2017/val2017) keeps the subdir because images are in images/train2017/.
+    # IDD-style (flat JPEGImages/) must NOT add a split subdir — labels go directly to labels/.
     SPLIT_MAP = {
         "train2017": "train2017",
         "val2017":   "val2017",
-        "train":     "train",
-        "val":       "val",
         "test2017":  "test2017",
-        "test":      "test",
+        # For flat-image datasets (IDD, VOC-style), no split subdir:
+        "train":     "",
+        "val":       "",
+        "test":      "",
     }
 
     # Collect annotation JSON files: instances_*.json OR *_train*.json / *_val*.json
@@ -180,7 +182,10 @@ def convert_coco_to_yolo(
                         split_key = kw
                         break
             out_subdir = SPLIT_MAP.get(split_key, split_key)
-            out_dir = labels_root / out_subdir
+            # If the dataset has split-specific image dirs (e.g. images/train2017/),
+            # keep the subdir. For flat datasets (JPEGImages/ or images/ shared across splits)
+            # out_subdir is empty so labels go directly into labels/.
+            out_dir = labels_root / out_subdir if out_subdir else labels_root
             out_dir.mkdir(parents=True, exist_ok=True)
 
             with open(json_path) as f:

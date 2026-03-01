@@ -204,11 +204,26 @@ def _resolve_dataset_yaml(dataset: str, weight_meta: dict | None) -> Path | None
                 except Exception:
                     pass
 
+    # 6. Plugin-based: generate data.yaml on-the-fly for installed datasets
+    try:
+        from ..plugins.loader import get_dataset_plugin, discover_plugins
+        from ..services.dataset_yaml import generate_data_yaml
+        discover_plugins()
+        plugin = get_dataset_plugin(dataset.lower())
+        if plugin and plugin.is_available():
+            cached_yaml = datasets_dir / dataset / "data.yaml"
+            cached_yaml.parent.mkdir(parents=True, exist_ok=True)
+            cached_yaml.write_text(generate_data_yaml(dataset))
+            return cached_yaml
+    except Exception:
+        pass
+
     return None
 
 
 def _list_available_datasets(weight_meta: dict | None = None) -> list[dict]:
     """Return all dataset YAMLs available for benchmarking."""
+    import tempfile
     import yaml as _yaml
 
     datasets_dir = DATA_DIR / "datasets"
@@ -216,20 +231,51 @@ def _list_available_datasets(weight_meta: dict | None = None) -> list[dict]:
     results: list[dict] = []
     seen: set[str] = set()
 
-    def _add(label: str, yaml_path: Path, source: str):
+    def _add(label: str, yaml_path: Path, source: str, nc_override: int | None = None):
         key = label.lower()
         if key in seen:
             return
         seen.add(key)
-        nc = None
-        try:
-            data = _yaml.safe_load(yaml_path.read_text())
-            nc = data.get("nc")
-        except Exception:
-            pass
+        nc = nc_override
+        if nc is None:
+            try:
+                data = _yaml.safe_load(yaml_path.read_text())
+                nc = data.get("nc")
+            except Exception:
+                pass
         results.append({"label": label, "value": label, "yaml_path": str(yaml_path), "nc": nc, "source": source})
 
-    # Datasets dir
+    # ── Installed plugins (same source as training jobs) ──────────────────────
+    # Generate data.yaml on-the-fly for each available plugin and cache it in
+    # the dataset dir so benchmark can reference it.
+    try:
+        from ..plugins.loader import all_dataset_plugins, discover_plugins
+        from ..services.dataset_yaml import generate_data_yaml
+        discover_plugins()
+        for plugin in all_dataset_plugins():
+            try:
+                if not plugin.is_available():
+                    continue
+                ds_name = plugin.name
+                ds_dir = datasets_dir / ds_name
+                cached_yaml = ds_dir / "data.yaml"
+                # Re-generate if missing or stale (older than 1 day)
+                import time as _time
+                needs_regen = (
+                    not cached_yaml.exists()
+                    or (_time.time() - cached_yaml.stat().st_mtime) > 86400
+                )
+                if needs_regen:
+                    yaml_content = generate_data_yaml(ds_name)
+                    cached_yaml.parent.mkdir(parents=True, exist_ok=True)
+                    cached_yaml.write_text(yaml_content)
+                _add(ds_name, cached_yaml, "dataset", nc_override=plugin.num_classes)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ── Datasets dir (static data.yaml files, e.g. COCO downloaded manually) ─
     if datasets_dir.exists():
         for ds_dir in sorted(datasets_dir.iterdir()):
             for fname in ("data.yaml", f"{ds_dir.name}.yaml"):
