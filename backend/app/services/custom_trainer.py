@@ -238,7 +238,22 @@ class CustomDetectionTrainer(DetectionTrainer):
         custom_source = getattr(self, '_custom_params', {})
         
         # 2. Extract and remove custom params
-        self.job_id = clean_overrides.pop('job_id', custom_source.get('job_id'))
+        # Fallback chain: overrides → _custom_params → MD_JOB_ID env var
+        # The env var is set by ultra_trainer before model.train() and is inherited
+        # by DDP child subprocesses (Ultralytics spawns them via subprocess.Popen,
+        # so all os.environ entries are available in the child).
+        import os as _os
+        self.job_id = (
+            clean_overrides.pop('job_id', None)
+            or custom_source.get('job_id')
+            or _os.environ.get('MD_JOB_ID')
+        )
+
+        # DDP rank: -1 = single GPU, 0 = main DDP rank, >0 = worker rank.
+        # Only rank -1 and 0 should write progress to job_storage to avoid
+        # duplicate log entries from every GPU worker.
+        _local_rank = int(_os.environ.get('LOCAL_RANK', -1))
+        self._is_logging_rank = _local_rank in (-1, 0)
         self.record_gradients = clean_overrides.pop('record_gradients', custom_source.get('record_gradients', False))
         self.record_weights = clean_overrides.pop('record_weights', custom_source.get('record_weights', False))
         self.gradient_interval = clean_overrides.pop('gradient_interval', custom_source.get('gradient_interval', 1))
@@ -530,6 +545,11 @@ class CustomDetectionTrainer(DetectionTrainer):
         import torch
         import psutil
 
+        # DDP: only rank -1 (single GPU) or rank 0 (main DDP rank) should write
+        # progress logs. Worker ranks (LOCAL_RANK > 0) skip logging entirely.
+        if not getattr(self, '_is_logging_rank', True):
+            return
+
         # Track per-batch timing for speed calculation
         now = _time.time()
         if not hasattr(self, '_last_batch_time'):
@@ -702,44 +722,51 @@ class CustomDetectionTrainer(DetectionTrainer):
         """
         import psutil
         import torch
+
+        _logging = getattr(self, '_is_logging_rank', True)
+
+        # Log validation start with structured PROGRESS data (rank 0 / single-GPU only)
+        if _logging:
+            if self.job_id:
+                job_storage.append_job_log(self.job_id, "PROGRESS",
+                    f"Running validation for epoch {self.epoch + 1}...",
+                    {
+                        'type': 'progress',
+                        'phase': 'validation',
+                        'epoch': f"{self.epoch + 1}/{self.epochs}",
+                        'batch': '0/0',
+                        'percent': 100,
+                        'losses': {},
+                    }
+                )
+            else:
+                self.log(f"Running validation for epoch {self.epoch + 1}...", "PROGRESS")
+
+            # Emit SSE progress event for validation phase to train_channel (frontend listens here)
+            if self.job_id:
+                from . import event_bus
+                from ..constants import train_channel
+                event_bus.publish_sync(train_channel(self.job_id), {
+                    "type": "progress",
+                    "phase": "validation",
+                    "epoch": self.epoch + 1,
+                    "total_epochs": self.epochs,
+                    "batch": 0,
+                    "total_batches": 0,
+                    "percent": 100.0,
+                    "losses": {},
+                    "message": f"Validating epoch {self.epoch + 1}...",
+                })
         
-        # Log validation start with structured PROGRESS data
-        if self.job_id:
-            job_storage.append_job_log(self.job_id, "PROGRESS",
-                f"Running validation for epoch {self.epoch + 1}...",
-                {
-                    'type': 'progress',
-                    'phase': 'validation',
-                    'epoch': f"{self.epoch + 1}/{self.epochs}",
-                    'batch': '0/0',
-                    'percent': 100,
-                    'losses': {},
-                }
-            )
-        else:
-            self.log(f"Running validation for epoch {self.epoch + 1}...", "PROGRESS")
-        
-        # Emit SSE progress event for validation phase to train_channel (frontend listens here)
-        if self.job_id:
-            from . import event_bus
-            from ..constants import train_channel
-            event_bus.publish_sync(train_channel(self.job_id), {
-                "type": "progress",
-                "phase": "validation",
-                "epoch": self.epoch + 1,
-                "total_epochs": self.epochs,
-                "batch": 0,
-                "total_batches": 0,
-                "percent": 100.0,
-                "losses": {},
-                "message": f"Validating epoch {self.epoch + 1}...",
-            })
-        
-        # Run parent validation
+        # Run parent validation (all ranks must execute this)
         val_start = time.time()
         metrics = super().validate()
         val_time = time.time() - val_start
-        
+
+        # Worker DDP ranks: skip all logging / extended metrics writing
+        if not _logging:
+            return metrics
+
         # Collect device and resource info
         device_info = {}
         if torch.cuda.is_available():

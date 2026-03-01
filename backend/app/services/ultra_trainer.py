@@ -1086,6 +1086,11 @@ def _training_worker(
 
         def on_train_epoch_end(trainer):
             """Called after each training epoch."""
+            # DDP: only rank -1 (single GPU) or rank 0 writes to job storage
+            import os as _os
+            if int(_os.environ.get('LOCAL_RANK', -1)) > 0:
+                return
+
             if _should_stop(job_id):
                 raise KeyboardInterrupt("Training stopped by user")
 
@@ -1132,6 +1137,11 @@ def _training_worker(
 
         def on_fit_epoch_end(trainer):
             """Called after validation at end of each epoch."""
+            # DDP: only rank -1 (single GPU) or rank 0 writes to job storage
+            import os as _os
+            if int(_os.environ.get('LOCAL_RANK', -1)) > 0:
+                return
+
             if not hasattr(trainer, 'metrics') or not trainer.metrics:
                 return
 
@@ -1152,6 +1162,11 @@ def _training_worker(
                 _publish(job_id, j)
 
         def on_train_start(trainer):
+            # DDP: only rank -1 (single GPU) or rank 0 writes to job storage
+            import os as _os
+            if int(_os.environ.get('LOCAL_RANK', -1)) > 0:
+                return
+
             j = job_storage.load_job(job_id)
             if j:
                 j["message"] = "Training started"
@@ -1273,6 +1288,13 @@ def _training_worker(
         import sys
         sys.argv = []
         os.environ['YOLO_CLI'] = '0'
+
+        # Pass job_id via env var so DDP child subprocesses can recover it.
+        # Ultralytics DDP spawns workers via subprocess.Popen (generate_ddp_file),
+        # which serialises only trainer.args into the temp .py file — not job_id.
+        # Child processes inherit all os.environ entries, so this is the only
+        # reliable channel to pass job_id across the process boundary.
+        os.environ['MD_JOB_ID'] = job_id
         
         # Monkey-patch Ultralytics' entrypoint to prevent CLI parsing
         try:
