@@ -753,7 +753,10 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
 
             # Destination: flat filename under images/<split>/ — avoids
             # creating thousands of subdirectories, matching COCO convention.
-            fname = rel_path.name + ".jpg"
+            # Use the full relative path flattened with "__" to prevent
+            # basename collisions across camera sequences
+            # e.g. frontFar/BLR-xxx/001542_r -> frontFar__BLR-xxx__001542_r.jpg
+            fname = str(rel_path).replace("/", "__").replace("\\", "__") + ".jpg"
             move_pairs.append((jpg_src, fname))
 
             images.append({
@@ -1136,6 +1139,7 @@ def _bg_url_download(name: str, url: str):
             plugin.rebuild_index()
 
         _invalidate_cache(name)
+        _invalidate_partition_cache(name)
         _scan_dataset_meta(name)
 
         # Verify dataset is actually usable after extraction
@@ -1379,6 +1383,7 @@ def _bg_extract(name: str, archive_path: str, state: dict):
             plugin.rebuild_index()
 
         _invalidate_cache(name)
+        _invalidate_partition_cache(name)
         _scan_dataset_meta(name)
 
         # Verify dataset is actually usable after extraction

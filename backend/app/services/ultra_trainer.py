@@ -890,41 +890,47 @@ def _training_worker(
             and len([x for x in _final_device.split(",") if x.strip()]) > 1
         )
 
-        if _is_multi_gpu:
-            # Ultralytics DDP spawns child processes via torch.multiprocessing.
-            # In a forked uvicorn worker the default 'fork' start method can
-            # cause deadlocks with CUDA.  Switch to 'spawn' before training.
-            import multiprocessing as _mp
-            try:
-                _current_method = _mp.get_start_method(allow_none=True)
-                if _current_method != "spawn":
-                    _mp.set_start_method("spawn", force=True)
-                    job_storage.append_job_log(job_id, "INFO",
-                        f"Multi-GPU DDP: set multiprocessing start method "
-                        f"'spawn' (was '{_current_method}')")
-            except RuntimeError:
-                # Already set — OK if already spawn; warn otherwise
-                _current_method = _mp.get_start_method(allow_none=True)
-                if _current_method != "spawn":
-                    job_storage.append_job_log(job_id, "WARNING",
-                        f"Multi-GPU DDP: could not change start method from "
-                        f"'{_current_method}' to 'spawn' — DDP may deadlock")
+        # ── Multi-GPU / DDP setup ─────────────────────────────────────────────
+        # JobCustomTrainer is now a top-level importable class in custom_trainer.py
+        # so Ultralytics DDP subprocess can import it correctly.
+        #
+        # DDP subprocess runs from /root/.config/Ultralytics/DDP/ — it has no
+        # access to the project directory, so 'from app.services.custom_trainer'
+        # fails with ModuleNotFoundError.  We must inject the backend directory
+        # into PYTHONPATH *before* torch.distributed.run spawns the subprocess.
+        import sys as _sys
+        _backend_dir = str(Path(__file__).resolve().parent.parent.parent)  # .../backend
+        _cur_pythonpath = os.environ.get("PYTHONPATH", "")
+        if _backend_dir not in _cur_pythonpath.split(os.pathsep):
+            os.environ["PYTHONPATH"] = _backend_dir + (os.pathsep + _cur_pythonpath if _cur_pythonpath else "")
+        if _backend_dir not in _sys.path:
+            _sys.path.insert(0, _backend_dir)
+        job_storage.append_job_log(job_id, "DEBUG",
+            f"DDP PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
 
-            job_storage.append_job_log(job_id, "INFO",
-                f"Multi-GPU training enabled: device='{_final_device}' "
-                f"({len(_final_device.split(','))} GPUs) — using DDP")
-        elif _avail > 1 and not _final_device:
-            # User left device blank but multiple GPUs exist — use all of them
-            all_indices = ",".join(str(i) for i in range(_avail))
-            train_kwargs["device"] = all_indices
-            job_storage.append_job_log(job_id, "INFO",
-                f"Auto-selected all {_avail} GPUs: device='{all_indices}'")
-            # Apply spawn for this case too
+        if _is_multi_gpu:
+            # User explicitly set multi-GPU (e.g. device="0,1") — enable DDP.
             import multiprocessing as _mp
             try:
-                _mp.set_start_method("spawn", force=True)
+                if _mp.get_start_method(allow_none=True) != "spawn":
+                    _mp.set_start_method("spawn", force=True)
             except RuntimeError:
                 pass
+            _gpu_count = len([x for x in _final_device.split(",") if x.strip()])
+            job_storage.append_job_log(job_id, "INFO",
+                f"Multi-GPU DDP enabled: device='{_final_device}' ({_gpu_count} GPUs)")
+        elif _avail > 1 and not _final_device:
+            # device blank + multiple GPUs → use all GPUs via DDP
+            all_indices = ",".join(str(i) for i in range(_avail))
+            train_kwargs["device"] = all_indices
+            import multiprocessing as _mp
+            try:
+                if _mp.get_start_method(allow_none=True) != "spawn":
+                    _mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+            job_storage.append_job_log(job_id, "INFO",
+                f"Auto-selected all {_avail} GPUs: device='{all_indices}' (DDP)")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── ema / pin_memory note ─────────────────────────────────────────────
@@ -982,7 +988,21 @@ def _training_worker(
         # cache=False:  no caching (fallback for remote FS where .cache write is slow).
         _user_cache = train_kwargs.get("cache", None)
         if not _user_cache or str(_user_cache).lower() in ("false", "0", "none", ""):
-            _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs)
+            _ddp_gpus = train_kwargs.get("device", None)
+            _num_ddp = 1
+            try:
+                import torch as _torch
+                if _ddp_gpus is None:
+                    _num_ddp = max(1, _torch.cuda.device_count())
+                elif isinstance(_ddp_gpus, (list, tuple)):
+                    _num_ddp = max(1, len(_ddp_gpus))
+                elif isinstance(_ddp_gpus, str) and "," in _ddp_gpus:
+                    _num_ddp = max(1, len(_ddp_gpus.split(",")))
+                else:
+                    _num_ddp = 1
+            except Exception:
+                _num_ddp = 1
+            _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs, num_gpus=_num_ddp)
             train_kwargs["cache"] = _chosen_cache
 
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
@@ -1001,9 +1021,15 @@ def _training_worker(
             if "workers" not in config:
                 train_kwargs["workers"] = 2
 
-            # If smart cache chose ram → keep it (best option on any FS).
-            # Otherwise fall back to False — disk cache on NFS is slow.
-            if str(train_kwargs.get("cache", "")).lower() not in ("ram", "true", "1", "disk"):
+            # Never use cache='ram' on remote/RunPod FS — each DDP process allocates
+            # its own independent copy, easily OOMing the container.
+            # Downgrade ram → disk; disk cache on RunPod /workspace works fine.
+            if str(train_kwargs.get("cache", "")).lower() in ("ram",):
+                train_kwargs["cache"] = True
+                job_storage.append_job_log(job_id, "WARNING",
+                    "Remote FS mitigation: downgraded cache='ram' → cache=True (disk) "
+                    "to prevent DDP multi-process RAM OOM")
+            elif str(train_kwargs.get("cache", "")).lower() not in ("true", "1", "disk"):
                 train_kwargs["cache"] = False
 
             # Redirect Ultralytics .cache files to /tmp (fast local storage) so
@@ -1258,30 +1284,19 @@ def _training_worker(
         job_storage.append_job_log(job_id, "INFO",
             f"Starting model.train() with {len(train_kwargs)} kwargs")
         
-        # Create a dynamic trainer class with custom params injected
-        # This ensures Ultralytics receives a proper class, not a factory function
-        class JobCustomTrainer(CustomDetectionTrainer):
-            # Store custom params as class attribute
-            _custom_params = custom_params
-            
-            def __init__(self, cfg=None, overrides=None, _callbacks=None):
-                # Inject custom params into overrides
-                if overrides is None:
-                    overrides = {}
-                # DO NOT inject into overrides, as it triggers Ultralytics validation
-                # CustomDetectionTrainer will read from self._custom_params instead
-                # overrides.update(self._custom_params)
-                
-                # Debug log
-                from . import job_storage as js
-                js.append_job_log(
-                    self._custom_params['job_id'],
-                    "INFO",
-                    f"JobCustomTrainer.__init__ called with job_id: {self._custom_params['job_id']}"
-                )
-                
-                super().__init__(cfg, overrides, _callbacks)
-        
+        # Register custom_params in the top-level JobCustomTrainer registry so
+        # the class can be imported by Ultralytics DDP subprocess without closures.
+        from .custom_trainer import JobCustomTrainer
+        JobCustomTrainer.set_params(custom_params)
+
+        # Inject custom_params into train_kwargs so Ultralytics includes them in
+        # the DDP temp file overrides dict.  The subprocess reads job_id from
+        # overrides via CustomDetectionTrainer.__init__._get() helper.
+        # CustomDetectionTrainer strips these keys before passing to Ultralytics parent.
+        for _cp_key, _cp_val in custom_params.items():
+            if _cp_key not in train_kwargs:
+                train_kwargs[_cp_key] = _cp_val
+
         # Continue using the same log_writer for training
         # CRITICAL: Prevent Ultralytics from entering CLI mode
         # Ultralytics checks sys.argv in multiple places and tries to parse CLI args
@@ -1319,6 +1334,91 @@ def _training_worker(
             if yolo_model:
                 return YOLO(f"{yolo_model}.pt") if use_yolo_pretrained else YOLO(f"{yolo_model}.yaml")
             return YOLO(yaml_path, task=task)
+
+        # Patch subprocess.run to capture DDP worker stderr before re-raising.
+        # Without this, DDP failures only show "exit code 1" with no details.
+        import subprocess as _subprocess
+        _orig_subprocess_run = _subprocess.run
+        def _patched_subprocess_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and "torch.distributed.run" in " ".join(str(c) for c in cmd):
+                # Log temp file contents so we can see what Ultralytics generates
+                try:
+                    _tmp_py = [c for c in cmd if str(c).endswith(".py")]
+                    if _tmp_py:
+                        _tmp_contents = Path(_tmp_py[0]).read_text()
+                        job_storage.append_job_log(job_id, "DEBUG",
+                            f"DDP temp file ({_tmp_py[0]}):\n{_tmp_contents}")
+                except Exception:
+                    pass
+                kwargs.setdefault("capture_output", False)
+                import io as _io
+                _stderr_buf = _io.StringIO()
+                try:
+                    result = _orig_subprocess_run(cmd, *args, **kwargs)
+                    return result
+                except _subprocess.CalledProcessError as _ddp_err:
+                    # Re-run with stderr captured to get the real error message
+                    try:
+                        _cap = _orig_subprocess_run(
+                            cmd, *[a for a in args],
+                            **{**{k: v for k, v in kwargs.items() if k not in ("check",)},
+                               "capture_output": True, "check": False}
+                        )
+                        _err_txt = (_cap.stderr or b"").decode(errors="replace").strip()
+                        _out_txt = (_cap.stdout or b"").decode(errors="replace").strip()
+                        if _err_txt:
+                            job_storage.append_job_log(job_id, "ERROR",
+                                f"DDP subprocess stderr:\n{_err_txt[-4000:]}")
+                        if _out_txt:
+                            job_storage.append_job_log(job_id, "ERROR",
+                                f"DDP subprocess stdout:\n{_out_txt[-2000:]}")
+                    except Exception as _cap_err:
+                        job_storage.append_job_log(job_id, "WARNING",
+                            f"Could not capture DDP stderr: {_cap_err}")
+                    raise _ddp_err
+            return _orig_subprocess_run(cmd, *args, **kwargs)
+        _subprocess.run = _patched_subprocess_run
+
+        # ── Log-tailer: re-broadcast DDP subprocess log entries to SSE ──────────
+        # DDP subprocess writes log entries to the job log file but cannot reach
+        # the in-process event bus (different memory space).  This thread tails
+        # the log file and re-broadcasts new entries so the UI stays updated.
+        _tailer_stop = threading.Event()
+
+        def _log_tailer():
+            import json as _json
+            from . import event_bus as _eb
+            from ..constants import job_log_channel as _jlc, train_channel as _tc
+            log_path = job_storage._log_path(job_id)
+            last_pos = 0
+            while not _tailer_stop.is_set():
+                try:
+                    if log_path.exists():
+                        with open(log_path, "r") as _lf:
+                            _lf.seek(last_pos)
+                            for _line in _lf:
+                                _line = _line.strip()
+                                if _line:
+                                    try:
+                                        _entry = _json.loads(_line)
+                                        # Re-broadcast log entry to log channel
+                                        _eb.publish_sync(_jlc(job_id), _entry)
+                                        # If entry carries progress data, also
+                                        # publish to train_channel so the UI
+                                        # updates epoch/batch/GPU stats.
+                                        _data = _entry.get("data")
+                                        if _data and isinstance(_data, dict):
+                                            _eb.publish_sync(_tc(job_id), _data)
+                                    except Exception:
+                                        pass
+                            last_pos = _lf.tell()
+                except Exception:
+                    pass
+                _tailer_stop.wait(1.0)
+
+        _tailer_thread = threading.Thread(
+            target=_log_tailer, daemon=True, name=f"log_tailer_{job_id}")
+        _tailer_thread.start()
 
         while True:
             try:
@@ -1449,22 +1549,37 @@ def _training_worker(
         except Exception as e:
             job_storage.append_job_log(job_id, "WARNING", f"Cleanup warning: {e}")
         
+        # Stop log tailer thread
+        try:
+            _tailer_stop.set()
+        except Exception:
+            pass
+
         with _lock:
             _active_jobs.pop(job_id, None)
         # Clear cached last progress event so future subscribers don't get stale data
         event_bus.clear_last_event(train_channel(job_id))
         
         job_storage.append_job_log(job_id, "INFO", "Worker thread cleanup completed")
+        try:
+            from .custom_trainer import JobCustomTrainer
+            JobCustomTrainer.cleanup_params(job_id)
+        except Exception:
+            pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool) -> "str | bool":
+def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool, num_gpus: int = 1) -> "str | bool":
     """Choose the best Ultralytics cache mode given available RAM and dataset size.
+
+    *num_gpus* is the number of DDP processes that will each independently
+    allocate their own RAM image cache.  Available RAM is divided by this
+    count before comparing with the estimated dataset size.
 
     Returns:
         "ram"  — load all images into shared memory (zero I/O per batch).
-                 Chosen when free RAM >= estimated_dataset_bytes * 1.5.
+                 Chosen when free RAM >= estimated_dataset_bytes * 1.5 * num_gpus.
         True   — disk .cache file (label scan saved, images read per batch).
         False  — no caching (last resort for remote FS when RAM is tight).
     """
@@ -1474,6 +1589,33 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
         free_ram = psutil.virtual_memory().available
     except Exception:
         free_ram = 0
+
+    # In containers (Docker/RunPod/Kubernetes), psutil reads the *host* RAM which
+    # is much larger than the cgroup memory limit assigned to this container.
+    # Cap free_ram by the cgroup limit so we don't OOM by choosing cache='ram'.
+    try:
+        _cgroup_limit = None
+        # cgroup v2
+        _cg2 = Path("/sys/fs/cgroup/memory.max")
+        if _cg2.exists():
+            _val = _cg2.read_text().strip()
+            if _val != "max":
+                _cgroup_limit = int(_val)
+        # cgroup v1
+        if _cgroup_limit is None:
+            _cg1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            if _cg1.exists():
+                _val = _cg1.read_text().strip()
+                _limit = int(_val)
+                # cgroup v1 uses 2^63-1 as "unlimited"
+                if _limit < (1 << 62):
+                    _cgroup_limit = _limit
+        if _cgroup_limit is not None:
+            # Leave 512 MB headroom for the process itself
+            _headroom = 512 * 1024 * 1024
+            free_ram = min(free_ram, max(0, _cgroup_limit - _headroom))
+    except Exception:
+        pass
 
     # Estimate dataset image size: count images and multiply by median size.
     dataset_bytes = 0
@@ -1504,17 +1646,25 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
                     1 for p in img_dir.iterdir()
                     if p.suffix.lower() in _IMG_EXTS
                 ) if img_dir.exists() else len(sizes)
-                dataset_bytes = int(median_size * total_imgs)
+                # JPEG/PNG files are compressed — actual RAM needed for cache='ram'
+                # is the decoded RGB size, not the on-disk size.
+                # Typical JPEG compression ratio is 8–15x; use 10x as a conservative
+                # multiplier so we don't OOM when Ultralytics loads all images decoded.
+                _DECOMPRESS_FACTOR = 10
+                dataset_bytes = int(median_size * total_imgs * _DECOMPRESS_FACTOR)
         except Exception:
             dataset_bytes = 0
 
-    required_ram = int(dataset_bytes * 1.5)
+    # Each DDP process allocates its own independent RAM cache, so multiply
+    # the required RAM by the number of parallel processes.
+    _ddp_factor = max(1, num_gpus)
+    required_ram = int(dataset_bytes * 1.5 * _ddp_factor)
     if free_ram > 0 and dataset_bytes > 0 and free_ram >= required_ram:
         gb = dataset_bytes / (1024 ** 3)
         free_gb = free_ram / (1024 ** 3)
         job_storage.append_job_log(job_id, "INFO",
-            f"Cache strategy: ram — dataset ~{gb:.1f} GB, free RAM {free_gb:.1f} GB "
-            f"(>= {required_ram/(1024**3):.1f} GB threshold)")
+            f"Cache strategy: ram — dataset ~{gb:.1f} GB x{_ddp_factor} DDP processes, "
+            f"free RAM {free_gb:.1f} GB (>= {required_ram/(1024**3):.1f} GB threshold)")
         return "ram"
 
     # Not enough RAM for full image cache — fall back to disk .cache (label scan only).

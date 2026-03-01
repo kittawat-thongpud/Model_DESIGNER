@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import threading
 import torch
 import numpy as np
 from copy import copy
@@ -230,35 +231,42 @@ class CustomDetectionTrainer(DetectionTrainer):
         # Ensure overrides is a dict
         if overrides is None:
             overrides = {}
-        
+
+        # In DDP subprocess Ultralytics passes trainer config as cfg dict (not overrides).
+        # We must read custom params from cfg first, then overrides, then _custom_params.
+        cfg_source = cfg if isinstance(cfg, dict) else {}
+        custom_source = getattr(self, '_custom_params', {})
+
         # 1. Create a copy of overrides to modify
         clean_overrides = overrides.copy()
-        
-        # Helper to get extraction source (overrides priority, then _custom_params)
-        custom_source = getattr(self, '_custom_params', {})
-        
-        # 2. Extract and remove custom params
+
+        # 2. Extract and remove custom params (cfg_source → overrides → _custom_params)
+        import os as _os
+
+        def _get(key, default=None):
+            if key in clean_overrides:
+                return clean_overrides.pop(key)
+            if key in cfg_source:
+                return cfg_source[key]
+            return custom_source.get(key, default)
+
         # Fallback chain: overrides → _custom_params → MD_JOB_ID env var
         # The env var is set by ultra_trainer before model.train() and is inherited
         # by DDP child subprocesses (Ultralytics spawns them via subprocess.Popen,
         # so all os.environ entries are available in the child).
-        import os as _os
-        self.job_id = (
-            clean_overrides.pop('job_id', None)
-            or custom_source.get('job_id')
-            or _os.environ.get('MD_JOB_ID')
-        )
+        self.job_id = _get('job_id') or _os.environ.get('MD_JOB_ID')
 
         # DDP rank: -1 = single GPU, 0 = main DDP rank, >0 = worker rank.
         # Only rank -1 and 0 should write progress to job_storage to avoid
         # duplicate log entries from every GPU worker.
         _local_rank = int(_os.environ.get('LOCAL_RANK', -1))
         self._is_logging_rank = _local_rank in (-1, 0)
-        self.record_gradients = clean_overrides.pop('record_gradients', custom_source.get('record_gradients', False))
-        self.record_weights = clean_overrides.pop('record_weights', custom_source.get('record_weights', False))
-        self.gradient_interval = clean_overrides.pop('gradient_interval', custom_source.get('gradient_interval', 1))
-        self.weight_interval = clean_overrides.pop('weight_interval', custom_source.get('weight_interval', 1))
-        self.sample_per_class = clean_overrides.pop('sample_per_class', custom_source.get('sample_per_class', 0))
+
+        self.record_gradients = _get('record_gradients', False)
+        self.record_weights = _get('record_weights', False)
+        self.gradient_interval = _get('gradient_interval', 1)
+        self.weight_interval = _get('weight_interval', 1)
+        self.sample_per_class = _get('sample_per_class', 0)
         
         # _partition_configs / _dataset_name no longer needed — TXT splits in data.yaml handle partition filtering
         clean_overrides.pop('_partition_configs', None)
@@ -273,8 +281,13 @@ class CustomDetectionTrainer(DetectionTrainer):
         from ultralytics.cfg import get_cfg, DEFAULT_CFG_DICT, check_dict_alignment
         
         # List of keys to remove (invalid for YOLO training)
-        INVALID_KEYS = {'session', 'sample_per_class', 'record_gradients', 'gradient_interval', 
-                        'record_weights', 'weight_interval', '_partition_configs', '_dataset_name'}
+        # Must include all custom params injected by JobCustomTrainer.set_params()
+        INVALID_KEYS = {
+            'session', 'job_id',
+            'sample_per_class', 'record_gradients', 'gradient_interval',
+            'record_weights', 'weight_interval',
+            '_partition_configs', '_dataset_name',
+        }
         
         # Build complete config by merging defaults with our overrides
         if cfg is None:
@@ -361,7 +374,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Override training loop to add custom logging."""
         self.log(f"Starting training for {self.epochs} epochs", "INFO")
         
-        # Call parent training loop
+        # BaseTrainer._do_train() takes no positional args in Ultralytics 8.4.x
         result = super()._do_train()
         
         self.log("Training loop completed", "INFO")
@@ -428,40 +441,6 @@ class CustomDetectionTrainer(DetectionTrainer):
             "INFO",
         )
         return result
-
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
-        """Override to enable persistent_workers and prefetch_factor.
-
-        ``persistent_workers=True`` keeps worker processes alive between epochs
-        so Python does not re-fork ~4 processes each epoch (saves ~2-5s/epoch).
-        ``prefetch_factor=2`` lets workers pre-load the next batch while GPU
-        is processing the current one — overlaps I/O with compute.
-        Both are no-ops when workers=0 (single-process mode).
-        """
-        loader = super().get_dataloader(dataset_path, batch_size=batch_size, rank=rank, mode=mode)
-        try:
-            nw = getattr(loader, 'num_workers', 0)
-            if nw > 0:
-                # Rebuild DataLoader with persistent_workers + prefetch_factor
-                from torch.utils.data import DataLoader
-                loader = DataLoader(
-                    loader.dataset,
-                    batch_size=loader.batch_size,
-                    shuffle=(mode == "train" and rank == -1),
-                    num_workers=nw,
-                    pin_memory=getattr(loader, 'pin_memory', False),
-                    collate_fn=getattr(loader, 'collate_fn', None),
-                    worker_init_fn=getattr(loader, 'worker_init_fn', None),
-                    persistent_workers=True,
-                    prefetch_factor=2,
-                )
-                self.log(
-                    f"DataLoader ({mode}): workers={nw}, persistent_workers=True, prefetch_factor=2",
-                    "DEBUG",
-                )
-        except Exception as _dl_err:
-            self.log(f"persistent_workers patch skipped: {_dl_err}", "DEBUG")
-        return loader
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
@@ -709,10 +688,12 @@ class CustomDetectionTrainer(DetectionTrainer):
         self.log("Final evaluation complete", "INFO")
         return result
     
-    def _setup_ddp(self, world_size):
-        """Override DDP setup to add logging."""
+    def _setup_ddp(self, world_size=None, *args, **kwargs):
+        """Override DDP setup to add logging — forward-compatible signature."""
         self.log(f"Setting up DDP with world_size={world_size}", "INFO")
-        return super()._setup_ddp(world_size)
+        if world_size is not None:
+            return super()._setup_ddp(world_size, *args, **kwargs)
+        return super()._setup_ddp(*args, **kwargs)
     
     def validate(self):
         """Run validation and collect extended metrics.
@@ -1208,3 +1189,78 @@ class CustomDetectionTrainer(DetectionTrainer):
         if hasattr(self, 'epoch') and hasattr(self, 'epochs'):
             return f"Epoch {self.epoch + 1}/{self.epochs}"
         return "Training..."
+
+
+# ── Top-level importable trainer (required for Ultralytics DDP) ───────────────
+# Ultralytics DDP spawns a subprocess via torch.distributed.run and imports the
+# trainer class by its fully-qualified module path.  Inner classes (closures)
+# inside functions are not importable and cause CalledProcessError exit 1.
+#
+# JobCustomTrainer must be a top-level class here.  custom_params are injected
+# via the class-level registry _params_registry (keyed by job_id) before
+# model.train() is called, and read back inside __init__.
+
+class JobCustomTrainer(CustomDetectionTrainer):
+    """Top-level trainer class used by model.train(trainer=JobCustomTrainer).
+
+    custom_params must be registered before calling model.train() via:
+        JobCustomTrainer.set_params(custom_params)
+
+    Uses threading.local() so parallel jobs (each in their own thread) never
+    read each other's params even when both call set_params() concurrently.
+    """
+
+    _registry_lock = threading.Lock()
+    _params_registry: "dict[str, dict]" = {}   # shared: job_id → params
+    _thread_local = threading.local()           # per-thread: active_job_id
+
+    @classmethod
+    def set_params(cls, custom_params: dict) -> None:
+        """Register custom_params for this thread's training run."""
+        job_id = custom_params.get("job_id")
+        with cls._registry_lock:
+            cls._params_registry[job_id] = custom_params
+        # Store active job_id per-thread so parallel jobs don't overwrite each other
+        cls._thread_local.active_job_id = job_id
+
+    @classmethod
+    def _get_params(cls) -> dict:
+        # Prefer thread-local job_id (set by the calling training thread)
+        job_id = getattr(cls._thread_local, "active_job_id", None)
+        with cls._registry_lock:
+            if job_id and job_id in cls._params_registry:
+                return cls._params_registry[job_id]
+            # Fallback for DDP subprocess (different thread/process, no thread-local):
+            # return the only registered params if exactly one job is running
+            if len(cls._params_registry) == 1:
+                return next(iter(cls._params_registry.values()))
+        return {}
+
+    @classmethod
+    def cleanup_params(cls, job_id: str) -> None:
+        """Remove params after training completes to avoid stale state."""
+        with cls._registry_lock:
+            cls._params_registry.pop(job_id, None)
+
+    def __init__(self, cfg=None, overrides=None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        # Read params from per-thread registry — safe for parallel jobs.
+        # In DDP subprocess (fresh spawn process) the registry is empty;
+        # params will be read from overrides instead (injected below).
+        params = self._get_params()
+        self._custom_params = params or {}
+
+        # Inject custom_params into overrides so DDP subprocess receives them
+        # via the Ultralytics-generated temp file (the only channel available).
+        # CustomDetectionTrainer.__init__ pops these keys from clean_overrides.
+        if self._custom_params:
+            for k, v in self._custom_params.items():
+                if k not in overrides:
+                    overrides[k] = v
+
+        from . import job_storage as js
+        _job_id = self._custom_params.get("job_id") or overrides.get("job_id", "unknown")
+        js.append_job_log(_job_id, "INFO",
+            f"JobCustomTrainer.__init__ called with job_id: {_job_id}")
+        super().__init__(cfg, overrides, _callbacks)

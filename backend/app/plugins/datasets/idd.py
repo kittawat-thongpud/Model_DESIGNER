@@ -131,6 +131,21 @@ def _build_index(
     cats = data.get("categories", [])
     cat_id_to_idx = {c["id"]: i for i, c in enumerate(cats)}
 
+    # Try 1 & 2 may miss images nested inside subdirs of img_dir (e.g. IDD's
+    # JPEGImages/frontFar/BLR-xxx/0001234.jpg).  Build a basename→abs-path map
+    # lazily on first miss so we scan img_dir at most once per _build_index call.
+    _basename_map: dict[str, Path] | None = None
+
+    def _get_basename_map() -> dict[str, Path]:
+        nonlocal _basename_map
+        if _basename_map is None:
+            _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+            _basename_map = {}
+            for p in img_dir.rglob("*"):
+                if p.is_file() and p.suffix.lower() in _IMG_EXTS:
+                    _basename_map.setdefault(p.name, p)
+        return _basename_map
+
     # Remap category_ids to contiguous indices in each annotation
     index = []
     for entry in img_lookup.values():
@@ -146,7 +161,14 @@ def _build_index(
             img_file = img_dir / base
             resolved_rel = base
         if not img_file.exists():
-            continue
+            # Try 3: search all subdirs of img_dir by basename (handles IDD's
+            # JPEGImages/frontFar/... and JPEGImages/highquality_16k/... layouts).
+            base = Path(file_raw).name
+            found = _get_basename_map().get(base)
+            if found is None:
+                continue
+            img_file = found
+            resolved_rel = str(img_file.relative_to(img_dir))
 
         # Resolve w/h at build time so __getitem__ never needs to open files.
         w, h = entry["w"], entry["h"]
@@ -441,6 +463,56 @@ class IDDPlugin(DatasetPlugin):
             self._index_cache[split] = index
         return index
 
+    @staticmethod
+    def _populate_images_from_split_txt(split: str) -> int:
+        """Read IDD's <split>.txt split file and create symlinks in images/<split>/.
+
+        IDD archives ship with ``train.txt`` / ``val.txt`` at the dataset root
+        containing lines like ``frontFar/BLR-2018-03-22.../001542_r`` (no ext).
+        Images live under ``JPEGImages/<rel_path>.jpg``.
+
+        This method creates ``images/<split>/<basename>.jpg`` symlinks so that:
+        - ``_build_index`` can find images by basename (Try 1 / Try 2).
+        - ``coco_converter`` writes ``labels/<split>/<basename>.txt`` which
+          Ultralytics resolves correctly by replacing ``images/`` → ``labels/``.
+
+        Returns the number of symlinks created.
+        """
+        split_txt = _IDD_ROOT / f"{split}.txt"
+        if not split_txt.exists():
+            return 0
+
+        jpeg_root = _IDD_ROOT / "JPEGImages"
+        if not jpeg_root.exists():
+            return 0
+
+        img_split_dir = _IDD_ROOT / "images" / split
+        img_split_dir.mkdir(parents=True, exist_ok=True)
+
+        _IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
+        created = 0
+        for line in split_txt.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Try with .jpg first, then other extensions
+            src: Path | None = None
+            for ext in _IMG_EXTS:
+                candidate = jpeg_root / (line + ext)
+                if candidate.exists():
+                    src = candidate
+                    break
+            if src is None:
+                continue
+            dst = img_split_dir / src.name
+            if not dst.exists():
+                try:
+                    dst.symlink_to(src)
+                    created += 1
+                except OSError:
+                    pass
+        return created
+
     def rebuild_index(self):
         """Force rebuild all split indices (called after upload/extraction)."""
         with self._lock:
@@ -449,6 +521,9 @@ class IDDPlugin(DatasetPlugin):
         if _INDEX_DIR.exists():
             import shutil
             shutil.rmtree(_INDEX_DIR)
+        # Populate images/train/ and images/val/ from split txt files if needed
+        for split in ("train", "val"):
+            self._populate_images_from_split_txt(split)
         for split in ("train", "val"):
             self._get_index(split)
 
@@ -465,6 +540,9 @@ class IDDPlugin(DatasetPlugin):
         if _INDEX_DIR.exists():
             import shutil
             shutil.rmtree(_INDEX_DIR)
+        # Populate images/train/ and images/val/ symlinks from split txt files
+        for split in ("train", "val"):
+            self._populate_images_from_split_txt(split)
         for split in ("train", "val"):
             index_path = _INDEX_DIR / f"{split}_index.json"
             ann_path = _find_ann_file(split)
