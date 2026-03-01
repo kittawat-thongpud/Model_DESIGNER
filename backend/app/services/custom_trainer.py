@@ -347,8 +347,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Override training loop to add custom logging."""
         self.log(f"Starting training for {self.epochs} epochs", "INFO")
         
-        # Call parent training loop
-        result = super()._do_train()
+        # Pass world_size so Ultralytics 8.4.19+ _setup_ddp(world_size) works in DDP mode.
+        result = super()._do_train(world_size)
         
         self.log("Training loop completed", "INFO")
         return result
