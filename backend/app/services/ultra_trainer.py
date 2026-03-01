@@ -1544,6 +1544,33 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
     except Exception:
         free_ram = 0
 
+    # In containers (Docker/RunPod/Kubernetes), psutil reads the *host* RAM which
+    # is much larger than the cgroup memory limit assigned to this container.
+    # Cap free_ram by the cgroup limit so we don't OOM by choosing cache='ram'.
+    try:
+        _cgroup_limit = None
+        # cgroup v2
+        _cg2 = Path("/sys/fs/cgroup/memory.max")
+        if _cg2.exists():
+            _val = _cg2.read_text().strip()
+            if _val != "max":
+                _cgroup_limit = int(_val)
+        # cgroup v1
+        if _cgroup_limit is None:
+            _cg1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            if _cg1.exists():
+                _val = _cg1.read_text().strip()
+                _limit = int(_val)
+                # cgroup v1 uses 2^63-1 as "unlimited"
+                if _limit < (1 << 62):
+                    _cgroup_limit = _limit
+        if _cgroup_limit is not None:
+            # Leave 512 MB headroom for the process itself
+            _headroom = 512 * 1024 * 1024
+            free_ram = min(free_ram, max(0, _cgroup_limit - _headroom))
+    except Exception:
+        pass
+
     # Estimate dataset image size: count images and multiply by median size.
     dataset_bytes = 0
     if ds_root and ds_root.exists():
@@ -1573,7 +1600,12 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
                     1 for p in img_dir.iterdir()
                     if p.suffix.lower() in _IMG_EXTS
                 ) if img_dir.exists() else len(sizes)
-                dataset_bytes = int(median_size * total_imgs)
+                # JPEG/PNG files are compressed — actual RAM needed for cache='ram'
+                # is the decoded RGB size, not the on-disk size.
+                # Typical JPEG compression ratio is 8–15x; use 10x as a conservative
+                # multiplier so we don't OOM when Ultralytics loads all images decoded.
+                _DECOMPRESS_FACTOR = 10
+                dataset_bytes = int(median_size * total_imgs * _DECOMPRESS_FACTOR)
         except Exception:
             dataset_bytes = 0
 
