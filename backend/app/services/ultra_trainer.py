@@ -893,6 +893,20 @@ def _training_worker(
         # ── Multi-GPU / DDP setup ─────────────────────────────────────────────
         # JobCustomTrainer is now a top-level importable class in custom_trainer.py
         # so Ultralytics DDP subprocess can import it correctly.
+        #
+        # DDP subprocess runs from /root/.config/Ultralytics/DDP/ — it has no
+        # access to the project directory, so 'from app.services.custom_trainer'
+        # fails with ModuleNotFoundError.  We must inject the backend directory
+        # into PYTHONPATH *before* torch.distributed.run spawns the subprocess.
+        _backend_dir = str(Path(__file__).resolve().parent.parent.parent)  # .../backend
+        _cur_pythonpath = os.environ.get("PYTHONPATH", "")
+        if _backend_dir not in _cur_pythonpath.split(os.pathsep):
+            os.environ["PYTHONPATH"] = _backend_dir + (os.pathsep + _cur_pythonpath if _cur_pythonpath else "")
+        if _backend_dir not in sys.path:
+            sys.path.insert(0, _backend_dir)
+        job_storage.append_job_log(job_id, "DEBUG",
+            f"DDP PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
+
         if _is_multi_gpu:
             # User explicitly set multi-GPU (e.g. device="0,1") — enable DDP.
             import multiprocessing as _mp
