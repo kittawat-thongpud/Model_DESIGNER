@@ -14,12 +14,14 @@ from pydantic import BaseModel
 
 from ..config import DATA_DIR
 from ..services import weight_storage, model_storage
+from ..services.config_service import get_benchmark_config
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/benchmark", tags=["Benchmark"])
 
 BENCHMARK_DIR = DATA_DIR / "benchmarks"
 BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+_BENCHMARK_DEFAULTS = get_benchmark_config().get("defaults", {})
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -27,11 +29,11 @@ BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
 class BenchmarkRequest(BaseModel):
     weight_id: str
     dataset: str                    # dataset name (resolves to DATA_DIR/datasets/{name}/data.yaml)
-    split: str = "val"              # train | val | test
-    conf: float = 0.001
-    iou: float = 0.6
-    imgsz: int = 640
-    batch: int = 16
+    split: str = str(_BENCHMARK_DEFAULTS.get("split", "val"))              # train | val | test
+    conf: float = float(_BENCHMARK_DEFAULTS.get("conf", 0.001))
+    iou: float = float(_BENCHMARK_DEFAULTS.get("iou", 0.6))
+    imgsz: int = int(_BENCHMARK_DEFAULTS.get("imgsz", 640))
+    batch: int = int(_BENCHMARK_DEFAULTS.get("batch", 16))
     device: str = ""                # "" = auto
 
 

@@ -8,15 +8,21 @@ import threading
 import time
 from typing import Callable
 
+from .. import logging_service as logger
 from . import ultra_trainer
+from .config_service import get_monitoring_config
+
+_MONITORING_CONFIG = get_monitoring_config()
+_DEFAULT_CHECK_INTERVAL = int(_MONITORING_CONFIG.get("worker_check_interval_s", 60))
+_DEFAULT_STOP_TIMEOUT = float(_MONITORING_CONFIG.get("worker_stop_timeout_s", 5.0))
 
 
 class WorkerMonitor:
     """Background monitor for worker health and zombie cleanup."""
-    
-    def __init__(self, check_interval: int = 60):
+
+    def __init__(self, check_interval: int = _DEFAULT_CHECK_INTERVAL):
         """Initialize worker monitor.
-        
+
         Args:
             check_interval: Seconds between health checks (default: 60)
         """
@@ -78,11 +84,11 @@ class WorkerMonitor:
                             try:
                                 callback(result)
                             except Exception as e:
-                                print(f"Worker monitor callback error: {e}")
-            
+                                logger.log("system", "WARNING", f"Worker monitor callback error: {e}", component="worker_monitor")
+
             except Exception as e:
-                print(f"Worker monitor error: {e}")
-            
+                logger.log("system", "WARNING", f"Worker monitor error: {e}", component="worker_monitor")
+
             # Wait for next check (with early exit on stop)
             self._stop_flag.wait(timeout=self.check_interval)
 
@@ -91,12 +97,12 @@ class WorkerMonitor:
 _monitor: WorkerMonitor | None = None
 
 
-def start_monitor(check_interval: int = 60) -> WorkerMonitor:
+def start_monitor(check_interval: int = _DEFAULT_CHECK_INTERVAL) -> WorkerMonitor:
     """Start the global worker monitor.
-    
+
     Args:
         check_interval: Seconds between health checks (default: 60)
-    
+
     Returns:
         WorkerMonitor instance
     """
@@ -107,9 +113,9 @@ def start_monitor(check_interval: int = 60) -> WorkerMonitor:
     return _monitor
 
 
-def stop_monitor(timeout: float = 5.0) -> None:
+def stop_monitor(timeout: float = _DEFAULT_STOP_TIMEOUT) -> None:
     """Stop the global worker monitor.
-    
+
     Args:
         timeout: Max seconds to wait for thread to stop
     """

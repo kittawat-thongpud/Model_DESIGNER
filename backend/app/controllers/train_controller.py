@@ -7,10 +7,13 @@ from pydantic import BaseModel
 
 from ..schemas.job_schema import TrainRequest
 from ..services import ultra_trainer, job_storage, model_storage, system_metrics
+from ..services.config_service import get_model_config, get_training_config
 from ..services.preflight import validate_train_request
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/train", tags=["Training"])
+_TRAINING_API_DEFAULTS = get_training_config().get("api_defaults", {})
+_MODEL_DEFAULTS = get_model_config().get("defaults", {})
 
 
 @router.post("/start", summary="Start a training job")
@@ -20,7 +23,7 @@ async def start_training(req: TrainRequest):
     if req.model_id.startswith("yolo:"):
         # Official YOLO model - no database lookup needed
         model_name = req.model_id.split(":")[1].upper()  # e.g., "yolo:yolov8" -> "YOLOV8"
-        task = "detect"
+        task = str(_MODEL_DEFAULTS.get("task", "detect"))
         yaml_path = ""  # Not used for official YOLO models
     else:
         # Custom model - load from database
@@ -32,7 +35,7 @@ async def start_training(req: TrainRequest):
         if not yaml_path:
             raise HTTPException(400, "No YAML file for this model")
 
-        task = record.get("task", "detect")
+        task = record.get("task", str(_MODEL_DEFAULTS.get("task", "detect")))
         model_name = record.get("name", "Untitled")
 
     config = req.config.to_train_kwargs()
@@ -117,7 +120,7 @@ async def cleanup_zombie_workers():
 
 
 class AppendRequest(BaseModel):
-    additional_epochs: int = 50
+    additional_epochs: int = int(_TRAINING_API_DEFAULTS.get("append_additional_epochs", 50))
 
 
 @router.post("/{job_id}/append", summary="Append more epochs to a completed/stopped job")
@@ -139,7 +142,7 @@ async def get_job(job_id: str):
 
 
 @router.get("/{job_id}/logs", summary="Get training logs")
-async def get_job_logs(job_id: str, limit: int = 200, offset: int = 0):
+async def get_job_logs(job_id: str, limit: int = int(_TRAINING_API_DEFAULTS.get("job_log_limit", 200)), offset: int = 0):
     return job_storage.get_job_logs(job_id, limit=limit, offset=offset)
 
 

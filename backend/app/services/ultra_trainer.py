@@ -33,8 +33,11 @@ from . import event_bus, job_storage
 from ..constants import job_channel, train_channel
 from . import dataset_yaml, dataset_registry
 from ..config import JOBS_DIR
+from .config_service import get_cache_config, get_model_config, get_training_config
 from . import task_queue
 from . import platform_caps
+
+_MODEL_DEFAULTS = get_model_config().get("defaults", {})
 
 
 # ── Active jobs tracking ─────────────────────────────────────────────────────
@@ -74,7 +77,7 @@ def _launch_thread(job_id: str, job: dict) -> None:
         pass
     t = threading.Thread(
         target=_training_worker,
-        args=(job_id, yaml_path, job.get("task", "detect"),
+        args=(job_id, yaml_path, job.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
               dict(job.get("config", {})),
               job.get("partition_configs") or [],
               job.get("model_scale")),
@@ -288,7 +291,7 @@ def _restart_job(job_id: str, config: dict) -> None:
 
     t = threading.Thread(
         target=_training_worker,
-        args=(job_id, str(_resolve_yaml_for_job(job)), job.get("task", "detect"),
+        args=(job_id, str(_resolve_yaml_for_job(job)), job.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
               config, job.get("partition_configs") or [], job.get("model_scale")),
         daemon=False,  # Changed to non-daemon for proper cleanup
     )
@@ -1092,10 +1095,14 @@ def _training_worker(
                 f"dataset_root={str(ds_root)!r}, fstype={fstype!r}",
             )
         if is_remote_fs:
+            training_runtime_config = get_training_config().get("runtime", {})
+            remote_fs_workers = int(training_runtime_config.get("remote_fs_workers", 2))
+            remote_fs_ultralytics_threads = int(training_runtime_config.get("remote_fs_ultralytics_threads", 1))
+
             # On remote filesystems we keep cache off unless RAM cache was chosen,
             # but we should NOT force workers=0 — use a small worker count instead.
             if "workers" not in config:
-                train_kwargs["workers"] = 2
+                train_kwargs["workers"] = remote_fs_workers
 
             # Never use cache='ram' on remote/RunPod FS — each DDP process allocates
             # its own independent copy, easily OOMing the container.
@@ -1119,19 +1126,19 @@ def _training_worker(
             try:
                 import ultralytics.data.dataset as _ultra_ds
                 old_ds_threads = getattr(_ultra_ds, "NUM_THREADS", None)
-                _ultra_ds.NUM_THREADS = 1
+                _ultra_ds.NUM_THREADS = remote_fs_ultralytics_threads
                 try:
                     import ultralytics.utils as _ultra_utils
                     old_utils_threads = getattr(_ultra_utils, "NUM_THREADS", None)
-                    _ultra_utils.NUM_THREADS = 1
+                    _ultra_utils.NUM_THREADS = remote_fs_ultralytics_threads
                 except Exception:
                     old_utils_threads = None
                 job_storage.append_job_log(
                     job_id,
                     "WARNING",
                     "Remote FS mitigation: reduced Ultralytics dataset scan threads | "
-                    f"ultralytics.data.dataset.NUM_THREADS: {old_ds_threads!r} -> 1, "
-                    f"ultralytics.utils.NUM_THREADS: {old_utils_threads!r} -> 1",
+                    f"ultralytics.data.dataset.NUM_THREADS: {old_ds_threads!r} -> {remote_fs_ultralytics_threads!r}, "
+                    f"ultralytics.utils.NUM_THREADS: {old_utils_threads!r} -> {remote_fs_ultralytics_threads!r}",
                 )
             except Exception as _thr_err:
                 job_storage.append_job_log(
@@ -1663,6 +1670,11 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
     import platform
     from pathlib import Path
 
+    cache_config = get_cache_config()
+    ram_cache_config = cache_config.get("ram_cache", {})
+    sample_image_count = int(cache_config.get("sample_image_count", 200))
+    decompress_factor = int(cache_config.get("decompress_factor", 30))
+
     try:
         import psutil
         free_ram = psutil.virtual_memory().available
@@ -1699,7 +1711,7 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
                             sizes.append(p.stat().st_size)
                         except OSError:
                             pass
-                        if len(sizes) >= 200:
+                        if len(sizes) >= sample_image_count:
                             break
 
             if sizes:
@@ -1710,11 +1722,7 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
                     if p.suffix.lower() in _IMG_EXTS
                 )
 
-                # IMPORTANT FIX
-                # JPEG decode ratio ~20-40x
-                _DECOMPRESS_FACTOR = 30
-
-                dataset_bytes = int(median_size * total_imgs * _DECOMPRESS_FACTOR)
+                dataset_bytes = int(median_size * total_imgs * decompress_factor)
 
         except Exception:
             dataset_bytes = 0
@@ -1725,11 +1733,11 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
     _os = platform.system()
 
     if _os == "Windows":
-        _SAFETY_FACTOR = 3.0
-        _MAX_RAM_CACHE = 16 * 1024**3   # hard cap 16GB
+        _SAFETY_FACTOR = float(ram_cache_config.get("windows_safety_factor", 3.0))
+        _MAX_RAM_CACHE = int(ram_cache_config.get("windows_max_gb", 16)) * 1024**3
     else:
-        _SAFETY_FACTOR = 1.5
-        _MAX_RAM_CACHE = 64 * 1024**3
+        _SAFETY_FACTOR = float(ram_cache_config.get("default_safety_factor", 1.5))
+        _MAX_RAM_CACHE = int(ram_cache_config.get("default_max_gb", 64)) * 1024**3
 
     _ddp_factor = max(1, num_gpus)
 

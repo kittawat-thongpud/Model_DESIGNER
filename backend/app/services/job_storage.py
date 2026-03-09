@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from ..config import JOBS_DIR
+from .config_service import get_training_config
 from .base_storage import BaseJsonStorage
+
+_TRAINING_API_DEFAULTS = get_training_config().get("api_defaults", {})
 
 # ── Storage instance (folder-per-job, JSON file = record.json) ─────────────
 
@@ -286,7 +288,7 @@ def append_job_log(job_id: str, level: str, message: str, data: dict | None = No
         pass
 
 
-def get_job_logs(job_id: str, limit: int = 200, offset: int = 0) -> list[dict]:
+def get_job_logs(job_id: str, limit: int = int(_TRAINING_API_DEFAULTS.get("job_log_limit", 200)), offset: int = 0) -> list[dict]:
     """Read job-specific training logs."""
     path = _log_path(job_id)
     if not path.exists():

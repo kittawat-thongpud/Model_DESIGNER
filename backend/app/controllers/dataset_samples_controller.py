@@ -13,9 +13,13 @@ from fastapi import APIRouter, HTTPException
 from torch.utils.data import Subset
 
 from ..services.dataset_registry import get_dataset_info as _get_info
+from ..services.config_service import get_dataset_samples_config
 from ..plugins.loader import get_dataset_plugin
 
 router = APIRouter(prefix="/api/datasets", tags=["Datasets"])
+_DATASET_SAMPLES_CONFIG = get_dataset_samples_config()
+_DATASET_SAMPLE_DEFAULTS = _DATASET_SAMPLES_CONFIG.get("defaults", {})
+_DATASET_SAMPLE_LIMITS = _DATASET_SAMPLES_CONFIG.get("limits", {})
 
 
 # ── Image encoding helpers ────────────────────────────────────────────────────
@@ -30,7 +34,7 @@ def _get_encode_pool():
         from concurrent.futures import ThreadPoolExecutor
         with _ENCODE_POOL_LOCK:
             if _ENCODE_POOL is None:
-                _ENCODE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="img_enc")
+                _ENCODE_POOL = ThreadPoolExecutor(max_workers=int(_DATASET_SAMPLE_LIMITS.get("encode_pool_workers", 4)), thread_name_prefix="img_enc")
     return _ENCODE_POOL
 
 
@@ -175,12 +179,12 @@ def _get_contiguous_cat_map(plugin) -> dict[int, int] | None:
 async def dataset_samples(
     name: str,
     page: int = 0,
-    page_size: int = 50,
+    page_size: int = int(_DATASET_SAMPLE_DEFAULTS.get("page_size", 50)),
     class_idx: int | None = None,
     class_indices: str | None = None,
-    split: str = "train",
-    thumb_size: int | None = 128,
-    include_annotations: bool = False,
+    split: str = str(_DATASET_SAMPLE_DEFAULTS.get("split", "train")),
+    thumb_size: int | None = int(_DATASET_SAMPLE_DEFAULTS.get("thumb_size", 128)),
+    include_annotations: bool = bool(_DATASET_SAMPLE_DEFAULTS.get("include_annotations", False)),
     partition_id: str | None = None,
 ):
     # Import from main controller for shared helpers
@@ -190,7 +194,7 @@ async def dataset_samples(
     if not ds:
         raise HTTPException(status_code=404, detail=f"Dataset '{name}' not found")
 
-    page_size = max(1, min(page_size, 200))
+    page_size = max(1, min(page_size, int(_DATASET_SAMPLE_LIMITS.get("max_page_size", 200))))
 
     filter_set: set[int] | None = None
     if class_indices is not None and class_indices.strip():
@@ -299,8 +303,8 @@ async def dataset_samples(
 async def dataset_sample_detail(
     name: str,
     index: int,
-    split: str = "train",
-    include_annotations: bool = True,
+    split: str = str(_DATASET_SAMPLE_DEFAULTS.get("split", "train")),
+    include_annotations: bool = bool(_DATASET_SAMPLE_DEFAULTS.get("detail_include_annotations", True)),
 ):
     from .dataset_controller import _load_dataset
 

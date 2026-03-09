@@ -8,10 +8,12 @@ import json
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response
 
+from ..services.config_service import get_package_config
 from ..services import package_service
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/packages", tags=["Packages"])
+_PACKAGE_DEFAULTS = get_package_config().get("defaults", {})
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
@@ -19,7 +21,7 @@ router = APIRouter(prefix="/api/packages", tags=["Packages"])
 @router.get("/weights/{weight_id}/export", summary="Export weight package (.mdpkg)")
 async def export_weight_package(
     weight_id: str,
-    include_jobs: bool = Query(False, description="Include training job records in package"),
+    include_jobs: bool = Query(bool(_PACKAGE_DEFAULTS.get("include_jobs", False)), description="Include training job records in package"),
 ):
     try:
         data, filename = package_service.build_weight_package(weight_id, include_jobs=include_jobs)
@@ -40,7 +42,7 @@ async def export_weight_package(
 @router.get("/jobs/{job_id}/export", summary="Export job package (.mdpkg)")
 async def export_job_package(
     job_id: str,
-    include_jobs: bool = Query(False, description="Include training job records in package"),
+    include_jobs: bool = Query(bool(_PACKAGE_DEFAULTS.get("include_jobs", False)), description="Include training job records in package"),
 ):
     try:
         data, filename = package_service.build_job_package(job_id, include_jobs=include_jobs)
@@ -78,8 +80,8 @@ async def peek_package(file: UploadFile = File(...)):
 @router.post("/import", summary="Import a .mdpkg package")
 async def import_package(
     file: UploadFile = File(...),
-    rename_map: str = Form(default="{}", description="JSON object {old_weight_id: new_display_name}"),
-    include_jobs: bool = Form(default=False, description="Also import job records"),
+    rename_map: str = Form(default=str(_PACKAGE_DEFAULTS.get("rename_map", "{}")), description="JSON object {old_weight_id: new_display_name}"),
+    include_jobs: bool = Form(default=bool(_PACKAGE_DEFAULTS.get("include_jobs", False)), description="Also import job records"),
 ):
     """
     Import a .mdpkg archive. Always assigns NEW IDs — never clashes with existing data.

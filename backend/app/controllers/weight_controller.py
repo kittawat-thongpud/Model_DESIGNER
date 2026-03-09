@@ -14,11 +14,14 @@ from ..schemas.weight_schema import (
     ExtractRequest, TransferRequest, AutoMapRequest,
     ApplyMapRequest, CreateEmptyRequest,
 )
+from ..services.config_service import get_export_config, get_model_config
 from ..services import weight_storage, weight_transfer, weight_import, model_storage
 from ..plugins.loader import all_weight_source_plugins
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/weights", tags=["Weights"])
+_EXPORT_DEFAULTS = get_export_config().get("defaults", {})
+_MODEL_DEFAULTS = get_model_config().get("defaults", {})
 
 
 @router.post("/create-empty", summary="Create an empty weight from a model")
@@ -110,7 +113,7 @@ async def create_empty_weight(body: CreateEmptyRequest):
 
         effective_scale = body.model_scale or record.get("scale")
         patched_yaml = prepare_model_yaml(yaml_path, scale=effective_scale)
-        model = YOLO(str(patched_yaml), task=record.get("task", "detect"))
+        model = YOLO(str(patched_yaml), task=record.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))))
         sd = model.model.state_dict()
         Path(patched_yaml).unlink(missing_ok=True)
     except Exception as e:
@@ -841,11 +844,11 @@ async def layer_detail(weight_id: str, key: str, bins: int = 50):
 # ── Export ─────────────────────────────────────────────────────────────────
 
 class ExportWeightRequest(BaseModel):
-    format: str = "onnx"            # onnx | torchscript | engine | tflite | coreml
-    imgsz: int = 640
-    device: str = ""                # "" = auto
-    half: bool = False
-    simplify: bool = True           # ONNX simplify
+    format: str = str(_EXPORT_DEFAULTS.get("format", "onnx"))            # onnx | torchscript | engine | tflite | coreml
+    imgsz: int = int(_EXPORT_DEFAULTS.get("imgsz", 640))
+    device: str = str(_EXPORT_DEFAULTS.get("device", ""))                # "" = auto
+    half: bool = bool(_EXPORT_DEFAULTS.get("half", False))
+    simplify: bool = bool(_EXPORT_DEFAULTS.get("simplify", True))           # ONNX simplify
 
 
 @router.post("/{weight_id}/export", summary="Export weight to ONNX / TorchScript / etc.")
@@ -894,7 +897,7 @@ async def export_weight(weight_id: str, body: ExportWeightRequest):
 
 
 @router.get("/{weight_id}/export/download", summary="Download exported file")
-async def download_exported(weight_id: str, fmt: str = "onnx"):
+async def download_exported(weight_id: str, fmt: str = str(_EXPORT_DEFAULTS.get("download_format", "onnx"))):
     """Stream an already-exported file for the given format."""
     from fastapi.responses import FileResponse
     pt_path = weight_storage.weight_pt_path(weight_id)

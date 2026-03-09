@@ -15,6 +15,9 @@ from pathlib import Path
 import yaml
 
 from ..config import MODELS_DIR
+from .config_service import get_model_config
+
+_MODEL_DEFAULTS = get_model_config().get("defaults", {})
 
 
 def _dir(model_id: str) -> Path:
@@ -24,7 +27,7 @@ def _dir(model_id: str) -> Path:
 def save_model(
     name: str,
     yaml_def: dict,
-    task: str = "detect",
+    task: str = str(_MODEL_DEFAULTS.get("task", "detect")),
     description: str = "",
     model_id: str | None = None,
 ) -> dict:
@@ -161,7 +164,7 @@ def list_models() -> list[dict]:
                 layer_count = len(yd.get("backbone", [])) + len(yd.get("head", []))
                 
                 # Determine input shape based on task
-                task = rec.get("task", "detect")
+                task = rec.get("task", _MODEL_DEFAULTS.get("task", "detect"))
                 if task in ["detect", "detection", "segment", "pose", "obb"]:
                     input_shape = [3, 640, 640]  # Standard YOLO input
                 elif task in ["classify", "classification"]:
@@ -174,7 +177,7 @@ def list_models() -> list[dict]:
         results.append({
             "model_id": rec["model_id"],
             "name": rec["name"],
-            "task": rec.get("task", "detect"),
+            "task": rec.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
             "layer_count": layer_count,
             "input_shape": input_shape,
             "params": rec.get("params"),

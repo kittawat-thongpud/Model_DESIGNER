@@ -9,21 +9,23 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from .. import logging_service as logger
+from ..services.config_service import get_logging_config
 
 router = APIRouter(prefix="/api/logs", tags=["Logs"])
+_LOGGING_CONFIG = get_logging_config()
 
 
 @router.get("/", summary="Fetch application logs")
 async def get_logs(
     category: str | None = None,
     level: str | None = None,
-    limit: int = 100,
+    limit: int = int(_LOGGING_CONFIG.get("query_default_limit", 100)),
     offset: int = 0,
     job_id: str | None = None,
     model_id: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    days: int = 7,
+    days: int = int(_LOGGING_CONFIG.get("query_default_days", 7)),
 ):
     """
     Retrieve structured log entries with optional filters.

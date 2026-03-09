@@ -42,6 +42,10 @@ Legacy_/
 data/
 *.cache
 
+!backend/
+!backend/data/
+!backend/data/config.json
+
 # ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
@@ -61,7 +65,8 @@ Desktop.ini
 logs/
 
 # ── Backend runtime data (jobs, weights, models stored locally) ───────────────
-backend/data/
+backend/data/*
+!backend/data/config.json
 
 # ── Secrets / env ─────────────────────────────────────────────────────────────
 .env

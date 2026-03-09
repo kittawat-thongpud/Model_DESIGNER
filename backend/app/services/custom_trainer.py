@@ -24,6 +24,7 @@ from ultralytics.cfg import get_cfg
 from ultralytics.utils.torch_utils import ModelEMA
 
 from . import job_storage
+from .config_service import get_monitoring_config
 from ..config import JOBS_DIR
 
 
@@ -391,8 +392,9 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         done = threading.Event()
         start_t = _time.time()
-        timeout_s = 600  # 10 min — large datasets (IDD ~47k images) need time to scan+cache
-        heartbeat_interval = 30  # log progress every 30s so user knows it is not hung
+        monitoring_config = get_monitoring_config()
+        timeout_s = int(monitoring_config.get("training_setup_watchdog_timeout_s", 600))
+        heartbeat_interval = int(monitoring_config.get("training_setup_heartbeat_s", 30))
 
         def _watchdog():
             """Emit heartbeat logs every 30s; dump stacks on timeout."""

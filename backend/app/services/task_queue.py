@@ -36,8 +36,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import DATA_DIR
+from .config_service import get_queue_config
 
-_DB_PATH = DATA_DIR / "task_queue.db"
+_QUEUE_CONFIG = get_queue_config()
+_DB_PATH = Path(str(_QUEUE_CONFIG.get("sqlite_path", "task_queue.db")))
+if not _DB_PATH.is_absolute():
+    _DB_PATH = DATA_DIR / _DB_PATH
+_SQLITE_TIMEOUT_S = float(_QUEUE_CONFIG.get("sqlite_timeout_s", 10.0))
+_QUEUE_CLEANUP_MAX_AGE_S = float(_QUEUE_CONFIG.get("cleanup_max_age_s", 86400 * 7))
 
 # ── Task classification ───────────────────────────────────────────────────────
 
@@ -63,16 +69,17 @@ class TaskStatus(str, Enum):
 
 # Option A: max concurrent slots per task class
 # training → 1 GPU job at a time; all other heavy tasks → 2 concurrent (non-GPU)
+_QUEUE_LIMITS_CONFIG = _QUEUE_CONFIG.get("concurrency_limits", {})
 _CONCURRENCY_LIMITS: dict[str, int] = {
-    TaskType.TRAINING: 1,
-    TaskType.BENCHMARK: 1,
-    TaskType.DATASET_CONVERSION: 2,
-    TaskType.DATASET_EXTRACTION: 2,
-    TaskType.EXPORT: 2,
-    TaskType.PACKAGE_IMPORT: 1,
-    TaskType.PACKAGE_EXPORT: 1,
-    TaskType.PLOT_GENERATION: 2,
-    TaskType.WEIGHT_TRANSFER: 2,
+    TaskType.TRAINING: int(_QUEUE_LIMITS_CONFIG.get("training", 1)),
+    TaskType.BENCHMARK: int(_QUEUE_LIMITS_CONFIG.get("benchmark", 1)),
+    TaskType.DATASET_CONVERSION: int(_QUEUE_LIMITS_CONFIG.get("dataset_conversion", 2)),
+    TaskType.DATASET_EXTRACTION: int(_QUEUE_LIMITS_CONFIG.get("dataset_extraction", 2)),
+    TaskType.EXPORT: int(_QUEUE_LIMITS_CONFIG.get("export", 2)),
+    TaskType.PACKAGE_IMPORT: int(_QUEUE_LIMITS_CONFIG.get("package_import", 1)),
+    TaskType.PACKAGE_EXPORT: int(_QUEUE_LIMITS_CONFIG.get("package_export", 1)),
+    TaskType.PLOT_GENERATION: int(_QUEUE_LIMITS_CONFIG.get("plot_generation", 2)),
+    TaskType.WEIGHT_TRANSFER: int(_QUEUE_LIMITS_CONFIG.get("weight_transfer", 2)),
 }
 
 # Lightweight task types that bypass the queue entirely (no admission check)
@@ -92,7 +99,7 @@ _db_lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(_DB_PATH), timeout=10, check_same_thread=False)
+    conn = sqlite3.connect(str(_DB_PATH), timeout=_SQLITE_TIMEOUT_S, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -315,8 +322,10 @@ def queue_status(task_type: str | None = None) -> dict:
         }
 
 
-def cleanup_old_tasks(max_age_seconds: float = 86400 * 7) -> int:
+def cleanup_old_tasks(max_age_seconds: float | None = None) -> int:
     """Delete completed/failed/cancelled tasks older than max_age_seconds."""
+    if max_age_seconds is None:
+        max_age_seconds = _QUEUE_CLEANUP_MAX_AGE_S
     cutoff = time.time() - max_age_seconds
     with _db() as conn:
         result = conn.execute(

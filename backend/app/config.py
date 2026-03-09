@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .services.config_service import get_effective_config
+
 # ─── Root directories ────────────────────────────────────────────────────────
 
 # Project root: Model_DESIGNER/
@@ -40,17 +42,19 @@ for _d in (MODELS_DIR, MODULES_DIR, JOBS_DIR, WEIGHTS_DIR,
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
-LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
+_EFFECTIVE_CONFIG = get_effective_config()
+LOG_LEVEL = str(_EFFECTIVE_CONFIG.get("logging", {}).get("level", "DEBUG")).upper()
+LOG_RETENTION_DAYS = int(_EFFECTIVE_CONFIG.get("logging", {}).get("retention_days", 30))
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 
-_DEFAULT_CORS = "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174"
 CORS_ORIGINS: list[str] = [
-    o.strip() for o in os.environ.get("CORS_ORIGINS", _DEFAULT_CORS).split(",") if o.strip()
+    str(origin).strip()
+    for origin in _EFFECTIVE_CONFIG.get("app", {}).get("cors_origins", [])
+    if str(origin).strip()
 ]
 
 # ─── App metadata ────────────────────────────────────────────────────────────
 
-APP_NAME = "Model DESIGNER API"
-APP_VERSION = "2.0.0"
+APP_NAME = str(_EFFECTIVE_CONFIG.get("app", {}).get("name", "Model DESIGNER API"))
+APP_VERSION = str(_EFFECTIVE_CONFIG.get("app", {}).get("version", "2.0.0"))

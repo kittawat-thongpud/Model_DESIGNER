@@ -30,6 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import logging_service as logger
 from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
+from .services.config_service import get_monitoring_config
 
 
 import sys
@@ -161,24 +162,28 @@ def create_app() -> FastAPI:
     # ── Startup: start worker monitor ───────────────────────────────────────
     try:
         from .services.worker_monitor import start_monitor
-        monitor = start_monitor(check_interval=60)  # Check every 60 seconds
-        
+        monitoring_config = get_monitoring_config()
+        check_interval = int(monitoring_config.get("worker_check_interval_s", 60))
+        monitor = start_monitor(check_interval=check_interval)
+
         # Add logging callback
         def on_zombie_cleanup(result):
             logger.log("system", "WARNING", 
                       f"Zombie workers detected and cleaned: {result['cleaned']}")
-        
+
         monitor.add_callback(on_zombie_cleanup)
-        logger.log("system", "INFO", "Worker monitor started (check_interval=60s)")
+        logger.log("system", "INFO", f"Worker monitor started (check_interval={check_interval}s)")
     except Exception as e:
         logger.log("system", "WARNING", f"Worker monitor startup failed: {e}")
-    
+
     # ── Shutdown: stop worker monitor ────────────────────────────────────────
     @application.on_event("shutdown")
     async def shutdown_event():
         try:
             from .services.worker_monitor import stop_monitor
-            stop_monitor(timeout=5.0)
+            monitoring_config = get_monitoring_config()
+            stop_timeout = float(monitoring_config.get("worker_stop_timeout_s", 5.0))
+            stop_monitor(timeout=stop_timeout)
             logger.log("system", "INFO", "Worker monitor stopped")
         except Exception as e:
             logger.log("system", "WARNING", f"Worker monitor shutdown failed: {e}")

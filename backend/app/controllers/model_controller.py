@@ -6,17 +6,21 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 from ..schemas.model import SaveModelRequest, ExportRequest
+from ..services.config_service import get_model_config
 from ..services import model_storage
 from ..services.yaml_to_graph import yaml_to_graph
 
 router = APIRouter(prefix="/api/models", tags=["Models"])
+_MODEL_CONFIG = get_model_config()
+_MODEL_DEFAULTS = _MODEL_CONFIG.get("defaults", {})
+_MODEL_VALIDATION = _MODEL_CONFIG.get("validation", {})
 
 
 class ImportYAMLRequest(BaseModel):
     """Request to import YAML content."""
     yaml_content: str
-    name: str = "Imported Model"
-    task: str = "detect"
+    name: str = str(_MODEL_DEFAULTS.get("imported_name", "Imported Model"))
+    task: str = str(_MODEL_DEFAULTS.get("task", "detect"))
 
 
 @router.get("/", summary="List all models")
@@ -99,7 +103,7 @@ async def import_yaml(req: ImportYAMLRequest):
 
 
 @router.post("/import/yaml/file", summary="Import YAML file")
-async def import_yaml_file(file: UploadFile = File(...), name: str = "Imported Model", task: str = "detect"):
+async def import_yaml_file(file: UploadFile = File(...), name: str = str(_MODEL_DEFAULTS.get("imported_name", "Imported Model")), task: str = str(_MODEL_DEFAULTS.get("task", "detect"))):
     """Import YAML file and convert to graph format."""
     try:
         content = await file.read()
@@ -149,7 +153,7 @@ async def validate_model(model_id: str, scale: str | None = None):
     if not yaml_path:
         raise HTTPException(404, f"Model not found: {model_id}")
     record = model_storage.load_model(model_id)
-    task = record.get("task", "detect") if record else "detect"
+    task = record.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))) if record else str(_MODEL_DEFAULTS.get("task", "detect"))
     # Pick a scale to avoid "no model scale passed" warning.
     # We write a temp YAML with only the chosen scale so YOLO doesn't warn.
     yaml_def = record.get("yaml_def", {}) if record else {}
@@ -272,7 +276,7 @@ async def validate_model(model_id: str, scale: str | None = None):
             # Capture model.info() output to extract FLOPs
             f = io.StringIO()
             with redirect_stdout(f):
-                model.info(verbose=False, imgsz=640)
+                model.info(verbose=False, imgsz=int(_MODEL_VALIDATION.get("info_imgsz", 640)))
             
             # Parse output for GFLOPs
             output = f.getvalue()
@@ -293,7 +297,8 @@ async def validate_model(model_id: str, scale: str | None = None):
                 print(f"[DEBUG] Trying thop library for detailed FLOPs calculation...")
                 try:
                     from thop import profile, clever_format
-                    dummy_input = torch.randn(1, 3, 640, 640)
+                    _info_imgsz = int(_MODEL_VALIDATION.get("info_imgsz", 640))
+                    dummy_input = torch.randn(1, 3, _info_imgsz, _info_imgsz)
                     flops_count, params_count = profile(model.model, inputs=(dummy_input,), verbose=False)
                     # Convert to GFLOPs
                     flops = flops_count / 1e9
@@ -394,7 +399,7 @@ async def export_model(req: ExportRequest):
     # Ultralytics export formats
     try:
         from ultralytics import YOLO
-        model = YOLO(str(yaml_path), task=record.get("task", "detect"))
+        model = YOLO(str(yaml_path), task=record.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))))
 
         if req.weight_id:
             from ..services.weight_storage import weight_pt_path

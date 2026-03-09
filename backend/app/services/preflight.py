@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .config_service import get_training_config
+
 
 @dataclass
 class PreflightResult:
@@ -57,6 +59,11 @@ def validate_train_request(
     from ..services import weight_storage
 
     result = PreflightResult()
+    training_config = get_training_config()
+    preflight_config = training_config.get("preflight", {})
+    imgsz_warn_threshold = int(preflight_config.get("imgsz_warn_threshold", 4096))
+    disk_fail_gb = float(preflight_config.get("disk_fail_gb", 2.0))
+    disk_warn_gb = float(preflight_config.get("disk_warn_gb", 5.0))
 
     # ── 1. Model YAML ──────────────────────────────────────────────────────────
     if yaml_path and not model_id.startswith("yolo:"):
@@ -136,7 +143,7 @@ def validate_train_request(
     imgsz = config.get("imgsz", 640)
     if not isinstance(imgsz, int) or imgsz < 32:
         result.fail(f"imgsz must be >= 32, got: {imgsz!r}")
-    elif imgsz > 4096:
+    elif imgsz > imgsz_warn_threshold:
         result.warn(f"imgsz={imgsz} is very large and may cause OOM errors.")
 
     workers = config.get("workers")
@@ -155,12 +162,12 @@ def validate_train_request(
         import shutil
         free_gb = shutil.disk_usage(DATA_DIR).free / 1e9
         result.info["disk_free_gb"] = round(free_gb, 1)
-        if free_gb < 2.0:
+        if free_gb < disk_fail_gb:
             result.fail(
                 f"Insufficient disk space: {free_gb:.1f} GB free under DATA_DIR. "
-                "At least 2 GB is required to start training."
+                f"At least {disk_fail_gb:.1f} GB is required to start training."
             )
-        elif free_gb < 5.0:
+        elif free_gb < disk_warn_gb:
             result.warn(
                 f"Low disk space: {free_gb:.1f} GB free under DATA_DIR. "
                 "Training may fail if checkpoints or plots exhaust disk."

@@ -17,10 +17,12 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
 from ..services import event_bus
+from ..services.config_service import get_streaming_config
 from ..constants import SSEEvent, train_channel, job_log_channel, SYSTEM_LOG_CHANNEL
 from ..config import JOBS_DIR
 
 router = APIRouter(tags=["Streaming"])
+_STREAMING_DEFAULTS = get_streaming_config().get("defaults", {})
 
 
 def _sanitize(obj: Any) -> Any:
@@ -34,7 +36,7 @@ def _sanitize(obj: Any) -> Any:
     return obj
 
 
-async def _sse_generator(channel: str, timeout: float = 30.0):
+async def _sse_generator(channel: str, timeout: float = float(_STREAMING_DEFAULTS.get("sse_timeout_s", 30.0))):
     """
     Generic SSE generator. Subscribes to a channel, yields events as SSE format.
     Sends a heartbeat comment every `timeout` seconds to keep the connection alive.
@@ -59,7 +61,7 @@ async def _sse_generator(channel: str, timeout: float = 30.0):
         event_bus.unsubscribe(channel, queue)
 
 
-async def _tail_log_generator(job_id: str, poll_interval: float = 0.5):
+async def _tail_log_generator(job_id: str, poll_interval: float = float(_STREAMING_DEFAULTS.get("tail_poll_interval_s", 0.5))):
     """
     Tail log.jsonl for a job and stream PROGRESS entries as SSE events.
     Works across multiple workers since it reads from disk, not in-memory event_bus.
@@ -69,10 +71,12 @@ async def _tail_log_generator(job_id: str, poll_interval: float = 0.5):
     record_path = Path(JOBS_DIR) / job_id / "record.json"
 
     # Wait up to 5s for log file to appear
-    for _ in range(10):
+    wait_retries = int(_STREAMING_DEFAULTS.get("tail_wait_log_retries", 10))
+    wait_retry_delay_s = float(_STREAMING_DEFAULTS.get("tail_wait_log_retry_delay_s", 0.5))
+    for _ in range(wait_retries):
         if log_path.exists():
             break
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(wait_retry_delay_s)
 
     # Seek to end so we only stream new entries
     offset = log_path.stat().st_size if log_path.exists() else 0
@@ -169,7 +173,7 @@ async def stream_system_logs():
     Each event contains a full log entry dict.
     """
     return StreamingResponse(
-        _sse_generator(SYSTEM_LOG_CHANNEL, timeout=60.0),
+        _sse_generator(SYSTEM_LOG_CHANNEL, timeout=float(_STREAMING_DEFAULTS.get("system_log_timeout_s", 60.0))),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -185,7 +189,7 @@ async def stream_job_logs(job_id: str):
     Subscribe to live log entries for a specific training job.
     """
     return StreamingResponse(
-        _sse_generator(job_log_channel(job_id), timeout=60.0),
+        _sse_generator(job_log_channel(job_id), timeout=float(_STREAMING_DEFAULTS.get("job_log_timeout_s", 60.0))),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -5,9 +5,11 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from ..services import job_storage, system_metrics
+from ..services.config_service import get_training_config
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
+_TRAINING_API_DEFAULTS = get_training_config().get("api_defaults", {})
 
 
 @router.get("/", summary="List all training jobs")
@@ -41,7 +43,7 @@ async def get_job_history(job_id: str):
 
 
 @router.get("/{job_id}/logs", summary="Get job training logs")
-async def get_job_logs(job_id: str, limit: int = 200, offset: int = 0):
+async def get_job_logs(job_id: str, limit: int = int(_TRAINING_API_DEFAULTS.get("job_log_limit", 200)), offset: int = 0):
     """Return per-epoch training log entries for a specific job."""
     return job_storage.get_job_logs(job_id, limit=limit, offset=offset)
 

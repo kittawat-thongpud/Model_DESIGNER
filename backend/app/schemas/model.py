@@ -11,6 +11,11 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Any
 
+from ..services.config_service import get_model_config
+
+_MODEL_CONFIG = get_model_config()
+_MODEL_DEFAULTS = _MODEL_CONFIG.get("defaults", {})
+
 
 class LayerDef(BaseModel):
     """Single layer in backbone or head: [from, repeats, module, args]."""
@@ -41,9 +46,9 @@ class ModelYAML(BaseModel):
 class ModelRecord(BaseModel):
     """Persisted model record with metadata + YAML definition."""
     model_id: str
-    name: str = "Untitled"
+    name: str = str(_MODEL_DEFAULTS.get("name", "Untitled"))
     description: str = ""
-    task: str = "detect"
+    task: str = str(_MODEL_DEFAULTS.get("task", "detect"))
     yaml_def: ModelYAML = Field(default_factory=ModelYAML)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -65,16 +70,16 @@ class ModelSummary(BaseModel):
 
 class SaveModelRequest(BaseModel):
     """Request to save a model."""
-    name: str = "Untitled"
+    name: str = str(_MODEL_DEFAULTS.get("name", "Untitled"))
     description: str = ""
-    task: str = "detect"
+    task: str = str(_MODEL_DEFAULTS.get("task", "detect"))
     yaml_def: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExportRequest(BaseModel):
     """Request to export a model."""
     model_id: str
-    format: str = "yaml"
+    format: str = str(_MODEL_DEFAULTS.get("export_format", "yaml"))
     weight_id: str | None = None
-    imgsz: int = 640
+    imgsz: int = int(_MODEL_DEFAULTS.get("export_imgsz", 640))
     scale: str | None = None

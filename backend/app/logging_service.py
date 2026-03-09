@@ -20,6 +20,11 @@ from typing import Literal
 
 from .config import LOGS_DIR as LOG_DIR
 from .config import LOG_LEVEL, LOG_RETENTION_DAYS
+from .services.config_service import get_logging_config
+
+_LOGGING_CONFIG = get_logging_config()
+_DEFAULT_QUERY_LIMIT = int(_LOGGING_CONFIG.get("query_default_limit", 100))
+_DEFAULT_QUERY_DAYS = int(_LOGGING_CONFIG.get("query_default_days", 7))
 
 # Legacy alias — kept for clear_logs cleanup of stale files
 LOG_FILE = LOG_DIR / "app.jsonl"
@@ -136,14 +141,14 @@ def log(
 def get_logs(
     category: str | None = None,
     level: str | None = None,
-    limit: int = 100,
+    limit: int = _DEFAULT_QUERY_LIMIT,
     offset: int = 0,
     *,
     job_id: str | None = None,
     model_id: str | None = None,
     since: str | None = None,
     until: str | None = None,
-    days: int = 7,
+    days: int = _DEFAULT_QUERY_DAYS,
 ) -> list[dict]:
     """
     Read structured log entries with filters.
@@ -269,6 +274,8 @@ def get_log_stats() -> dict:
     stats: dict = {
         "min_level": _min_level,
         "retention_days": LOG_RETENTION_DAYS,
+        "query_default_limit": _DEFAULT_QUERY_LIMIT,
+        "query_default_days": _DEFAULT_QUERY_DAYS,
         "categories": {},
         "total_files": 0,
         "total_size_bytes": 0,

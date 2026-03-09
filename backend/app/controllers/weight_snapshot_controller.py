@@ -5,9 +5,11 @@ Tagged as "Weight Snapshots" in ReDoc.
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
+from ..services.config_service import get_weight_snapshots_config
 from ..services import weight_snapshots
 
 router = APIRouter(prefix="/api/jobs", tags=["Weight Snapshots"])
+_WEIGHT_SNAPSHOT_DEFAULTS = get_weight_snapshots_config().get("defaults", {})
 
 
 @router.get("/{job_id}/snapshots", summary="List weight snapshots")
@@ -35,7 +37,7 @@ async def get_recorded_epochs(job_id: str):
 
 
 @router.get("/{job_id}/snapshots/{epoch}/thumbnails", summary="Get epoch thumbnails")
-async def get_epoch_thumbnails(job_id: str, epoch: int, max_size: int = 48):
+async def get_epoch_thumbnails(job_id: str, epoch: int, max_size: int = int(_WEIGHT_SNAPSHOT_DEFAULTS.get("thumbnail_max_size", 48))):
     """Return downsampled weight thumbnails for all layers at a given epoch."""
     return weight_snapshots.get_epoch_thumbnails(job_id, epoch, max_size)
 

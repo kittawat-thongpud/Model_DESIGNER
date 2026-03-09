@@ -16,6 +16,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .config_service import get_platform_config
+
+_PLATFORM_CONFIG = get_platform_config()
+_REMOTE_FSTYPES = frozenset({
+    str(item).lower()
+    for item in _PLATFORM_CONFIG.get("remote_fs_types", [])
+    if str(item).strip()
+})
+_REMOTE_PREFIXES = tuple(
+    str(item)
+    for item in _PLATFORM_CONFIG.get("remote_fs_prefixes", [])
+    if str(item).strip()
+)
+
 # ── Reason codes for fallback decisions ──────────────────────────────────────
 # Use these codes in log entries so issues are grep-able in production.
 
@@ -137,11 +151,6 @@ def is_remote_fs(path: str | Path) -> bool:
     Covers: NFS, CIFS/SMB, FUSE, sshfs, overlay, RunPod network volumes.
     Auto-detects known remote path prefixes (/workspace, /runpod-volume) as fallback.
     """
-    _REMOTE_FSTYPES = frozenset({
-        "nfs", "nfs4", "cifs", "smbfs", "sshfs", "fuse", "fuseblk",
-        "overlay", "overlayfs", "tmpfs", "ramfs",
-    })
-
     fstype = get_fs_type(path)
     if fstype and fstype.lower() in _REMOTE_FSTYPES:
         return True
@@ -149,7 +158,7 @@ def is_remote_fs(path: str | Path) -> bool:
     # Fallback: known remote-like path prefixes (RunPod, typical NFS mounts)
     try:
         p_str = str(Path(path).resolve())
-        for prefix in ("/workspace", "/runpod-volume", "/mnt/nfs", "/mnt/smb"):
+        for prefix in _REMOTE_PREFIXES:
             if p_str.startswith(prefix):
                 return True
     except Exception:

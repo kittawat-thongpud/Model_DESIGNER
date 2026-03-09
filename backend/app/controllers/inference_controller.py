@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..config import DATA_DIR
+from ..services.config_service import get_inference_config
 from ..services import weight_storage, model_storage
 from .. import logging_service as logger
 
@@ -27,7 +28,10 @@ INFERENCE_DIR = DATA_DIR / "inference"
 INFERENCE_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_FILE = INFERENCE_DIR / "history.jsonl"
-MAX_HISTORY = 200
+_INFERENCE_CONFIG = get_inference_config()
+_INFERENCE_DEFAULTS = _INFERENCE_CONFIG.get("defaults", {})
+_INFERENCE_LIMITS = _INFERENCE_CONFIG.get("limits", {})
+MAX_HISTORY = int(_INFERENCE_LIMITS.get("history_max_entries", 200))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,9 +51,15 @@ def _load_yolo(weight_id: str):
 def _append_history(entry: dict) -> None:
     with open(HISTORY_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
+    try:
+        lines = HISTORY_FILE.read_text().splitlines()
+        if len(lines) > MAX_HISTORY:
+            HISTORY_FILE.write_text("\n".join(lines[-MAX_HISTORY:]) + "\n")
+    except Exception:
+        pass
 
 
-def _load_history(limit: int = 50) -> list[dict]:
+def _load_history(limit: int = int(_INFERENCE_LIMITS.get("history_default_limit", 50))) -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
     lines = HISTORY_FILE.read_text().splitlines()
@@ -214,17 +224,18 @@ def _results_to_response(results, weight_id: str, source_name: str,
 @router.post("/predict", summary="Run inference on uploaded images")
 async def predict_images(
     weight_id: str = Form(...),
-    conf: float = Form(0.25),
-    iou: float = Form(0.45),
-    imgsz: int = Form(640),
-    top_k: int = Form(5),
+    conf: float = Form(float(_INFERENCE_DEFAULTS.get("conf", 0.25))),
+    iou: float = Form(float(_INFERENCE_DEFAULTS.get("iou", 0.45))),
+    imgsz: int = Form(int(_INFERENCE_DEFAULTS.get("imgsz", 640))),
+    top_k: int = Form(int(_INFERENCE_DEFAULTS.get("top_k", 5))),
     files: list[UploadFile] = File(...),
 ):
     """Run YOLO prediction on one or more uploaded images. Returns annotated images + detections."""
     if not files:
         raise HTTPException(400, "No files uploaded")
-    if len(files) > 32:
-        raise HTTPException(400, "Max 32 images per request")
+    max_files_per_request = int(_INFERENCE_LIMITS.get("max_files_per_request", 32))
+    if len(files) > max_files_per_request:
+        raise HTTPException(400, f"Max {max_files_per_request} images per request")
 
     tmp_dir = Path(tempfile.mkdtemp())
     try:
@@ -282,7 +293,7 @@ async def predict_images(
 
 
 @router.get("/history", summary="Get inference history")
-async def get_history(limit: int = 50):
+async def get_history(limit: int = int(_INFERENCE_LIMITS.get("history_default_limit", 50))):
     """Return recent inference runs (newest first)."""
     return _load_history(limit)
 
@@ -297,10 +308,10 @@ async def clear_history():
 @router.post("/infer", summary="Run inference — bboxes, labels, confidence + annotated image")
 async def infer(
     weight_id: str = Form(...),
-    conf: float = Form(0.25),
-    iou: float = Form(0.45),
-    imgsz: int = Form(640),
-    visualize_sgbg: bool = Form(False),
+    conf: float = Form(float(_INFERENCE_DEFAULTS.get("conf", 0.25))),
+    iou: float = Form(float(_INFERENCE_DEFAULTS.get("iou", 0.45))),
+    imgsz: int = Form(int(_INFERENCE_DEFAULTS.get("imgsz", 640))),
+    visualize_sgbg: bool = Form(bool(_INFERENCE_DEFAULTS.get("visualize_sgbg", False))),
     file: UploadFile = File(...),
 ):
     """
@@ -545,7 +556,7 @@ async def infer(
 @router.post("/infer/attention", summary="SGBG attention map for a specific detection bbox")
 async def infer_attention(
     weight_id: str = Form(...),
-    imgsz: int = Form(640),
+    imgsz: int = Form(int(_INFERENCE_DEFAULTS.get("imgsz", 640))),
     bbox_x1: float = Form(...),
     bbox_y1: float = Form(...),
     bbox_x2: float = Form(...),

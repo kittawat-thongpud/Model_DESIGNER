@@ -5,15 +5,15 @@ Stores per-layer tensor snapshots and statistics at configurable intervals.
 from __future__ import annotations
 import json
 import math
-import re
-import numpy as np
 from pathlib import Path
 from typing import Any
 
 import torch
 
-# Base directory for job snapshots
 from ..config import JOBS_DIR
+from .config_service import get_weight_snapshots_config
+
+_WEIGHT_SNAPSHOT_DEFAULTS = get_weight_snapshots_config().get("defaults", {})
 
 
 def _snapshots_dir(job_id: str) -> Path:
@@ -85,7 +85,7 @@ def save_full_snapshot(
         _append_stats(job_id, _compute_stats(epoch, name, tensor))
 
 
-def get_epoch_thumbnails(job_id: str, epoch: int, max_size: int = 48) -> dict:
+def get_epoch_thumbnails(job_id: str, epoch: int, max_size: int = int(_WEIGHT_SNAPSHOT_DEFAULTS.get("thumbnail_max_size", 48))) -> dict:
     """Load all layer tensors for an epoch and return downsampled thumbnails."""
     import torch.nn.functional as F
 
