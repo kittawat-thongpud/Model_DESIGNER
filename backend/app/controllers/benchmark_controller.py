@@ -414,9 +414,26 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
     # ── Extract metrics ──────────────────────────────────────────────────────
     mp = val_results.box    # detect metrics proxy
 
+    # Resolve class names: dataset data.yaml names take priority over model.names.
+    # This ensures correct labels when using empty weights or weights trained on a
+    # different dataset's class set (e.g. empty-weight evaluation on idd returns
+    # numeric ids from model.names but the dataset has proper class names in data.yaml).
+    import yaml as _yaml_cls
+    _dataset_names: dict[int, str] = {}
+    try:
+        _yaml_cls_data = _yaml_cls.safe_load(data_yaml.read_text())
+        _raw_names = _yaml_cls_data.get("names") or {}
+        if isinstance(_raw_names, list):
+            _dataset_names = {i: str(n) for i, n in enumerate(_raw_names)}
+        elif isinstance(_raw_names, dict):
+            _dataset_names = {int(k): str(v) for k, v in _raw_names.items()}
+    except Exception:
+        pass
+    # Merge: dataset names override model names for any matching class id
+    names: dict[int, str] = {**(model.names or {}), **_dataset_names}
+
     # Per-class metrics
     per_class: list[dict] = []
-    names = model.names or {}
     if hasattr(mp, "ap_class_index") and mp.ap_class_index is not None:
         for i, cls_id in enumerate(mp.ap_class_index.tolist()):
             per_class.append({
@@ -435,9 +452,13 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
         cm = val_results.confusion_matrix
         if cm is not None:
             matrix = cm.matrix
+            # nc is matrix dimension - 1 (last row/col is background).
+            # Use matrix shape as the authoritative nc so labels always match
+            # the matrix even when model.names count differs from dataset nc.
+            _cm_nc = matrix.shape[0] - 1
             confusion_data = {
                 "matrix": matrix.tolist(),
-                "names": [names.get(i, str(i)) for i in range(len(names))] + ["background"],
+                "names": [names.get(i, str(i)) for i in range(_cm_nc)] + ["background"],
             }
     except Exception:
         pass
