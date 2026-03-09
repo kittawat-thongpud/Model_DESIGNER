@@ -1571,32 +1571,8 @@ def _training_worker(
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bool, num_gpus: int = 1) -> "str | bool":
-    """Choose the best Ultralytics cache mode given available RAM and dataset size.
-
-    *num_gpus* is the number of DDP processes that will each independently
-    allocate their own RAM image cache.  Available RAM is divided by this
-    count before comparing with the estimated dataset size.
-
-    Returns:
-        "ram"  — load all images into shared memory (zero I/O per batch).
-                 Chosen when free RAM >= estimated_dataset_bytes * 1.5 * num_gpus.
-        True   — disk .cache file (label scan saved, images read per batch).
-        False  — no caching (last resort for remote FS when RAM is tight).
-    """
-    import os
     import platform
     from pathlib import Path
-
-        # -------------------------------------------------
-    # 1. Windows → always use disk cache
-    # -------------------------------------------------
-    if platform.system() == "Windows":
-        job_storage.append_job_log(
-            job_id,
-            "INFO",
-            "Cache strategy: disk (Windows stability mode)"
-        )
-        return True
 
     try:
         import psutil
@@ -1604,95 +1580,115 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
     except Exception:
         free_ram = 0
 
-    # In containers (Docker/RunPod/Kubernetes), psutil reads the *host* RAM which
-    # is much larger than the cgroup memory limit assigned to this container.
-    # Cap free_ram by the cgroup limit so we don't OOM by choosing cache='ram'.
-    try:
-        _cgroup_limit = None
-        # cgroup v2
-        _cg2 = Path("/sys/fs/cgroup/memory.max")
-        if _cg2.exists():
-            _val = _cg2.read_text().strip()
-            if _val != "max":
-                _cgroup_limit = int(_val)
-        # cgroup v1
-        if _cgroup_limit is None:
-            _cg1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-            if _cg1.exists():
-                _val = _cg1.read_text().strip()
-                _limit = int(_val)
-                # cgroup v1 uses 2^63-1 as "unlimited"
-                if _limit < (1 << 62):
-                    _cgroup_limit = _limit
-        if _cgroup_limit is not None:
-            # Leave 512 MB headroom for the process itself
-            _headroom = 512 * 1024 * 1024
-            free_ram = min(free_ram, max(0, _cgroup_limit - _headroom))
-    except Exception:
-        pass
-
-    # Estimate dataset image size: count images and multiply by median size.
+    # -----------------------------
+    # Estimate dataset size
+    # -----------------------------
     dataset_bytes = 0
-    if ds_root and ds_root.exists():
+    if ds_root and Path(ds_root).exists():
         try:
+            import statistics
+
             _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-            sizes = []
+
+            img_dir = None
             for split in ("train", "train2017"):
-                img_dir = ds_root / "images" / split
-                if not img_dir.exists():
-                    img_dir = ds_root / "images"
-                if img_dir.exists():
-                    for p in img_dir.iterdir():
-                        if p.suffix.lower() in _IMG_EXTS:
-                            try:
-                                sizes.append(p.stat().st_size)
-                            except OSError:
-                                pass
+                p = Path(ds_root) / "images" / split
+                if p.exists():
+                    img_dir = p
+                    break
+
+            if img_dir is None:
+                p = Path(ds_root) / "images"
+                if p.exists():
+                    img_dir = p
+
+            sizes = []
+            if img_dir:
+                for p in img_dir.rglob("*"):
+                    if p.suffix.lower() in _IMG_EXTS:
+                        try:
+                            sizes.append(p.stat().st_size)
+                        except OSError:
+                            pass
                         if len(sizes) >= 200:
                             break
-                if sizes:
-                    break
+
             if sizes:
-                import statistics
                 median_size = statistics.median(sizes)
-                # Count total images cheaply (iterdir once more)
+
                 total_imgs = sum(
-                    1 for p in img_dir.iterdir()
+                    1 for p in img_dir.rglob("*")
                     if p.suffix.lower() in _IMG_EXTS
-                ) if img_dir.exists() else len(sizes)
-                # JPEG/PNG files are compressed — actual RAM needed for cache='ram'
-                # is the decoded RGB size, not the on-disk size.
-                # Typical JPEG compression ratio is 8–15x; use 10x as a conservative
-                # multiplier so we don't OOM when Ultralytics loads all images decoded.
-                _DECOMPRESS_FACTOR = 10
+                )
+
+                # IMPORTANT FIX
+                # JPEG decode ratio ~20-40x
+                _DECOMPRESS_FACTOR = 30
+
                 dataset_bytes = int(median_size * total_imgs * _DECOMPRESS_FACTOR)
+
         except Exception:
             dataset_bytes = 0
 
-    # Each DDP process allocates its own independent RAM cache, so multiply
-    # the required RAM by the number of parallel processes.
+    # -----------------------------
+    # OS Safety
+    # -----------------------------
+    _os = platform.system()
+
+    if _os == "Windows":
+        _SAFETY_FACTOR = 3.0
+        _MAX_RAM_CACHE = 16 * 1024**3   # hard cap 16GB
+    else:
+        _SAFETY_FACTOR = 1.5
+        _MAX_RAM_CACHE = 64 * 1024**3
+
     _ddp_factor = max(1, num_gpus)
-    required_ram = int(dataset_bytes * 1.5 * _ddp_factor)
+
+    required_ram = int(dataset_bytes * _SAFETY_FACTOR * _ddp_factor)
+
+    # Hard limit protection
+    if dataset_bytes > _MAX_RAM_CACHE:
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            f"Cache strategy: disk — dataset decoded size exceeds RAM cache cap ({_MAX_RAM_CACHE/(1024**3):.1f} GB)"
+        )
+        return True
+
     if free_ram > 0 and dataset_bytes > 0 and free_ram >= required_ram:
+
         gb = dataset_bytes / (1024 ** 3)
         free_gb = free_ram / (1024 ** 3)
-        job_storage.append_job_log(job_id, "INFO",
-            f"Cache strategy: ram — dataset ~{gb:.1f} GB x{_ddp_factor} DDP processes, "
-            f"free RAM {free_gb:.1f} GB (>= {required_ram/(1024**3):.1f} GB threshold)")
+
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            f"Cache strategy: ram — dataset ~{gb:.1f} GB x{_ddp_factor} DDP, "
+            f"OS={_os}, free RAM {free_gb:.1f} GB "
+            f"(>= {required_ram/(1024**3):.1f} GB threshold)"
+        )
+
         return "ram"
 
-    # Not enough RAM for full image cache — fall back to disk .cache (label scan only).
-    # On remote FS this is still better than False because scan only happens once.
-    chosen = True  # disk .cache
+    # fallback disk cache
+    chosen = True
+
     if free_ram > 0 and dataset_bytes > 0:
         gb = dataset_bytes / (1024 ** 3)
         free_gb = free_ram / (1024 ** 3)
-        job_storage.append_job_log(job_id, "INFO",
-            f"Cache strategy: disk — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB, "
-            "using label .cache file only")
+
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            f"Cache strategy: disk — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB"
+        )
     else:
-        job_storage.append_job_log(job_id, "INFO",
-            "Cache strategy: disk — could not estimate dataset size, defaulting to disk cache")
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            "Cache strategy: disk — dataset size unknown"
+        )
+
     return chosen
 
 
