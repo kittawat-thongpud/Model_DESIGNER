@@ -157,7 +157,12 @@ def get_job_history(job_id: str) -> list[dict]:
             if history:
                 return history
         except Exception as e:
-            print(f"Error reading extended_metrics.jsonl: {e}")
+            try:
+                from .. import logging_service as _ls
+                _ls.log("system", "WARNING", "Error reading extended_metrics.jsonl",
+                        {"job_id": job_id, "error": str(e)})
+            except Exception:
+                pass
             # Fall through to results.csv
     
     # Fallback to results.csv (Ultralytics standard)
@@ -214,7 +219,12 @@ def get_job_history(job_id: str) -> list[dict]:
             if history:
                 return history
         except Exception as e:
-            print(f"Error reading results.csv: {e}")
+            try:
+                from .. import logging_service as _ls
+                _ls.log("system", "WARNING", "Error reading results.csv",
+                        {"job_id": job_id, "error": str(e)})
+            except Exception:
+                pass
     
     # Final fallback to legacy history in record.json
     record = load_job(job_id)
