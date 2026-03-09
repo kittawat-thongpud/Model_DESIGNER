@@ -33,12 +33,57 @@ from . import event_bus, job_storage
 from ..constants import job_channel, train_channel
 from . import dataset_yaml, dataset_registry
 from ..config import JOBS_DIR
+from . import task_queue
 
 
 # ── Active jobs tracking ─────────────────────────────────────────────────────
 
 _active_jobs: dict[str, dict] = {}
 _lock = threading.Lock()
+
+
+# ── Queue admission callback ──────────────────────────────────────────────────
+
+def _on_training_task_admitted(task_id: str, task_type: str) -> None:
+    """Called by task_queue when a pending training task gets a slot.
+    Looks up the job record by queue task_id and starts its thread.
+    """
+    if task_type != task_queue.TaskType.TRAINING:
+        return
+    # Find the job whose queue_task_id matches
+    jobs = job_storage.list_jobs(status="pending")
+    job = next((j for j in jobs if j.get("queue_task_id") == task_id), None)
+    if not job:
+        return
+    job_id = job["job_id"]
+    job_storage.append_job_log(job_id, "INFO",
+        "Queue slot available — starting training worker")
+    _launch_thread(job_id, job)
+
+
+task_queue.on_task_admitted(_on_training_task_admitted)
+
+
+def _launch_thread(job_id: str, job: dict) -> None:
+    """Spawn the training worker thread for a job record."""
+    yaml_path = ""
+    try:
+        yaml_path = _resolve_yaml_for_job(job)
+    except ValueError:
+        pass
+    t = threading.Thread(
+        target=_training_worker,
+        args=(job_id, yaml_path, job.get("task", "detect"),
+              dict(job.get("config", {})),
+              job.get("partition_configs") or [],
+              job.get("model_scale")),
+        daemon=False,
+    )
+    with _lock:
+        if job_id not in _active_jobs:
+            _active_jobs[job_id] = {"thread": None, "stop": False}
+        _active_jobs[job_id]["thread"] = t
+    t.start()
 
 
 def start_training(
@@ -51,7 +96,12 @@ def start_training(
     model_scale: str | None = None,
 ) -> str:
     """Start an Ultralytics training job in a background thread.
-    
+
+    Uses the SQLite task queue (Option A policy, 1 GPU training slot):
+    - If a GPU slot is available the job starts immediately.
+    - If no slot is available the job is queued (status=pending) and will
+      be admitted automatically when the running job finishes.
+
     Args:
         partition_configs: List of partition split configurations
                           [{'partition_id': 'p_xxx', 'train': True, 'val': False, 'test': True}, ...]
@@ -59,7 +109,7 @@ def start_training(
         model_scale: Scale char ('n', 's', 'm', 'l', 'x') for model scaling.
     """
     job_id = uuid.uuid4().hex[:12]
-    
+
     if partition_configs is None:
         partition_configs = []
 
@@ -67,19 +117,27 @@ def start_training(
     _data_arg = config.get("data", "")
     _dataset_name = _data_arg if (_data_arg and dataset_registry.is_image_dataset(_data_arg)) else ""
 
+    # Enqueue training task — respects 1-GPU slot admission (Option A policy)
+    queue_task_id, admitted = task_queue.enqueue(
+        task_queue.TaskType.TRAINING,
+        ref_id=job_id,
+        payload={"model_id": model_id, "model_name": model_name, "task": task},
+    )
+
     job = {
         "job_id": job_id,
         "model_id": model_id,
         "model_name": model_name,
         "task": task,
         "config": config,
-        "dataset_name": _dataset_name,  # human-readable dataset name
+        "dataset_name": _dataset_name,
         "partition_configs": partition_configs,
-        "model_scale": model_scale,  # Store scale in job record
+        "model_scale": model_scale,
+        "queue_task_id": queue_task_id,  # link to SQLite queue entry
         "status": "pending",
         "epoch": 0,
         "total_epochs": config.get("epochs", 100),
-        "message": "Queued",
+        "message": "Queued" if not admitted else "Starting...",
         "history": [],
         "weight_id": None,
         "best_fitness": None,
@@ -91,17 +149,24 @@ def start_training(
     }
     job_storage.save_job(job)
 
-    with _lock:
-        _active_jobs[job_id] = {"thread": None, "stop": False}
-
-    t = threading.Thread(
-        target=_training_worker,
-        args=(job_id, yaml_path, task, config, partition_configs, model_scale),
-        daemon=False,  # Changed to non-daemon for proper cleanup
-    )
-    with _lock:
-        _active_jobs[job_id]["thread"] = t
-    t.start()
+    if admitted:
+        # Slot available — start immediately
+        with _lock:
+            _active_jobs[job_id] = {"thread": None, "stop": False}
+        t = threading.Thread(
+            target=_training_worker,
+            args=(job_id, yaml_path, task, config, partition_configs, model_scale),
+            daemon=False,
+        )
+        with _lock:
+            _active_jobs[job_id]["thread"] = t
+        t.start()
+    else:
+        # No slot — job waits in queue; _on_training_task_admitted will start it
+        from .. import logging_service as _ls
+        _ls.log("training", "INFO",
+                f"Training job queued (no GPU slot available): {job_id}",
+                {"job_id": job_id, "model_id": model_id, "queue_task_id": queue_task_id})
 
     return job_id
 
@@ -1566,6 +1631,19 @@ def _training_worker(
             JobCustomTrainer.cleanup_params(job_id)
         except Exception:
             pass
+
+        # Release the queue slot so the next pending training job can start
+        _qt_id = None
+        try:
+            _jrec = job_storage.load_job(job_id)
+            _qt_id = (_jrec or {}).get("queue_task_id")
+        except Exception:
+            pass
+        if _qt_id:
+            try:
+                task_queue.complete(_qt_id)
+            except Exception:
+                pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

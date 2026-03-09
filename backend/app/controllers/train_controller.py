@@ -93,6 +93,13 @@ async def resume_training(job_id: str):
         raise HTTPException(400, str(e))
 
 
+@router.get("/queue", summary="Get training queue status")
+async def get_queue_status():
+    """Return current training queue status including pending jobs and slot limits."""
+    from ..services.task_queue import queue_status, TaskType
+    return queue_status(TaskType.TRAINING)
+
+
 @router.get("/workers/health", summary="Get worker health status")
 async def get_worker_health():
     """Get health status of all active worker threads."""
