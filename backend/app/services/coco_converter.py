@@ -7,6 +7,7 @@ using Ultralytics' built-in converter.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,50 @@ def has_coco_annotations(dataset_path: Path) -> bool:
     )
 
 
+def _discover_annotation_splits(dataset_path: Path) -> list[str]:
+    anno_dir = dataset_path / "annotations"
+    if not anno_dir.exists():
+        return []
+
+    splits: list[str] = []
+    for json_path in sorted(anno_dir.glob("*.json")):
+        stem = json_path.stem.replace("instances_", "")
+        split_key = stem
+        if split_key not in {"train2017", "val2017", "test2017", "train", "val", "test"}:
+            for kw in ("train2017", "val2017", "test2017", "train", "val", "test"):
+                if kw in split_key:
+                    split_key = kw
+                    break
+        if split_key in {"train2017", "val2017", "test2017", "train", "val", "test"} and split_key not in splits:
+            splits.append(split_key)
+    return splits
+
+
+def _expected_label_dirs(dataset_path: Path) -> list[Path]:
+    labels_dir = dataset_path / "labels"
+    img_root = dataset_path / "images"
+    result: list[Path] = []
+    for split in _discover_annotation_splits(dataset_path):
+        if (img_root / split).is_dir():
+            result.append(labels_dir / split)
+        else:
+            result.append(labels_dir)
+    return result
+
+
+def _dir_has_non_empty_txt(path: Path) -> bool:
+    if not path.exists():
+        return False
+    checked = 0
+    for txt in path.rglob("*.txt"):
+        if txt.stat().st_size > 0:
+            return True
+        checked += 1
+        if checked >= 200:
+            break
+    return False
+
+
 def is_already_converted(dataset_path: Path) -> bool:
     """Check if COCO dataset has already been converted to YOLO format.
 
@@ -57,6 +102,12 @@ def is_already_converted(dataset_path: Path) -> bool:
     labels_dir = dataset_path / "labels"
     if not labels_dir.exists():
         return False
+
+    expected_dirs = _expected_label_dirs(dataset_path)
+    if expected_dirs:
+        for expected_dir in expected_dirs:
+            if not _dir_has_non_empty_txt(expected_dir):
+                return False
 
     marker_path = _get_conversion_marker_path(dataset_path)
     if marker_path.exists():
@@ -174,6 +225,7 @@ def convert_coco_to_yolo(
     total_non_empty = 0
     labels_root = dataset_path / "labels"
     loaded_data: dict[str, Any] = {}  # split_key → parsed annotation dict
+    written_split_dirs: set[str] = set()
 
     try:
         for json_path in instances_files:
@@ -193,6 +245,8 @@ def convert_coco_to_yolo(
             out_subdir = SPLIT_MAP.get(split_key, split_key)
             out_dir = labels_root / out_subdir if out_subdir else labels_root
             out_dir.mkdir(parents=True, exist_ok=True)
+            if out_subdir:
+                written_split_dirs.add(out_subdir)
 
             with open(json_path) as f:
                 data = json.load(f)
@@ -262,6 +316,11 @@ def convert_coco_to_yolo(
                 total_written += 1
                 if content:
                     total_non_empty += 1
+
+        if written_split_dirs and labels_root.exists():
+            for child in list(labels_root.iterdir()):
+                if child.is_dir() and child.name not in written_split_dirs:
+                    shutil.rmtree(child, ignore_errors=True)
 
         try:
             marker_path = _get_conversion_marker_path(dataset_path)

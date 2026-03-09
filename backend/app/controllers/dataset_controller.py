@@ -157,6 +157,50 @@ def _dir_has_files(path: Path) -> bool:
     return True
 
 
+def _idd_has_split_images(root: Path) -> bool:
+    images_dir = root / "images"
+    if not images_dir.exists():
+        return False
+    train_dir = images_dir / "train"
+    val_dir = images_dir / "val"
+    return _dir_has_files(train_dir) or _dir_has_files(val_dir)
+
+
+def _idd_has_any_images(root: Path) -> bool:
+    for candidate in (root / "images", root / "JPEGImages"):
+        if _dir_has_files(candidate):
+            return True
+    return False
+
+
+def _resolve_idd_source_images_dir(root: Path) -> Path | None:
+    jpeg_dir = root / "JPEGImages"
+    if jpeg_dir.exists():
+        return jpeg_dir
+    images_dir = root / "images"
+    if images_dir.exists():
+        return images_dir
+    return None
+
+
+def _idd_has_voc_source(root: Path) -> bool:
+    ann_dir = root / "Annotations"
+    img_dir = _resolve_idd_source_images_dir(root)
+    train_list = _resolve_idd_split_file(root, "train")
+    val_list = _resolve_idd_split_file(root, "val")
+    return ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None
+
+
+def _resolve_idd_split_file(root: Path, split: str) -> Path | None:
+    direct = root / f"{split}.txt"
+    if direct.exists():
+        return direct
+    imagesets = root / "ImageSets" / "Main" / f"{split}.txt"
+    if imagesets.exists():
+        return imagesets
+    return None
+
+
 def _meta_needs_refresh(meta: dict | None, available: bool) -> bool:
     if not meta:
         return True
@@ -183,6 +227,11 @@ def _human_size(n: int) -> str:
 def _scan_dataset_meta(name: str) -> dict:
     """Scan a dataset via its plugin and build metadata. Cached in meta.json."""
     key = name.lower()
+    if key == "idd":
+        try:
+            coco_converter.auto_convert_if_needed(key)
+        except Exception:
+            pass
     plugin = get_dataset_plugin(key)
     if not plugin:
         return {"name": key, "available": False}
@@ -724,12 +773,12 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     from pathlib import Path as _Path
 
     ann_dir = root / "Annotations"
-    img_dir = root / "JPEGImages"
-    train_list = root / "train.txt"
-    val_list   = root / "val.txt"
+    img_dir = _resolve_idd_source_images_dir(root)
+    train_list = _resolve_idd_split_file(root, "train")
+    val_list   = _resolve_idd_split_file(root, "val")
 
     # Flatten optional IDD_Detection/ wrapper subdirectory
-    if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
+    if not (ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None):
         _WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
         _sub = next(
             (d for d in root.iterdir()
@@ -738,10 +787,10 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
         )
         if _sub is not None:
             _ann = _sub / "Annotations"
-            _img = _sub / "JPEGImages"
-            _tr  = _sub / "train.txt"
-            _vl  = _sub / "val.txt"
-            if _ann.exists() and _img.exists() and _tr.exists() and _vl.exists():
+            _img = _resolve_idd_source_images_dir(_sub)
+            _tr  = _resolve_idd_split_file(_sub, "train")
+            _vl  = _resolve_idd_split_file(_sub, "val")
+            if _ann.exists() and _img is not None and _tr is not None and _vl is not None:
                 state["message"] = f"Flattening {_sub.name}/ ..."
                 for _item in list(_sub.iterdir()):
                     _target = root / _item.name
@@ -758,11 +807,11 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
                 except Exception:
                     pass
                 ann_dir    = root / "Annotations"
-                img_dir    = root / "JPEGImages"
-                train_list = root / "train.txt"
-                val_list   = root / "val.txt"
+                img_dir    = _resolve_idd_source_images_dir(root)
+                train_list = _resolve_idd_split_file(root, "train")
+                val_list   = _resolve_idd_split_file(root, "val")
 
-    if not (ann_dir.exists() and img_dir.exists() and train_list.exists() and val_list.exists()):
+    if not (ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None):
         return False
 
     cats = [
@@ -905,14 +954,20 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     try:
         if ann_dir.exists():
             _sh.rmtree(ann_dir)
-        if img_dir.exists():
+        if img_dir.exists() and img_dir != yolo_img_dir:
             _sh.rmtree(img_dir)
-        for txt_file in [train_list, val_list, root / "test.txt"]:
+        elif img_dir == yolo_img_dir:
+            for child in list(img_dir.iterdir()):
+                if child.name not in {"train", "val", "test", "train2017", "val2017", "test2017"}:
+                    if child.is_dir():
+                        _sh.rmtree(child, ignore_errors=True)
+        txt_cleanup = {p for p in [train_list, val_list, _resolve_idd_split_file(root, "test")] if p is not None}
+        for txt_file in txt_cleanup:
             if txt_file.exists():
                 txt_file.unlink(missing_ok=True)
-        idd_det_dir = root / "IDD_Detection"
-        if idd_det_dir.exists():
-            _sh.rmtree(idd_det_dir)
+        for extra_dir in [root / "ImageSets", root / "IDD_Detection"]:
+            if extra_dir.exists():
+                _sh.rmtree(extra_dir)
     except Exception:
         pass
 
@@ -1200,8 +1255,8 @@ def _bg_url_download(name: str, url: str):
             state["progress"] = 0
             state["message"] = (
                 "Extraction complete but dataset files are incomplete or invalid. "
-                "Expected annotation JSON files containing 'idd'/'detection' keywords "
-                "and at least one image file. Please check the archive structure and re-upload."
+                "Expected at least one image under images/train, images/val, or a valid annotation source. "
+                "Please check the archive structure and re-upload."
             )
             return
 
@@ -1409,20 +1464,30 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         _coco_loaded_data: dict = {}
         if name.lower() == "idd":
             has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
-            if not has_json:
+            has_images = _idd_has_split_images(dest)
+            has_voc_source = _idd_has_voc_source(dest)
+            if not has_json and has_voc_source and not has_images:
                 state["message"] = "Converting IDD dataset to COCO JSON..."
                 state["progress"] = max(state.get("progress", 70), 70)
                 if not _auto_convert_idd_voc_to_coco(dest, state):
                     raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
+                has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
+                has_images = _idd_has_split_images(dest)
 
             # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
-            state["message"] = "Converting COCO annotations to YOLO format..."
-            state["progress"] = 91
-            _conv_result = coco_converter.auto_convert_if_needed("idd")
-            if _conv_result and _conv_result.get("status") == "error":
-                raise ValueError(_conv_result.get("message") or _conv_result.get("error") or "IDD label conversion failed")
-            if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
-                _coco_loaded_data = _conv_result["loaded_data"]
+            if has_json:
+                state["message"] = "Converting COCO annotations to YOLO format..."
+                state["progress"] = 91
+                _conv_result = coco_converter.auto_convert_if_needed("idd")
+                if _conv_result and _conv_result.get("status") == "error":
+                    raise ValueError(_conv_result.get("message") or _conv_result.get("error") or "IDD label conversion failed")
+                if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
+                    _coco_loaded_data = _conv_result["loaded_data"]
+            elif has_images:
+                state["message"] = "No annotations found. Building image index from extracted files..."
+                state["progress"] = 91
+            elif _idd_has_any_images(dest):
+                raise ValueError("IDD archive has images but no train/val split directories and no convertible VOC split files")
 
         state["progress"] = 90
         state["message"] = "Building index..."

@@ -99,6 +99,16 @@ def _img_dir_has_files(img_dir: Path | None) -> bool:
     return False
 
 
+def _find_split_txt(split: str) -> Path | None:
+    direct = _IDD_ROOT / f"{split}.txt"
+    if direct.exists():
+        return direct
+    imagesets = _IDD_ROOT / "ImageSets" / "Main" / f"{split}.txt"
+    if imagesets.exists():
+        return imagesets
+    return None
+
+
 # ── Index builder ─────────────────────────────────────────────────────────────
 
 def _build_index(
@@ -500,8 +510,8 @@ class IDDPlugin(DatasetPlugin):
 
         Returns the number of symlinks created.
         """
-        split_txt = _IDD_ROOT / f"{split}.txt"
-        if not split_txt.exists():
+        split_txt = _find_split_txt(split)
+        if split_txt is None or not split_txt.exists():
             return 0
 
         jpeg_root = _IDD_ROOT / "JPEGImages"
