@@ -235,10 +235,20 @@ def _flatten_idd_wrapper_dir(root: Path, state: dict) -> bool:
     return True
 
 
+def _idd_coco_json_files(root: Path) -> list[Path]:
+    annotations_dir = root / "annotations"
+    if not annotations_dir.exists():
+        return []
+    try:
+        return sorted([p for p in annotations_dir.glob("*.json") if p.is_file()])
+    except Exception:
+        return []
+
+
 def _idd_layout_snapshot(root: Path) -> dict:
     images_dir = root / "images"
-    annotations_dir = root / "annotations"
     jpeg_dir = root / "JPEGImages"
+    json_files = _idd_coco_json_files(root)
     top_level: list[str] = []
     try:
         top_level = [f"{p.name}/" if p.is_dir() else p.name for p in sorted(root.iterdir())[:20]]
@@ -248,7 +258,8 @@ def _idd_layout_snapshot(root: Path) -> dict:
         "root": str(root),
         "top_level": top_level,
         "has_annotations_dir": (root / "Annotations").exists(),
-        "has_annotations_json_dir": annotations_dir.exists(),
+        "has_annotations_json_dir": bool(json_files),
+        "annotation_json_files": [p.name for p in json_files[:10]],
         "has_jpegimages_dir": jpeg_dir.exists(),
         "has_images_dir": images_dir.exists(),
         "has_images_train": _dir_has_files(images_dir / "train"),
@@ -660,8 +671,7 @@ async def import_local(name: str):
                     })
                 while _flatten_idd_wrapper_dir(dest, state):
                     _dataset_log("INFO", "IDD import-local layout after post-nested flatten", _idd_layout_snapshot(dest))
-                ann_dir = dest / "annotations"
-                has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
+                has_json = bool(_idd_coco_json_files(dest))
                 has_yolo_images = _idd_has_split_images(dest)
                 has_voc_source = _idd_has_voc_source(dest)
                 _dataset_log("INFO", "IDD import-local decision snapshot", {
@@ -676,7 +686,16 @@ async def import_local(name: str):
                     state["progress"] = 25
                     try:
                         converted = _auto_convert_idd_voc_to_coco(dest, state)
-                        if not converted:
+                        has_json = bool(_idd_coco_json_files(dest))
+                        has_yolo_images = _idd_has_split_images(dest)
+                        _dataset_log("INFO", "IDD import-local post-conversion recheck", {
+                            "dataset": key,
+                            "converted": converted,
+                            "has_json": has_json,
+                            "has_yolo_images": has_yolo_images,
+                            "layout": _idd_layout_snapshot(dest),
+                        })
+                        if not converted and not has_json:
                             raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
                     except Exception as _conv_err:
                         import traceback as _tb
@@ -692,10 +711,8 @@ async def import_local(name: str):
                         state["progress"] = 0
                         state["message"] = f"IDD conversion failed: {_conv_err}"
                         return
-                    ann_dir = dest / "annotations"
-                    has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
 
-                if has_json or (ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))):
+                if has_json:
                     state["message"] = "Converting COCO annotations to YOLO format..."
                     state["progress"] = 35
                     conv_result = coco_converter.auto_convert_if_needed(key)
@@ -993,7 +1010,17 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     categories = [{"id": i, "name": n} for i, n in enumerate(cats)]
 
     coco_ann_dir = root / "annotations"
-    coco_ann_dir.mkdir(parents=True, exist_ok=True)
+    staged_coco_ann_dir = coco_ann_dir
+    if ann_dir.parent == coco_ann_dir.parent and ann_dir.name.casefold() == coco_ann_dir.name.casefold():
+        staged_coco_ann_dir = root / "__idd_coco_annotations_tmp__"
+        if staged_coco_ann_dir.exists():
+            _sh.rmtree(staged_coco_ann_dir, ignore_errors=True)
+        _dataset_log("INFO", "Using staged COCO annotations directory to avoid case-collision", {
+            "source_annotations_dir": str(ann_dir),
+            "staged_annotations_dir": str(staged_coco_ann_dir),
+            "final_annotations_dir": str(coco_ann_dir),
+        })
+    staged_coco_ann_dir.mkdir(parents=True, exist_ok=True)
 
     def _parse_split(split: str, list_path: Path) -> tuple[list, list, list[tuple]]:
         """Pass 1: parse all XMLs and collect (jpg_src, jpg_dest) pairs.
@@ -1081,13 +1108,13 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
             "info": {"description": "IDD Detection"},
             "images": imgs, "annotations": anns, "categories": categories,
         }
-        with open(coco_ann_dir / f"idd_detection_{split}.json", "w") as f:
+        with open(staged_coco_ann_dir / f"idd_detection_{split}.json", "w") as f:
             _json.dump(out, f)
         _dataset_log("INFO", "Wrote IDD COCO annotation file", {
             "split": split,
             "images": len(imgs),
             "annotations": len(anns),
-            "path": str(coco_ann_dir / f"idd_detection_{split}.json"),
+            "path": str(staged_coco_ann_dir / f"idd_detection_{split}.json"),
         })
 
     # ── Pass 3: move images — directory rename where possible ────────────────
@@ -1147,6 +1174,22 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     except Exception:
         pass
 
+    if staged_coco_ann_dir != coco_ann_dir:
+        try:
+            if coco_ann_dir.exists() and coco_ann_dir != staged_coco_ann_dir:
+                _sh.rmtree(coco_ann_dir, ignore_errors=True)
+            staged_coco_ann_dir.rename(coco_ann_dir)
+        except Exception:
+            try:
+                _sh.move(str(staged_coco_ann_dir), str(coco_ann_dir))
+            except Exception as _rename_err:
+                _dataset_log("ERROR", "Failed to finalize staged COCO annotations directory", {
+                    "staged_annotations_dir": str(staged_coco_ann_dir),
+                    "final_annotations_dir": str(coco_ann_dir),
+                    "error": str(_rename_err),
+                })
+                return False
+
     out_train = coco_ann_dir / "idd_detection_train.json"
     out_val   = coco_ann_dir / "idd_detection_val.json"
     _dataset_log("INFO", "Finished IDD VOC-to-COCO conversion", {
@@ -1154,6 +1197,8 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
         "layout": _idd_layout_snapshot(root),
         "train_json": str(out_train),
         "val_json": str(out_val),
+        "train_exists": out_train.exists(),
+        "val_exists": out_val.exists(),
     })
     return out_train.exists() and out_val.exists()
 
@@ -1635,7 +1680,7 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         _coco_loaded_data: dict = {}
         if name.lower() == "idd":
             _dataset_log("INFO", "Evaluating IDD layout before conversion", _idd_layout_snapshot(dest))
-            has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
+            has_json = bool(_idd_coco_json_files(dest))
             has_images = _idd_has_split_images(dest)
             has_voc_source = _idd_has_voc_source(dest)
             _dataset_log("INFO", "IDD conversion decision snapshot", {
@@ -1648,10 +1693,18 @@ def _bg_extract(name: str, archive_path: str, state: dict):
             if not has_json and has_voc_source:
                 state["message"] = "Converting IDD dataset to COCO JSON..."
                 state["progress"] = max(state.get("progress", 70), 70)
-                if not _auto_convert_idd_voc_to_coco(dest, state):
-                    raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
-                has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
+                converted = _auto_convert_idd_voc_to_coco(dest, state)
+                has_json = bool(_idd_coco_json_files(dest))
                 has_images = _idd_has_split_images(dest)
+                _dataset_log("INFO", "IDD post-conversion recheck", {
+                    "dataset": name,
+                    "converted": converted,
+                    "has_json": has_json,
+                    "has_images": has_images,
+                    "layout": _idd_layout_snapshot(dest),
+                })
+                if not converted and not has_json:
+                    raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
                 _dataset_log("INFO", "IDD layout after VOC conversion", _idd_layout_snapshot(dest))
 
             # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
