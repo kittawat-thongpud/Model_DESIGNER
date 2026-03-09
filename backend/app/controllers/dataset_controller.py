@@ -531,6 +531,16 @@ async def import_local(name: str):
                         state["message"] = f"IDD conversion failed: {_conv_err}"
                         return
 
+                if has_json or (ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))):
+                    state["message"] = "Converting COCO annotations to YOLO format..."
+                    state["progress"] = 35
+                    conv_result = coco_converter.auto_convert_if_needed(key)
+                    if conv_result and conv_result.get("status") == "error":
+                        state["status"] = "error"
+                        state["progress"] = 0
+                        state["message"] = f"IDD label conversion failed: {conv_result.get('message') or conv_result.get('error') or 'unknown error'}"
+                        return
+
             state["message"] = "Building index..."
             state["progress"] = 40
             if hasattr(plugin, "rebuild_index"):
@@ -1398,21 +1408,21 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
         _coco_loaded_data: dict = {}
         if name.lower() == "idd":
-            try:
-                has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
-                if not has_json:
-                    state["message"] = "Converting IDD dataset to COCO JSON..."
-                    state["progress"] = max(state.get("progress", 70), 70)
-                    _auto_convert_idd_voc_to_coco(dest, state)
+            has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
+            if not has_json:
+                state["message"] = "Converting IDD dataset to COCO JSON..."
+                state["progress"] = max(state.get("progress", 70), 70)
+                if not _auto_convert_idd_voc_to_coco(dest, state):
+                    raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
 
-                # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
-                state["message"] = "Converting COCO annotations to YOLO format..."
-                state["progress"] = 91
-                _conv_result = coco_converter.auto_convert_if_needed("idd")
-                if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
-                    _coco_loaded_data = _conv_result["loaded_data"]
-            except Exception:
-                pass
+            # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
+            state["message"] = "Converting COCO annotations to YOLO format..."
+            state["progress"] = 91
+            _conv_result = coco_converter.auto_convert_if_needed("idd")
+            if _conv_result and _conv_result.get("status") == "error":
+                raise ValueError(_conv_result.get("message") or _conv_result.get("error") or "IDD label conversion failed")
+            if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
+                _coco_loaded_data = _conv_result["loaded_data"]
 
         state["progress"] = 90
         state["message"] = "Building index..."
