@@ -1584,6 +1584,20 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
         False  — no caching (last resort for remote FS when RAM is tight).
     """
     import os
+    import platform
+    from pathlib import Path
+
+        # -------------------------------------------------
+    # 1. Windows → always use disk cache
+    # -------------------------------------------------
+    if platform.system() == "Windows":
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            "Cache strategy: disk (Windows stability mode)"
+        )
+        return True
+
     try:
         import psutil
         free_ram = psutil.virtual_memory().available
