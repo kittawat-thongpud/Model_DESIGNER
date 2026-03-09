@@ -147,6 +147,31 @@ def _delete_meta(name: str):
         p.unlink()
 
 
+def _dir_has_files(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        next(p for p in path.rglob("*") if p.is_file())
+    except StopIteration:
+        return False
+    return True
+
+
+def _meta_needs_refresh(meta: dict | None, available: bool) -> bool:
+    if not meta:
+        return True
+    if bool(meta.get("available", False)) != bool(available):
+        return True
+    if not available:
+        return False
+    splits = meta.get("splits") or {}
+    train = splits.get("train", {})
+    val = splits.get("val", {})
+    if train.get("total", 0) <= 0 and train.get("labeled", 0) <= 0 and val.get("total", 0) <= 0 and val.get("labeled", 0) <= 0:
+        return True
+    return False
+
+
 def _human_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
@@ -211,6 +236,8 @@ async def dataset_status(name: str):
         result["manual_download"] = getattr(plugin, "manual_download", False)
         result["instructions"] = getattr(plugin, "upload_instructions", "")
     meta = _load_meta(key)
+    if _meta_needs_refresh(meta, available):
+        meta = _scan_dataset_meta(key)
     if meta:
         result["meta"] = meta
     return result
@@ -222,7 +249,9 @@ async def get_meta(name: str):
     if not ds:
         raise HTTPException(status_code=404, detail=f"Dataset '{name}' not found")
     meta = _load_meta(name.lower())
-    if not meta:
+    plugin = get_dataset_plugin(name.lower())
+    available = plugin.is_available() if plugin else False
+    if _meta_needs_refresh(meta, available):
         meta = _scan_dataset_meta(name.lower())
     return meta
 
@@ -485,7 +514,7 @@ async def import_local(name: str):
                 has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
                 yolo_train = (dest / "images" / "train")
                 yolo_val = (dest / "images" / "val")
-                has_yolo_images = yolo_train.exists() and yolo_val.exists()
+                has_yolo_images = _dir_has_files(yolo_train) and _dir_has_files(yolo_val)
                 if (not has_json) or (not has_yolo_images):
                     state["message"] = "Converting IDD dataset to COCO JSON..."
                     state["progress"] = 25
