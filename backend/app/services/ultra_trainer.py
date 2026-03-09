@@ -34,6 +34,7 @@ from ..constants import job_channel, train_channel
 from . import dataset_yaml, dataset_registry
 from ..config import JOBS_DIR
 from . import task_queue
+from . import platform_caps
 
 
 # ── Active jobs tracking ─────────────────────────────────────────────────────
@@ -974,28 +975,44 @@ def _training_worker(
             f"DDP PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
 
         if _is_multi_gpu:
-            # User explicitly set multi-GPU (e.g. device="0,1") — enable DDP.
-            import multiprocessing as _mp
-            try:
-                if _mp.get_start_method(allow_none=True) != "spawn":
-                    _mp.set_start_method("spawn", force=True)
-            except RuntimeError:
-                pass
-            _gpu_count = len([x for x in _final_device.split(",") if x.strip()])
-            job_storage.append_job_log(job_id, "INFO",
-                f"Multi-GPU DDP enabled: device='{_final_device}' ({_gpu_count} GPUs)")
+            # User explicitly set multi-GPU (e.g. device="0,1") — probe DDP capability.
+            final_dev, ddp_cap = platform_caps.select_ddp_device_with_fallback(
+                _final_device, job_id=job_id
+            )
+            if ddp_cap.supported:
+                import multiprocessing as _mp
+                try:
+                    if _mp.get_start_method(allow_none=True) != "spawn":
+                        _mp.set_start_method("spawn", force=True)
+                except RuntimeError:
+                    pass
+                _gpu_count = len([x for x in final_dev.split(",") if x.strip()])
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Multi-GPU DDP enabled: device='{final_dev}' ({_gpu_count} GPUs)")
+            else:
+                # Auto-fallback already logged by platform_caps; update device
+                train_kwargs["device"] = final_dev
+                job_storage.append_job_log(job_id, "INFO",
+                    f"DDP downgraded to single device '{final_dev}' [{ddp_cap.fallback_code}]")
         elif _avail > 1 and not _final_device:
-            # device blank + multiple GPUs → use all GPUs via DDP
+            # device blank + multiple GPUs → probe all-GPU DDP capability
             all_indices = ",".join(str(i) for i in range(_avail))
-            train_kwargs["device"] = all_indices
-            import multiprocessing as _mp
-            try:
-                if _mp.get_start_method(allow_none=True) != "spawn":
-                    _mp.set_start_method("spawn", force=True)
-            except RuntimeError:
-                pass
-            job_storage.append_job_log(job_id, "INFO",
-                f"Auto-selected all {_avail} GPUs: device='{all_indices}' (DDP)")
+            _, ddp_cap = platform_caps.select_ddp_device_with_fallback(
+                all_indices, job_id=job_id
+            )
+            if ddp_cap.supported:
+                train_kwargs["device"] = all_indices
+                import multiprocessing as _mp
+                try:
+                    if _mp.get_start_method(allow_none=True) != "spawn":
+                        _mp.set_start_method("spawn", force=True)
+                except RuntimeError:
+                    pass
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Auto-selected all {_avail} GPUs: device='{all_indices}' (DDP)")
+            else:
+                job_storage.append_job_log(job_id, "INFO",
+                    f"All-GPU DDP not available, using single GPU [{ddp_cap.fallback_code}]")
         # ─────────────────────────────────────────────────────────────────────
 
         # ── ema / pin_memory note ─────────────────────────────────────────────
@@ -1012,7 +1029,7 @@ def _training_worker(
         if resume_path:
             train_kwargs["resume"] = True  # tell Ultralytics to restore epoch/optimizer state
 
-        # Detect dataset filesystem early (used to decide worker/cache strategy)
+        # Detect dataset filesystem using capability-based cross-platform detection
         fstype = None
         ds_root = None
         is_remote_fs = False
@@ -1020,16 +1037,10 @@ def _training_worker(
             data_yaml = train_kwargs.get("data")
             ds_root = _dataset_root_from_data_yaml(data_yaml) if data_yaml else None
             if ds_root:
-                fstype = _mount_fstype_for_path(ds_root)
-                if fstype and fstype.lower() in {"fuse", "fuseblk", "nfs", "cifs", "sshfs", "overlay"}:
-                    is_remote_fs = True
-                # RunPod Network Volume mounts as nfs/overlay but may appear as ext4.
-                # Fallback: treat /workspace (and subdirs) as remote if fstype not caught above.
-                if not is_remote_fs and ds_root:
-                    _ds_str = str(ds_root.resolve())
-                    if _ds_str.startswith("/workspace") or _ds_str.startswith("/runpod-volume"):
-                        is_remote_fs = True
-                        fstype = fstype or "runpod-network-volume"
+                fstype = platform_caps.get_fs_type(ds_root)
+                is_remote_fs = platform_caps.is_remote_fs(ds_root)
+                job_storage.append_job_log(job_id, "DEBUG",
+                    f"Dataset FS: fstype={fstype!r} remote={is_remote_fs} path={ds_root}")
         except Exception as _fs_err:
             job_storage.append_job_log(job_id, "DEBUG", f"Dataset filesystem detection failed: {_fs_err}")
 

@@ -90,6 +90,13 @@ async def readiness():
     except Exception as e:
         checks["workers"] = {"ok": False, "error": str(e)}
 
+    # ── Platform capabilities ────────────────────────────────────────────────
+    try:
+        from ..services.platform_caps import get_platform_info
+        checks["platform"] = {"ok": True, **get_platform_info()}
+    except Exception as e:
+        checks["platform"] = {"ok": False, "error": str(e)}
+
     status_code = 200 if all_ok else 503
     return JSONResponse(
         status_code=status_code,
