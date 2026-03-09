@@ -36,6 +36,18 @@ _DATASET_SPLIT_SEED = int(_DATASET_API_DEFAULTS.get("split_seed", 42))
 _DATASET_PARTITION_METHOD = str(_DATASET_API_DEFAULTS.get("partition_method", "stratified"))
 
 
+def _dataset_log(level: str, message: str, data: dict | None = None) -> None:
+    payload = data or {}
+    try:
+        print(f"[dataset:{level}] {message} | {json.dumps(payload, default=str, ensure_ascii=False)}", flush=True)
+    except Exception:
+        print(f"[dataset:{level}] {message}", flush=True)
+    try:
+        logger.log("dataset", level, message, payload, component="dataset_controller")
+    except Exception:
+        pass
+
+
 # ── Shared archive-detection helper ──────────────────────────────────────────
 
 def _looks_like_archive(p: Path) -> bool:
@@ -183,11 +195,84 @@ def _resolve_idd_source_images_dir(root: Path) -> Path | None:
     return None
 
 
+def _find_idd_wrapper_dir(root: Path) -> Path | None:
+    wrapper_names = {"idd_detection", "idd-detection", "idd detection"}
+    for child in root.iterdir():
+        if child.is_dir() and child.name.lower().replace(" ", "_") in wrapper_names:
+            return child
+    subdirs = [d for d in root.iterdir() if d.is_dir()]
+    if len(subdirs) == 1:
+        inner_candidate = subdirs[0]
+        final_dirs = {"images", "labels", "annotations", "jpegimages"}
+        if inner_candidate.name.lower() not in final_dirs:
+            return inner_candidate
+    return None
+
+
+def _flatten_idd_wrapper_dir(root: Path, state: dict) -> bool:
+    flatten_dir = _find_idd_wrapper_dir(root)
+    if flatten_dir is None:
+        return False
+    state["message"] = f"Flattening {flatten_dir.name}/ into dataset root..."
+    _dataset_log("INFO", "Flattening IDD wrapper directory", {
+        "root": str(root),
+        "wrapper": str(flatten_dir),
+    })
+    for item in list(flatten_dir.iterdir()):
+        target = root / item.name
+        if target.exists():
+            if item.is_dir() and target.is_dir():
+                for sub in list(item.iterdir()):
+                    sub_target = target / sub.name
+                    if not sub_target.exists():
+                        shutil.move(str(sub), str(sub_target))
+        else:
+            shutil.move(str(item), str(target))
+    try:
+        shutil.rmtree(str(flatten_dir))
+    except Exception:
+        pass
+    return True
+
+
+def _idd_layout_snapshot(root: Path) -> dict:
+    images_dir = root / "images"
+    annotations_dir = root / "annotations"
+    jpeg_dir = root / "JPEGImages"
+    top_level: list[str] = []
+    try:
+        top_level = [f"{p.name}/" if p.is_dir() else p.name for p in sorted(root.iterdir())[:20]]
+    except Exception:
+        pass
+    return {
+        "root": str(root),
+        "top_level": top_level,
+        "has_annotations_dir": (root / "Annotations").exists(),
+        "has_annotations_json_dir": annotations_dir.exists(),
+        "has_jpegimages_dir": jpeg_dir.exists(),
+        "has_images_dir": images_dir.exists(),
+        "has_images_train": _dir_has_files(images_dir / "train"),
+        "has_images_val": _dir_has_files(images_dir / "val"),
+        "train_txt": str(_resolve_idd_split_file(root, "train")) if _resolve_idd_split_file(root, "train") else None,
+        "val_txt": str(_resolve_idd_split_file(root, "val")) if _resolve_idd_split_file(root, "val") else None,
+        "wrapper_dir": str(_find_idd_wrapper_dir(root)) if _find_idd_wrapper_dir(root) else None,
+    }
+
+
 def _idd_has_voc_source(root: Path) -> bool:
     ann_dir = root / "Annotations"
     img_dir = _resolve_idd_source_images_dir(root)
     train_list = _resolve_idd_split_file(root, "train")
     val_list = _resolve_idd_split_file(root, "val")
+    if ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None:
+        return True
+    wrapper = _find_idd_wrapper_dir(root)
+    if wrapper is None:
+        return False
+    ann_dir = wrapper / "Annotations"
+    img_dir = _resolve_idd_source_images_dir(wrapper)
+    train_list = _resolve_idd_split_file(wrapper, "train")
+    val_list = _resolve_idd_split_file(wrapper, "val")
     return ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None
 
 
@@ -559,26 +644,56 @@ async def import_local(name: str):
     def _bg():
         try:
             if key == "idd":
+                _dataset_log("INFO", "Starting IDD import-local flow", {
+                    "dataset": key,
+                    "dest": str(dest),
+                    "layout": _idd_layout_snapshot(dest) if dest.exists() else {},
+                })
+                while _flatten_idd_wrapper_dir(dest, state):
+                    _dataset_log("INFO", "IDD import-local layout after wrapper flatten", _idd_layout_snapshot(dest))
+                nested = _extract_nested_archives(dest, state, progress_start=15, progress_end=24)
+                if nested:
+                    _dataset_log("INFO", "IDD import-local extracted nested archives", {
+                        "dataset": key,
+                        "nested_count": nested,
+                        "layout": _idd_layout_snapshot(dest),
+                    })
+                while _flatten_idd_wrapper_dir(dest, state):
+                    _dataset_log("INFO", "IDD import-local layout after post-nested flatten", _idd_layout_snapshot(dest))
                 ann_dir = dest / "annotations"
                 has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
-                yolo_train = (dest / "images" / "train")
-                yolo_val = (dest / "images" / "val")
-                has_yolo_images = _dir_has_files(yolo_train) and _dir_has_files(yolo_val)
-                if (not has_json) or (not has_yolo_images):
+                has_yolo_images = _idd_has_split_images(dest)
+                has_voc_source = _idd_has_voc_source(dest)
+                _dataset_log("INFO", "IDD import-local decision snapshot", {
+                    "dataset": key,
+                    "has_json": has_json,
+                    "has_yolo_images": has_yolo_images,
+                    "has_voc_source": has_voc_source,
+                    "layout": _idd_layout_snapshot(dest),
+                })
+                if not has_json and has_voc_source:
                     state["message"] = "Converting IDD dataset to COCO JSON..."
                     state["progress"] = 25
                     try:
-                        _auto_convert_idd_voc_to_coco(dest, state)
+                        converted = _auto_convert_idd_voc_to_coco(dest, state)
+                        if not converted:
+                            raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
                     except Exception as _conv_err:
                         import traceback as _tb
                         _detail = _tb.format_exc()
-                        logger.log("dataset", "ERROR",
-                                   "IDD VOC-to-COCO conversion failed",
-                                   {"dataset": key, "dest": str(dest), "error": str(_conv_err)})
+                        _dataset_log("ERROR", "IDD VOC-to-COCO conversion failed", {
+                            "dataset": key,
+                            "dest": str(dest),
+                            "error": str(_conv_err),
+                            "traceback": _detail,
+                            "layout": _idd_layout_snapshot(dest),
+                        })
                         state["status"] = "error"
                         state["progress"] = 0
                         state["message"] = f"IDD conversion failed: {_conv_err}"
                         return
+                    ann_dir = dest / "annotations"
+                    has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
 
                 if has_json or (ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))):
                     state["message"] = "Converting COCO annotations to YOLO format..."
@@ -589,6 +704,25 @@ async def import_local(name: str):
                         state["progress"] = 0
                         state["message"] = f"IDD label conversion failed: {conv_result.get('message') or conv_result.get('error') or 'unknown error'}"
                         return
+                    _dataset_log("INFO", "IDD import-local COCO-to-YOLO conversion result", {
+                        "dataset": key,
+                        "result": conv_result,
+                        "layout": _idd_layout_snapshot(dest),
+                    })
+                elif has_yolo_images:
+                    _dataset_log("INFO", "IDD import-local using existing split image layout without COCO JSON", {
+                        "dataset": key,
+                        "layout": _idd_layout_snapshot(dest),
+                    })
+                elif _idd_has_any_images(dest):
+                    state["status"] = "error"
+                    state["progress"] = 0
+                    state["message"] = "IDD archive has images but no train/val split directories and no convertible VOC source files"
+                    _dataset_log("ERROR", "IDD import-local found unsupported image-only layout", {
+                        "dataset": key,
+                        "layout": _idd_layout_snapshot(dest),
+                    })
+                    return
 
             state["message"] = "Building index..."
             state["progress"] = 40
@@ -672,7 +806,12 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
             pass
 
     if not candidates:
+        _dataset_log("INFO", "No nested archives found", {"dest": str(dest_dir)})
         return 0
+    _dataset_log("INFO", "Found nested archives", {
+        "dest": str(dest_dir),
+        "archives": [p.name for p in candidates],
+    })
 
     def _safe_tar_extract(tf: "_tarfile.TarFile", extract_to: "Path") -> int:
         """Extract tar members, stripping absolute/rooted paths to prevent
@@ -709,6 +848,10 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
         extract_to = arc.parent  # extract beside the archive file
 
         state["message"] = f"Extracting nested archive: {arc.name} ..."
+        _dataset_log("INFO", "Extracting nested archive", {
+            "archive": arc.name,
+            "extract_to": str(extract_to),
+        })
         pct = progress_start + int((idx / len(candidates)) * (progress_end - progress_start))
         state["progress"] = pct
 
@@ -746,9 +889,17 @@ def _extract_nested_archives(dest_dir, state: dict, progress_start: int = 70, pr
 
             arc.unlink(missing_ok=True)
             extracted += 1
+            _dataset_log("INFO", "Nested archive extracted", {
+                "archive": arc.name,
+                "extract_to": str(extract_to),
+            })
         except Exception as _ne:
             # Don't fail the whole job for one nested archive
             state["message"] = f"Warning: could not extract {arc.name}: {_ne}"
+            _dataset_log("WARNING", "Nested archive extraction failed", {
+                "archive": arc.name,
+                "error": str(_ne),
+            })
 
     return extracted
 
@@ -776,6 +927,10 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
     img_dir = _resolve_idd_source_images_dir(root)
     train_list = _resolve_idd_split_file(root, "train")
     val_list   = _resolve_idd_split_file(root, "val")
+    _dataset_log("INFO", "Starting IDD VOC-to-COCO conversion", {
+        "root": str(root),
+        "layout": _idd_layout_snapshot(root),
+    })
 
     # Flatten optional IDD_Detection/ wrapper subdirectory
     if not (ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None):
@@ -810,9 +965,24 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
                 img_dir    = _resolve_idd_source_images_dir(root)
                 train_list = _resolve_idd_split_file(root, "train")
                 val_list   = _resolve_idd_split_file(root, "val")
+                _dataset_log("INFO", "Flattened IDD wrapper during VOC conversion", {
+                    "root": str(root),
+                    "layout": _idd_layout_snapshot(root),
+                })
 
     if not (ann_dir.exists() and img_dir is not None and train_list is not None and val_list is not None):
+        _dataset_log("WARNING", "IDD VOC source not found for conversion", {
+            "root": str(root),
+            "layout": _idd_layout_snapshot(root),
+        })
         return False
+
+    _dataset_log("INFO", "Resolved IDD VOC source", {
+        "ann_dir": str(ann_dir),
+        "img_dir": str(img_dir),
+        "train_list": str(train_list),
+        "val_list": str(val_list),
+    })
 
     cats = [
         "person", "rider", "car", "truck", "bus", "motorcycle",
@@ -913,6 +1083,12 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
         }
         with open(coco_ann_dir / f"idd_detection_{split}.json", "w") as f:
             _json.dump(out, f)
+        _dataset_log("INFO", "Wrote IDD COCO annotation file", {
+            "split": split,
+            "images": len(imgs),
+            "annotations": len(anns),
+            "path": str(coco_ann_dir / f"idd_detection_{split}.json"),
+        })
 
     # ── Pass 3: move images — directory rename where possible ────────────────
     # Preferred: if JPEGImages/ has train/ and val/ subdirs, rename the whole
@@ -973,6 +1149,12 @@ def _auto_convert_idd_voc_to_coco(root: Path, state: dict) -> bool:
 
     out_train = coco_ann_dir / "idd_detection_train.json"
     out_val   = coco_ann_dir / "idd_detection_val.json"
+    _dataset_log("INFO", "Finished IDD VOC-to-COCO conversion", {
+        "root": str(root),
+        "layout": _idd_layout_snapshot(root),
+        "train_json": str(out_train),
+        "val_json": str(out_val),
+    })
     return out_train.exists() and out_val.exists()
 
 
@@ -1347,6 +1529,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
 
         arc = _Path(archive_path)
         lower = arc.name.lower()
+        _dataset_log("INFO", "Starting dataset extraction", {
+            "dataset": name,
+            "archive": str(arc),
+            "dest": str(dest),
+        })
 
         state["message"] = "Detecting archive format..."
         state["progress"] = 55
@@ -1387,6 +1574,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     state["progress"] = 60
                     zf.extractall(dest, members=filtered)
                     state["progress"] = 85
+                    _dataset_log("INFO", "Primary zip extraction finished", {
+                        "dataset": name,
+                        "dest": str(dest),
+                        "entries": len(filtered),
+                    })
             except zipfile.BadZipFile:
                 is_zip_valid = False
 
@@ -1407,6 +1599,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                         state["progress"] = 60
                         tf.extractall(dest, members=filtered_tar, filter="data")
                         state["progress"] = 85
+                        _dataset_log("INFO", "Primary tar extraction finished", {
+                            "dataset": name,
+                            "dest": str(dest),
+                            "entries": len(filtered_tar),
+                        })
                 except _tarfile.TarError as _te:
                     raise ValueError(
                         f"Archive '{arc.name}' is not a valid zip or tar archive. "
@@ -1419,60 +1616,43 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     f"(magic bytes: {magic[:4].hex()})"
                 )
         state["progress"] = 88
+        if name.lower() == "idd":
+            _dataset_log("INFO", "IDD layout after primary extraction", _idd_layout_snapshot(dest))
 
-        # Flatten single-root-dir extraction (e.g. IDD_Detection/ or idd/ inside tar)
-        # Strategy:
-        #   1. If a well-known IDD wrapper dir exists at dest root, always flatten it.
-        #   2. Otherwise fall back to the classic "only one subdir" heuristic.
-        _IDD_WRAPPER_NAMES = {"idd_detection", "idd-detection", "idd detection"}
-        _idd_wrapper = next(
-            (d for d in dest.iterdir()
-             if d.is_dir() and d.name.lower().replace(" ", "_") in _IDD_WRAPPER_NAMES),
-            None,
-        )
-        subdirs = [d for d in dest.iterdir() if d.is_dir()]
-        _flatten_dir = _idd_wrapper
-        if _flatten_dir is None and len(subdirs) == 1:
-            inner_candidate = subdirs[0]
-            # Only flatten if the single subdir is not already a final-layout dir
-            _FINAL_DIRS = {"images", "labels", "annotations", "jpegimages"}
-            if inner_candidate.name.lower() not in _FINAL_DIRS:
-                _flatten_dir = inner_candidate
-        if _flatten_dir is not None:
-            state["message"] = f"Flattening {_flatten_dir.name}/ into dataset root..."
-            for item in list(_flatten_dir.iterdir()):
-                target = dest / item.name
-                if target.exists():
-                    # Destination already exists — merge directories, skip files
-                    if item.is_dir() and target.is_dir():
-                        for sub in list(item.iterdir()):
-                            sub_target = target / sub.name
-                            if not sub_target.exists():
-                                shutil.move(str(sub), str(sub_target))
-                else:
-                    shutil.move(str(item), str(target))
-            try:
-                shutil.rmtree(str(_flatten_dir))
-            except Exception:
-                pass
+        if name.lower() == "idd":
+            while _flatten_idd_wrapper_dir(dest, state):
+                _dataset_log("INFO", "IDD layout after wrapper flatten", _idd_layout_snapshot(dest))
 
         # Extract any nested archives (e.g. idd-detection.tar.gz inside the zip)
         nested = _extract_nested_archives(dest, state, progress_start=70, progress_end=88)
         if nested:
             state["message"] = f"Extracted {nested} nested archive(s). Building index..."
+        if name.lower() == "idd":
+            _dataset_log("INFO", "IDD layout after nested archive extraction", _idd_layout_snapshot(dest))
+            while _flatten_idd_wrapper_dir(dest, state):
+                _dataset_log("INFO", "IDD layout after post-nested wrapper flatten", _idd_layout_snapshot(dest))
 
         _coco_loaded_data: dict = {}
         if name.lower() == "idd":
+            _dataset_log("INFO", "Evaluating IDD layout before conversion", _idd_layout_snapshot(dest))
             has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
             has_images = _idd_has_split_images(dest)
             has_voc_source = _idd_has_voc_source(dest)
-            if not has_json and has_voc_source and not has_images:
+            _dataset_log("INFO", "IDD conversion decision snapshot", {
+                "dataset": name,
+                "has_json": has_json,
+                "has_images": has_images,
+                "has_voc_source": has_voc_source,
+                "layout": _idd_layout_snapshot(dest),
+            })
+            if not has_json and has_voc_source:
                 state["message"] = "Converting IDD dataset to COCO JSON..."
                 state["progress"] = max(state.get("progress", 70), 70)
                 if not _auto_convert_idd_voc_to_coco(dest, state):
                     raise ValueError("IDD archive is missing both COCO JSON annotations and convertible VOC source files")
                 has_json = any(p.suffix.lower() == ".json" for p in (dest / "annotations").glob("*.json")) if (dest / "annotations").exists() else False
                 has_images = _idd_has_split_images(dest)
+                _dataset_log("INFO", "IDD layout after VOC conversion", _idd_layout_snapshot(dest))
 
             # Auto-convert COCO → YOLO .txt; capture pre-loaded JSON to reuse below
             if has_json:
@@ -1483,6 +1663,11 @@ def _bg_extract(name: str, archive_path: str, state: dict):
                     raise ValueError(_conv_result.get("message") or _conv_result.get("error") or "IDD label conversion failed")
                 if _conv_result and isinstance(_conv_result.get("loaded_data"), dict):
                     _coco_loaded_data = _conv_result["loaded_data"]
+                _dataset_log("INFO", "IDD COCO-to-YOLO conversion result", {
+                    "dataset": name,
+                    "result": _conv_result,
+                    "layout": _idd_layout_snapshot(dest),
+                })
             elif has_images:
                 state["message"] = "No annotations found. Building image index from extracted files..."
                 state["progress"] = 91
@@ -1517,11 +1702,23 @@ def _bg_extract(name: str, archive_path: str, state: dict):
         state["status"] = "complete"
         state["progress"] = 100
         state["message"] = "Dataset ready!"
+        _dataset_log("INFO", "Dataset extraction complete", {
+            "dataset": name,
+            "dest": str(dest),
+            "layout": _idd_layout_snapshot(dest) if name.lower() == "idd" else {"root": str(dest)},
+        })
 
     except Exception as e:
         state["status"] = "error"
         state["progress"] = 0
         state["message"] = f"Extraction failed: {e}"
+        _dataset_log("ERROR", "Dataset extraction failed", {
+            "dataset": name,
+            "archive": archive_path,
+            "dest": str(DATASETS_DIR / name),
+            "error": str(e),
+            "layout": _idd_layout_snapshot(DATASETS_DIR / name) if name.lower() == "idd" and (DATASETS_DIR / name).exists() else {},
+        })
     finally:
         try:
             arc_path = _Path(archive_path)
