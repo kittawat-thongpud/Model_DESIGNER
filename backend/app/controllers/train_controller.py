@@ -7,6 +7,8 @@ from pydantic import BaseModel
 
 from ..schemas.job_schema import TrainRequest
 from ..services import ultra_trainer, job_storage, model_storage, system_metrics
+from ..services.preflight import validate_train_request
+from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/train", tags=["Training"])
 
@@ -37,6 +39,29 @@ async def start_training(req: TrainRequest):
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []
+
+    # Preflight validation — check dataset, YAML, config, and disk space before
+    # admitting the job to avoid failures that surface mid-training.
+    dataset_name = config.get("data", "")
+    preflight = validate_train_request(
+        model_id=req.model_id,
+        yaml_path=str(yaml_path) if yaml_path else "",
+        dataset_name=dataset_name,
+        config=config,
+        weight_id=config.get("pretrained") or None,
+        partition_configs=partition_configs,
+    )
+    if preflight.warnings:
+        for w in preflight.warnings:
+            logger.log("training", "WARNING", f"Preflight warning for {dataset_name}: {w}",
+                       {"model_id": req.model_id, "dataset": dataset_name})
+    if not preflight.ok:
+        raise HTTPException(400, {
+            "message": "Preflight validation failed",
+            "errors": preflight.errors,
+            "warnings": preflight.warnings,
+            "info": preflight.info,
+        })
 
     job_id = ultra_trainer.start_training(
         model_id=req.model_id,

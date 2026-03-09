@@ -106,6 +106,7 @@ def create_app() -> FastAPI:
             {"name": "Weights", "description": "Trained weight management"},
             {"name": "Logs", "description": "System-wide structured logs"},
             {"name": "Streaming", "description": "Server-Sent Events for real-time updates"},
+            {"name": "Health", "description": "Liveness and readiness probes"},
         ],
     )
 
@@ -135,12 +136,13 @@ def create_app() -> FastAPI:
     from .controllers.inference_controller import router as inference_router
     from .controllers.benchmark_controller import router as benchmark_router
     from .controllers.package_controller import router as package_router
+    from .controllers.health_controller import router as health_router
 
     for router in (
         model_router, module_router, train_router,
         dataset_router, dataset_samples_router, job_router,
         weight_router, snapshot_router, log_router, stats_router, stream_router, system_router,
-        inference_router, benchmark_router, package_router,
+        inference_router, benchmark_router, package_router, health_router,
     ):
         application.include_router(router)
 
