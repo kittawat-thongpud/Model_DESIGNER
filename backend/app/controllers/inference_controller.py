@@ -31,6 +31,7 @@ HISTORY_FILE = INFERENCE_DIR / "history.jsonl"
 _INFERENCE_CONFIG = get_inference_config()
 _INFERENCE_DEFAULTS = _INFERENCE_CONFIG.get("defaults", {})
 _INFERENCE_LIMITS = _INFERENCE_CONFIG.get("limits", {})
+CENTRAL_INFERENCE_DEFAULT_TOP_K = int(_INFERENCE_DEFAULTS.get("top_k", 5))
 MAX_HISTORY = int(_INFERENCE_LIMITS.get("history_max_entries", 200))
 
 
@@ -74,7 +75,7 @@ def _load_history(limit: int = int(_INFERENCE_LIMITS.get("history_default_limit"
     return entries
 
 
-def _extract_top_classes(boxes_data, i: int, names: dict, top_k: int = 5) -> list[dict]:
+def _extract_top_classes(boxes_data, i: int, names: dict, top_k: int = CENTRAL_INFERENCE_DEFAULT_TOP_K) -> list[dict]:
     """
     Extract top-k class scores for detection i.
 
@@ -117,7 +118,7 @@ def _extract_top_classes(boxes_data, i: int, names: dict, top_k: int = 5) -> lis
 
 def _results_to_response(results, weight_id: str, source_name: str,
                           elapsed_ms: float, image_count: int,
-                          top_k: int = 5) -> dict:
+                          top_k: int = CENTRAL_INFERENCE_DEFAULT_TOP_K) -> dict:
     """Convert Ultralytics Results list to API response dict."""
     detections_per_image = []
     all_classes: dict[int, dict] = {}

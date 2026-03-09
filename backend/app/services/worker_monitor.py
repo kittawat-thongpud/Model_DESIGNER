@@ -44,7 +44,7 @@ class WorkerMonitor:
         )
         self._monitor_thread.start()
     
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = _DEFAULT_STOP_TIMEOUT) -> None:
         """Stop the background monitor thread.
         
         Args:

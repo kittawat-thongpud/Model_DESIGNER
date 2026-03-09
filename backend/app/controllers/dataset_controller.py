@@ -24,12 +24,16 @@ from ..schemas.dataset_schema import (
     SplitConfig, UpdatePartitionMethod, CreatePartition,
     SplitPartitionItem, SplitPartitionBody,
 )
+from ..services.config_service import get_datasets_config
 from ..services.dataset_registry import get_all_datasets, get_dataset_info as _get_info
 from ..services import coco_converter
 from ..plugins.loader import get_dataset_plugin
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/datasets", tags=["Datasets"])
+_DATASET_API_DEFAULTS = get_datasets_config().get("api_defaults", {})
+_DATASET_SPLIT_SEED = int(_DATASET_API_DEFAULTS.get("split_seed", 42))
+_DATASET_PARTITION_METHOD = str(_DATASET_API_DEFAULTS.get("partition_method", "stratified"))
 
 
 # ── Shared archive-detection helper ──────────────────────────────────────────
@@ -77,7 +81,7 @@ async def get_dataset_info(name: str):
 
 
 @router.get("/{name}/preview", summary="Preview dataset samples")
-async def preview_dataset(name: str, count: int = 8):
+async def preview_dataset(name: str, count: int = int(_DATASET_API_DEFAULTS.get("preview_count", 8))):
     """Return a few sample images as base64-encoded PNGs."""
     import base64
     import io
@@ -1456,10 +1460,10 @@ def _load_split_config(name: str) -> dict:
     raw = json.loads(p.read_text())
     if "val_fraction" in raw and "train_to_val" not in raw:
         vf = raw.get("val_fraction", 0.0)
-        return {**_DEFAULT_SPLIT, "seed": raw.get("seed", 42),
+        return {**_DEFAULT_SPLIT, "seed": raw.get("seed", _DATASET_SPLIT_SEED),
                 "train_to_val": round(vf * 100)}
     if "train_pct" in raw and "train_to_val" not in raw:
-        return {**_DEFAULT_SPLIT, "seed": raw.get("seed", 42)}
+        return {**_DEFAULT_SPLIT, "seed": raw.get("seed", _DATASET_SPLIT_SEED)}
     return raw
 
 
@@ -1502,7 +1506,7 @@ def _compute_transfer_counts(cfg: dict, orig_train: int, orig_test: int, orig_va
 
 def _apply_transfers(cfg: dict, n_train: int, n_test: int, n_val: int = 0):
     """Return (train_indices, val_indices, test_indices) into a ConcatDataset([train, test, val])."""
-    seed = cfg.get("seed", 42)
+    seed = cfg.get("seed", _DATASET_SPLIT_SEED)
     rng = np.random.RandomState(seed)
 
     train_shuf = rng.permutation(n_train).tolist()
@@ -1599,9 +1603,9 @@ PARTITION_METHODS = ("random", "stratified", "round_robin", "iterative")
 def _load_partition_config(name: str) -> dict:
     p = _partition_config_path(name)
     if not p.exists():
-        return {"seed": 42, "method": "stratified", "partitions": []}
+        return {"seed": _DATASET_SPLIT_SEED, "method": _DATASET_PARTITION_METHOD, "partitions": []}
     cfg = json.loads(p.read_text())
-    cfg.setdefault("method", "stratified")
+    cfg.setdefault("method", _DATASET_PARTITION_METHOD)
     return cfg
 
 
@@ -1747,8 +1751,8 @@ def _build_partition_cache(name: str) -> dict | None:
     is_detection = getattr(ds_info, 'task_type', 'classification') == 'detection'
 
     cfg = _load_partition_config(name)
-    seed = cfg.get("seed", 42)
-    method = cfg.get("method", "stratified")
+    seed = cfg.get("seed", _DATASET_SPLIT_SEED)
+    method = cfg.get("method", _DATASET_PARTITION_METHOD)
     parts = cfg.get("partitions", [])
 
     # Effective split sizes after transfers
@@ -1896,7 +1900,7 @@ def compute_partition_indices(
     seed: int,
     partitions: list[dict],
     labels: list[int] | None = None,
-    method: str = "stratified",
+    method: str = _DATASET_PARTITION_METHOD,
 ) -> dict[str, list[int]]:
     """Compute deterministic index sets for each partition + master.
 
@@ -2106,8 +2110,8 @@ def _partition_summary(name: str) -> dict:
     if not ds:
         return {}
     cfg = _load_partition_config(name)
-    seed = cfg.get("seed", 42)
-    method = cfg.get("method", "stratified")
+    seed = cfg.get("seed", _DATASET_SPLIT_SEED)
+    method = cfg.get("method", _DATASET_PARTITION_METHOD)
     parts = cfg.get("partitions", [])
 
     cache = _get_or_build_cache(name)

@@ -5,6 +5,11 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 from typing import Any
 
+from ..services.config_service import get_datasets_config
+
+
+_DATASET_API_DEFAULTS = get_datasets_config().get("api_defaults", {})
+
 
 class DatasetInfo(BaseModel):
     """Dataset metadata returned by dataset plugins."""
@@ -22,7 +27,7 @@ class DatasetInfo(BaseModel):
 
 class SplitConfig(BaseModel):
     """Configuration for dataset train/val/test split redistribution."""
-    seed: int = Field(42, ge=0)
+    seed: int = Field(int(_DATASET_API_DEFAULTS.get("split_seed", 42)), ge=0)
     train_to_val: int = Field(0, ge=0, le=100)
     train_to_test: int = Field(0, ge=0, le=100)
     test_to_train: int = Field(0, ge=0, le=100)

@@ -15,11 +15,13 @@ from pathlib import Path
 
 from ..config import WEIGHTS_DIR
 from .base_storage import BaseJsonStorage
+from .config_service import get_weights_config
 
 
 # ── Storage instance (folder-per-weight, JSON file = meta.json) ────────────
 
 _store = BaseJsonStorage(WEIGHTS_DIR, folder_mode="meta.json")
+_WEIGHTS_API_DEFAULTS = get_weights_config().get("api_defaults", {})
 
 
 # ── Path helpers ────────────────────────────────────────────────────────────────────────
@@ -157,7 +159,7 @@ def save_edit_meta(
     _store.save(weight_id, meta)
 
 
-def get_lineage(weight_id: str, max_depth: int = 20) -> list[dict]:
+def get_lineage(weight_id: str, max_depth: int = int(_WEIGHTS_API_DEFAULTS.get("lineage_max_depth", 20))) -> list[dict]:
     """Walk the parent chain and return a list from oldest ancestor to current."""
     chain: list[dict] = []
     visited: set[str] = set()

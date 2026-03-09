@@ -14,7 +14,7 @@ from ..schemas.weight_schema import (
     ExtractRequest, TransferRequest, AutoMapRequest,
     ApplyMapRequest, CreateEmptyRequest,
 )
-from ..services.config_service import get_export_config, get_model_config
+from ..services.config_service import get_export_config, get_model_config, get_weights_config
 from ..services import weight_storage, weight_transfer, weight_import, model_storage
 from ..plugins.loader import all_weight_source_plugins
 from .. import logging_service as logger
@@ -22,6 +22,7 @@ from .. import logging_service as logger
 router = APIRouter(prefix="/api/weights", tags=["Weights"])
 _EXPORT_DEFAULTS = get_export_config().get("defaults", {})
 _MODEL_DEFAULTS = get_model_config().get("defaults", {})
+_WEIGHTS_VISUALIZATION = get_weights_config().get("visualization", {})
 
 
 @router.post("/create-empty", summary="Create an empty weight from a model")
@@ -693,7 +694,7 @@ async def compat_check(weight_id: str, body: CompatCheckRequest):
 # ── Layer Detail (histogram, stats, heatmap) ─────────────────────────────
 
 @router.get("/{weight_id}/layer-detail", summary="Get detailed stats for a weight parameter")
-async def layer_detail(weight_id: str, key: str, bins: int = 50):
+async def layer_detail(weight_id: str, key: str, bins: int = int(_WEIGHTS_VISUALIZATION.get("layer_detail_histogram_bins", 50))):
     """Return histogram, statistics, and optional 2D heatmap data for a
     specific weight tensor identified by its state_dict key.
 

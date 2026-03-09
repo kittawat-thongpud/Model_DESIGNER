@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/benchmark", tags=["Benchmark"])
 BENCHMARK_DIR = DATA_DIR / "benchmarks"
 BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
 _BENCHMARK_DEFAULTS = get_benchmark_config().get("defaults", {})
+_BENCHMARK_API_DEFAULTS = get_benchmark_config().get("api_defaults", {})
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -559,7 +560,7 @@ async def run_benchmark(req: BenchmarkRequest):
 
 
 @router.get("/history", summary="List past benchmark results")
-async def list_benchmarks(weight_id: str | None = None, limit: int = 20):
+async def list_benchmarks(weight_id: str | None = None, limit: int = int(_BENCHMARK_API_DEFAULTS.get("history_limit", 20))):
     """Return recent benchmark results, optionally filtered by weight_id."""
     results = []
     for path in sorted(BENCHMARK_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):

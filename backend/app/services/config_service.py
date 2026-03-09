@@ -131,6 +131,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "runtime": {
             "remote_fs_workers": 2,
             "remote_fs_ultralytics_threads": 1,
+            "nan_retries": 3,
+            "worker_stop_join_timeout_s": 10.0,
+            "resume_existing_worker_join_timeout_s": 30.0,
+            "child_cleanup_wait_timeout_s": 3.0,
         },
     },
     "cache": {
@@ -171,6 +175,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "iou": 0.6,
             "imgsz": 640,
             "batch": 16,
+        },
+        "api_defaults": {
+            "history_limit": 20,
         },
     },
     "inference": {
@@ -228,9 +235,29 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "encode_pool_workers": 4,
         },
     },
+    "datasets": {
+        "api_defaults": {
+            "preview_count": 8,
+            "split_seed": 42,
+            "partition_method": "stratified",
+        },
+        "plugins": {
+            "coco": {
+                "download_max_workers": 4,
+            },
+        },
+    },
     "weight_snapshots": {
         "defaults": {
             "thumbnail_max_size": 48,
+        },
+    },
+    "weights": {
+        "api_defaults": {
+            "lineage_max_depth": 20,
+        },
+        "visualization": {
+            "layer_detail_histogram_bins": 50,
         },
     },
     "streaming": {
@@ -370,8 +397,16 @@ def get_dataset_samples_config() -> dict[str, Any]:
     return get_effective_config().get("dataset_samples", {})
 
 
+def get_datasets_config() -> dict[str, Any]:
+    return get_effective_config().get("datasets", {})
+
+
 def get_weight_snapshots_config() -> dict[str, Any]:
     return get_effective_config().get("weight_snapshots", {})
+
+
+def get_weights_config() -> dict[str, Any]:
+    return get_effective_config().get("weights", {})
 
 
 def get_streaming_config() -> dict[str, Any]:

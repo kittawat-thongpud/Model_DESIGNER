@@ -38,6 +38,13 @@ from . import task_queue
 from . import platform_caps
 
 _MODEL_DEFAULTS = get_model_config().get("defaults", {})
+_TRAINING_RUNTIME_DEFAULTS = get_training_config().get("runtime", {})
+_TRAINING_REMOTE_FS_WORKERS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_workers", 2))
+_TRAINING_REMOTE_FS_ULTRALYTICS_THREADS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_ultralytics_threads", 1))
+_TRAINING_NAN_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("nan_retries", 3))
+_TRAINING_WORKER_STOP_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("worker_stop_join_timeout_s", 10.0))
+_TRAINING_RESUME_EXISTING_WORKER_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("resume_existing_worker_join_timeout_s", 30.0))
+_TRAINING_CHILD_CLEANUP_WAIT_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("child_cleanup_wait_timeout_s", 3.0))
 
 
 # ── Active jobs tracking ─────────────────────────────────────────────────────
@@ -190,7 +197,7 @@ def stop_training(job_id: str) -> bool:
     # Wait for thread to finish (with timeout) to ensure proper cleanup
     if thread_to_join and thread_to_join.is_alive():
         job_storage.append_job_log(job_id, "INFO", "Stopping worker thread...")
-        thread_to_join.join(timeout=10.0)  # Wait max 10 seconds
+        thread_to_join.join(timeout=_TRAINING_WORKER_STOP_JOIN_TIMEOUT_S)
         if thread_to_join.is_alive():
             job_storage.append_job_log(job_id, "WARNING", "Worker thread did not stop in time")
     
@@ -277,7 +284,7 @@ def _restart_job(job_id: str, config: dict) -> None:
     # Wait for existing thread to finish (with timeout)
     if existing_thread and existing_thread.is_alive():
         job_storage.append_job_log(job_id, "INFO", "Waiting for previous worker to finish...")
-        existing_thread.join(timeout=30.0)  # Wait max 30 seconds
+        existing_thread.join(timeout=_TRAINING_RESUME_EXISTING_WORKER_JOIN_TIMEOUT_S)
         if existing_thread.is_alive():
             job_storage.append_job_log(job_id, "WARNING", "Previous worker did not finish in time, proceeding anyway")
 
@@ -1095,9 +1102,8 @@ def _training_worker(
                 f"dataset_root={str(ds_root)!r}, fstype={fstype!r}",
             )
         if is_remote_fs:
-            training_runtime_config = get_training_config().get("runtime", {})
-            remote_fs_workers = int(training_runtime_config.get("remote_fs_workers", 2))
-            remote_fs_ultralytics_threads = int(training_runtime_config.get("remote_fs_ultralytics_threads", 1))
+            remote_fs_workers = _TRAINING_REMOTE_FS_WORKERS
+            remote_fs_ultralytics_threads = _TRAINING_REMOTE_FS_ULTRALYTICS_THREADS
 
             # On remote filesystems we keep cache off unless RAM cache was chosen,
             # but we should NOT force workers=0 — use a small worker count instead.
@@ -1407,7 +1413,7 @@ def _training_worker(
             job_storage.append_job_log(job_id, "WARNING", f"Could not patch entrypoint: {e}")
         
         # Retry loop: if loss becomes NaN/Inf mid-epoch, restart immediately from last.pt
-        max_nan_retries = int(config.get("nan_retries", 3) or 3)
+        max_nan_retries = int(config.get("nan_retries", _TRAINING_NAN_RETRIES) or _TRAINING_NAN_RETRIES)
         nan_attempt = 0
         results = None
 
@@ -1618,7 +1624,7 @@ def _training_worker(
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
                 if children:
-                    psutil.wait_procs(children, timeout=3)
+                    psutil.wait_procs(children, timeout=_TRAINING_CHILD_CLEANUP_WAIT_TIMEOUT_S)
                     job_storage.append_job_log(job_id, "INFO", f"Killed {len(children)} child process(es)")
             except Exception as e:
                 job_storage.append_job_log(job_id, "WARNING", f"Child process cleanup warning: {e}")

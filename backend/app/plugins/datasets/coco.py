@@ -21,11 +21,14 @@ from torch.utils.data import Dataset
 from PIL import Image as PILImage
 
 from app.config import DATASETS_DIR
+from app.services.config_service import get_datasets_config
 from ..base import DatasetPlugin
 from ..loader import register_dataset
 
 _COCO_ROOT = DATASETS_DIR / "coco"
 _INDEX_DIR = _COCO_ROOT / "_index"
+_DATASET_PLUGIN_CONFIG = get_datasets_config().get("plugins", {}).get("coco", {})
+_COCO_DOWNLOAD_MAX_WORKERS = int(_DATASET_PLUGIN_CONFIG.get("download_max_workers", 4))
 
 _IMAGE_ZIPS = [
     "http://images.cocodataset.org/zips/train2017.zip",
@@ -304,7 +307,7 @@ class COCOPlugin(DatasetPlugin):
             download_and_extract(url, images_dir, state, f"[?/{total_files}]", file_key=fk)
             _mark_done()
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=_COCO_DOWNLOAD_MAX_WORKERS) as pool:
             futs = {pool.submit(_dl_image_zip, u): u for u in _IMAGE_ZIPS}
             for f in as_completed(futs):
                 f.result()
@@ -314,7 +317,7 @@ class COCOPlugin(DatasetPlugin):
             download_and_extract(url, coco_root, state, f"[?/{total_files}]", file_key=fname)
             _mark_done()
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=_COCO_DOWNLOAD_MAX_WORKERS) as pool:
             futs = {pool.submit(_dl_ann_zip, u): u for u in _ANN_ZIPS}
             for f in as_completed(futs):
                 f.result()
