@@ -29,6 +29,7 @@ from ..loader import register_dataset
 
 _IDD_ROOT = DATASETS_DIR / "idd"
 _INDEX_DIR = _IDD_ROOT / "_index"
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 # Bump this when the index schema changes so stale indexes are auto-rebuilt.
 _INDEX_VERSION = 2
@@ -89,6 +90,15 @@ def _find_img_dir(split: str) -> Path | None:
     return None
 
 
+def _img_dir_has_files(img_dir: Path | None) -> bool:
+    if img_dir is None or not img_dir.exists():
+        return False
+    for p in img_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _IMG_EXTS:
+            return True
+    return False
+
+
 # ── Index builder ─────────────────────────────────────────────────────────────
 
 def _build_index(
@@ -139,7 +149,6 @@ def _build_index(
     def _get_basename_map() -> dict[str, Path]:
         nonlocal _basename_map
         if _basename_map is None:
-            _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
             _basename_map = {}
             for p in img_dir.rglob("*"):
                 if p.is_file() and p.suffix.lower() in _IMG_EXTS:
@@ -211,6 +220,28 @@ def _build_index(
         with open(cats_path, "w") as f:
             json.dump(sorted(data.get("categories", []), key=lambda c: c["id"]), f, indent=1)
 
+    return index
+
+
+def _build_image_only_index(img_dir: Path, index_path: Path) -> list[dict]:
+    index = []
+    for img_file in sorted(p for p in img_dir.rglob("*") if p.is_file() and p.suffix.lower() in _IMG_EXTS):
+        try:
+            with PILImage.open(img_file) as im:
+                w, h = im.size
+        except Exception:
+            continue
+        index.append({
+            "file": str(img_file.relative_to(img_dir)),
+            "w": w,
+            "h": h,
+            "anns": [],
+        })
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": _INDEX_VERSION, "images": index}
+    with open(index_path, "w") as f:
+        json.dump(payload, f, separators=(",", ":"))
     return index
 
 
@@ -398,34 +429,22 @@ class IDDPlugin(DatasetPlugin):
         )
 
     def is_available(self) -> bool:
-        """Fast availability check — no rglob, no full JSON parse.
-
-        Strategy (cheapest first):
-        1. Pre-built index exists and is non-empty  → available.
-        2. Annotation JSON exists (size > 1 KB) AND images dir exists → available.
-           (After conversion the annotation JSON is always present and named
-           idd_detection_train.json; its existence is a reliable sentinel.)
-        """
         if not _IDD_ROOT.exists():
             return False
 
-        # 1. Index already built — fastest possible check (single stat call).
         index_path = _INDEX_DIR / "train_index.json"
         if index_path.exists() and index_path.stat().st_size > 256:
             return True
 
-        # 2. Annotation sentinel + images dir exist.
+        img_dir = _find_img_dir("train")
+        if not _img_dir_has_files(img_dir):
+            return False
+
         ann_path = _find_ann_file("train")
         if ann_path and ann_path.exists() and ann_path.stat().st_size > 1024:
-            img_dir = _find_img_dir("train")
-            if img_dir and img_dir.exists():
-                # Check just the directory is non-empty (single iterdir call)
-                try:
-                    next(img_dir.iterdir())
-                    return True
-                except StopIteration:
-                    pass
-        return False
+            return True
+
+        return True
 
     # ── Index management ──────────────────────────────────────────────────────
 
@@ -455,9 +474,12 @@ class IDDPlugin(DatasetPlugin):
         if index is None:
             ann_path = _find_ann_file(split)
             img_dir = _find_img_dir(split)
-            if not ann_path or not img_dir:
+            if not img_dir or not _img_dir_has_files(img_dir):
                 return []
-            index = _build_index(ann_path, img_dir, index_path)
+            if ann_path:
+                index = _build_index(ann_path, img_dir, index_path)
+            else:
+                index = _build_image_only_index(img_dir, index_path)
 
         with self._lock:
             self._index_cache[split] = index
