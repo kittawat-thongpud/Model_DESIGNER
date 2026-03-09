@@ -27,6 +27,7 @@ from ..schemas.dataset_schema import (
 from ..services.dataset_registry import get_all_datasets, get_dataset_info as _get_info
 from ..services import coco_converter
 from ..plugins.loader import get_dataset_plugin
+from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/datasets", tags=["Datasets"])
 
@@ -476,18 +477,26 @@ async def import_local(name: str):
     def _bg():
         try:
             if key == "idd":
-                try:
-                    ann_dir = dest / "annotations"
-                    has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
-                    yolo_train = (dest / "images" / "train")
-                    yolo_val = (dest / "images" / "val")
-                    has_yolo_images = yolo_train.exists() and yolo_val.exists()
-                    if (not has_json) or (not has_yolo_images):
-                        state["message"] = "Converting IDD dataset to COCO JSON..."
-                        state["progress"] = 25
+                ann_dir = dest / "annotations"
+                has_json = ann_dir.exists() and any(p.suffix.lower() == ".json" for p in ann_dir.glob("*.json"))
+                yolo_train = (dest / "images" / "train")
+                yolo_val = (dest / "images" / "val")
+                has_yolo_images = yolo_train.exists() and yolo_val.exists()
+                if (not has_json) or (not has_yolo_images):
+                    state["message"] = "Converting IDD dataset to COCO JSON..."
+                    state["progress"] = 25
+                    try:
                         _auto_convert_idd_voc_to_coco(dest, state)
-                except Exception:
-                    pass
+                    except Exception as _conv_err:
+                        import traceback as _tb
+                        _detail = _tb.format_exc()
+                        logger.log("dataset", "ERROR",
+                                   "IDD VOC-to-COCO conversion failed",
+                                   {"dataset": key, "dest": str(dest), "error": str(_conv_err)})
+                        state["status"] = "error"
+                        state["progress"] = 0
+                        state["message"] = f"IDD conversion failed: {_conv_err}"
+                        return
 
             state["message"] = "Building index..."
             state["progress"] = 40

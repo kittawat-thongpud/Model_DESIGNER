@@ -119,6 +119,18 @@ def discover_plugins() -> dict[str, int]:
     import pkgutil
     from . import datasets, weight_sources
 
+    # Import logging lazily to avoid circular import at module load time
+    def _log_import_error(pkg_key: str, modname: str, exc: Exception) -> None:
+        try:
+            import traceback as _tb
+            from ..logging_service import log as _log
+            _log("system", "WARNING",
+                 f"Plugin import failed: {pkg_key}.{modname}",
+                 {"plugin_group": pkg_key, "module": modname, "error": str(exc),
+                  "traceback": _tb.format_exc(limit=5)})
+        except Exception:
+            pass  # logging itself must not crash startup
+
     # Import archs package lazily (may not exist before Step 3)
     try:
         from . import archs as _archs_pkg
@@ -130,15 +142,15 @@ def discover_plugins() -> dict[str, int]:
         for importer, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
             try:
                 importlib.import_module(f"{pkg.__name__}.{modname}")
-            except Exception:
-                pass
+            except Exception as _e:
+                _log_import_error(key, modname, _e)
 
     if arch_pkg is not None:
         for importer, modname, ispkg in pkgutil.iter_modules(arch_pkg.__path__):
             try:
                 importlib.import_module(f"{arch_pkg.__name__}.{modname}")
-            except Exception:
-                pass
+            except Exception as _e:
+                _log_import_error("archs", modname, _e)
 
     return {
         "datasets": len(_dataset_plugins),
