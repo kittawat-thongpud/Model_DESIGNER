@@ -21,9 +21,20 @@ interface JobConfigurationProps {
 const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName, partitions, modelScale }) => {
   const [showConfig, setShowConfig] = useState(false);
 
-  // Helper to safely access config values
   const getValue = (key: string, defaultValue: any = '-') => {
     return config[key] !== undefined ? config[key] : defaultValue;
+  };
+
+  const formatCacheMode = (value: unknown) => {
+    if (value === true) return 'Disk';
+    if (value === false) return 'None';
+    if (typeof value !== 'string') return '-';
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'auto') return 'Auto';
+    if (normalized === 'ram') return 'RAM';
+    if (normalized === 'disk') return 'Disk';
+    if (normalized === 'none' || normalized === 'off') return 'None';
+    return value;
   };
 
   return (
@@ -47,6 +58,7 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
               <ConfigItem label="Batch Size" value={getValue('batch')} />
               <ConfigItem label="Image Size" value={getValue('imgsz')} />
               <ConfigItem label="Workers" value={getValue('workers')} />
+              <ConfigItem label="Dataset Cache" value={formatCacheMode(getValue('cache', '-'))} />
               <ConfigItem label="Device" value={getValue('device') || 'Auto'} />
               <ConfigItem label="Patience" value={getValue('patience')} />
               <ConfigItem label="Freeze" value={getValue('freeze')} />

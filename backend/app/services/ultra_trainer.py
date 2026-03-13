@@ -39,6 +39,25 @@ from . import platform_caps
 
 _MODEL_DEFAULTS = get_model_config().get("defaults", {})
 _TRAINING_RUNTIME_DEFAULTS = get_training_config().get("runtime", {})
+
+
+def _normalize_requested_cache(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("", "auto"):
+        return None
+    if text in ("none", "off", "false", "0"):
+        return False
+    if text in ("disk", "true", "1"):
+        return True
+    if text == "ram":
+        return "ram"
+    return value
+
+
 _TRAINING_REMOTE_FS_WORKERS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_workers", 2))
 _TRAINING_REMOTE_FS_ULTRALYTICS_THREADS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_ultralytics_threads", 1))
 _TRAINING_NAN_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("nan_retries", 3))
@@ -92,9 +111,123 @@ def _launch_thread(job_id: str, job: dict) -> None:
     )
     with _lock:
         if job_id not in _active_jobs:
-            _active_jobs[job_id] = {"thread": None, "stop": False}
+            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
         _active_jobs[job_id]["thread"] = t
     t.start()
+
+
+def _running_training_job_ids() -> set[str]:
+    running_ids: set[str] = set()
+    with _lock:
+        items = list(_active_jobs.items())
+    for job_id, info in items:
+        thread = info.get("thread")
+        if thread and thread.is_alive():
+            running_ids.add(job_id)
+    return running_ids
+
+
+def _reconcile_training_queue() -> dict[str, int]:
+    return _reconcile_training_queue_with_admission(admit_pending=True)
+
+
+def _reconcile_training_queue_with_admission(admit_pending: bool) -> dict[str, int]:
+    valid_job_ids = {str(job.get("job_id")) for job in job_storage.list_jobs() if job.get("job_id")}
+    running_job_ids = _running_training_job_ids()
+    result = task_queue.reconcile_tasks(
+        task_queue.TaskType.TRAINING,
+        valid_ref_ids=valid_job_ids,
+        running_ref_ids=running_job_ids,
+        admit_pending=admit_pending,
+    )
+    if result.get("stale_running") or result.get("orphan_pending") or result.get("admitted"):
+        from .. import logging_service as _ls
+        _ls.log("training", "WARNING", "Reconciled stale training queue state", result)
+    return result
+
+
+def _sync_queue_task_with_job(job_id: str, admit_pending: bool = True, error: str | None = None) -> None:
+    job = job_storage.load_job(job_id)
+    if not job:
+        return
+    queue_task_id = job.get("queue_task_id")
+    if not queue_task_id:
+        return
+    status = str(job.get("status") or "")
+    if status == "completed":
+        task_queue.complete(queue_task_id)
+        return
+    if status == "failed":
+        task_queue.finalize_task(
+            queue_task_id,
+            task_queue.TaskStatus.FAILED,
+            error=error or str(job.get("message") or "training failed"),
+            admit_pending=admit_pending,
+        )
+        return
+    if status == "stopped":
+        task_queue.finalize_task(
+            queue_task_id,
+            task_queue.TaskStatus.CANCELLED,
+            error=error or str(job.get("message") or "training stopped"),
+            admit_pending=admit_pending,
+        )
+
+
+def _mark_job_stopped(job_id: str, message: str, admit_pending: bool) -> None:
+    job = job_storage.load_job(job_id)
+    if not job:
+        return
+    job["status"] = "stopped"
+    job["message"] = message
+    job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+    job_storage.save_job(job)
+    _publish(job_id, job)
+    job_storage.append_job_log(job_id, "WARNING", message)
+    _sync_queue_task_with_job(job_id, admit_pending=admit_pending, error=message)
+
+
+def _request_stop(job_id: str, reason: str) -> threading.Thread | None:
+    with _lock:
+        info = _active_jobs.get(job_id)
+        if not info:
+            return None
+        info["stop"] = True
+        info["stop_reason"] = reason
+        return info.get("thread")
+
+
+def _consume_stop_reason(job_id: str, default: str) -> str:
+    with _lock:
+        info = _active_jobs.get(job_id)
+        if not info:
+            return default
+        reason = str(info.get("stop_reason") or default)
+        info["stop_reason"] = None
+        return reason
+
+
+def shutdown_training_workers(timeout: float | None = None) -> dict[str, str]:
+    if timeout is None:
+        timeout = _TRAINING_WORKER_STOP_JOIN_TIMEOUT_S
+    with _lock:
+        active = list(_active_jobs.keys())
+    results: dict[str, str] = {}
+    for job_id in active:
+        thread = _request_stop(job_id, "Stopped due to server shutdown")
+        if thread and thread.is_alive():
+            job_storage.append_job_log(job_id, "INFO", "Server shutdown requested - stopping worker thread...")
+            thread.join(timeout=timeout)
+        if thread and thread.is_alive():
+            job_storage.append_job_log(job_id, "WARNING", "Worker thread did not stop before shutdown timeout")
+            results[job_id] = "stop_timeout"
+        else:
+            results[job_id] = "stopped"
+        _mark_job_stopped(job_id, "Stopped due to server shutdown", admit_pending=False)
+        with _lock:
+            _active_jobs.pop(job_id, None)
+    _reconcile_training_queue_with_admission(admit_pending=False)
+    return results
 
 
 def start_training(
@@ -127,6 +260,8 @@ def start_training(
     # Resolve human-readable dataset name from config.data
     _data_arg = config.get("data", "")
     _dataset_name = _data_arg if (_data_arg and dataset_registry.is_image_dataset(_data_arg)) else ""
+
+    _reconcile_training_queue()
 
     # Enqueue training task — respects 1-GPU slot admission (Option A policy)
     queue_task_id, admitted = task_queue.enqueue(
@@ -163,7 +298,7 @@ def start_training(
     if admitted:
         # Slot available — start immediately
         with _lock:
-            _active_jobs[job_id] = {"thread": None, "stop": False}
+            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
         t = threading.Thread(
             target=_training_worker,
             args=(job_id, yaml_path, task, config, partition_configs, model_scale),
@@ -184,15 +319,9 @@ def start_training(
 
 def stop_training(job_id: str) -> bool:
     """Signal a training job to stop and wait for cleanup."""
-    thread_to_join = None
-    
-    with _lock:
-        info = _active_jobs.get(job_id)
-        if info:
-            info["stop"] = True
-            thread_to_join = info.get("thread")
-        else:
-            return False
+    thread_to_join = _request_stop(job_id, "Stopped by user")
+    if thread_to_join is None:
+        return False
     
     # Wait for thread to finish (with timeout) to ensure proper cleanup
     if thread_to_join and thread_to_join.is_alive():
@@ -280,6 +409,7 @@ def _restart_job(job_id: str, config: dict) -> None:
             existing_thread = info.get("thread")
             # Signal existing thread to stop
             info["stop"] = True
+            info["stop_reason"] = "Stopped due to worker restart"
     
     # Wait for existing thread to finish (with timeout)
     if existing_thread and existing_thread.is_alive():
@@ -294,7 +424,7 @@ def _restart_job(job_id: str, config: dict) -> None:
     job_storage.save_job(job)
 
     with _lock:
-        _active_jobs[job_id] = {"thread": None, "stop": False}
+        _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
 
     t = threading.Thread(
         target=_training_worker,
@@ -317,12 +447,9 @@ def _resolve_yaml_for_job(job: dict) -> str:
 
 
 def cleanup_stale_jobs() -> None:
-    """Mark any 'running' jobs as failed on startup (server restart)."""
     for job in job_storage.list_jobs(status="running"):
-        job["status"] = "failed"
-        job["message"] = "Server restarted during training"
-        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
-        job_storage.save_job(job)
+        _mark_job_stopped(str(job["job_id"]), "Stopped due to server restart", admit_pending=False)
+    _reconcile_training_queue_with_admission(admit_pending=False)
 
 
 def cleanup_zombie_workers() -> dict[str, str]:
@@ -352,14 +479,14 @@ def cleanup_zombie_workers() -> dict[str, str]:
             if not thread.is_alive():
                 job = job_storage.load_job(job_id)
                 if job and job.get("status") == "running":
-                    # Thread died but job still running - mark as failed
                     job["status"] = "failed"
                     job["message"] = "Worker thread died unexpectedly"
                     job["completed_at"] = datetime.utcnow().isoformat() + "Z"
                     job_storage.save_job(job)
+                    _publish(job_id, job)
+                    _sync_queue_task_with_job(job_id, admit_pending=True, error="Worker thread died unexpectedly")
                     cleaned[job_id] = "marked_failed"
                 
-                # Remove from active jobs
                 _active_jobs.pop(job_id, None)
     
     return cleaned
@@ -922,6 +1049,11 @@ def _training_worker(
         # Build train kwargs (only valid Ultralytics parameters)
         train_kwargs = {k: v for k, v in config.items() if v != ""}
         train_kwargs["project"] = str(job_dir / "runs")
+        _requested_cache = _normalize_requested_cache(train_kwargs.get("cache", None))
+        if _requested_cache is None:
+            train_kwargs.pop("cache", None)
+        else:
+            train_kwargs["cache"] = _requested_cache
 
         # ── Device validation & multi-GPU setup ──────────────────────────────
         # Strip GPU indices that exceed the actual device count so Ultralytics
@@ -1072,8 +1204,8 @@ def _training_worker(
         # cache=True:   build a .cache label file on first run, reuse after.
         #               On NFS this still saves the re-scan cost for later runs.
         # cache=False:  no caching (fallback for remote FS where .cache write is slow).
-        _user_cache = train_kwargs.get("cache", None)
-        if not _user_cache or str(_user_cache).lower() in ("false", "0", "none", ""):
+        _user_cache = _normalize_requested_cache(train_kwargs.get("cache", None))
+        if _user_cache is None:
             _ddp_gpus = train_kwargs.get("device", None)
             _num_ddp = 1
             try:
@@ -1090,6 +1222,8 @@ def _training_worker(
                 _num_ddp = 1
             _chosen_cache = _select_cache_strategy(ds_root, job_id, is_remote_fs, num_gpus=_num_ddp)
             train_kwargs["cache"] = _chosen_cache
+        else:
+            train_kwargs["cache"] = _user_cache
 
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
         # due to heavy stat()/glob across 100k+ files and/or multiprocessing overhead.
@@ -1572,13 +1706,14 @@ def _training_worker(
 
     except KeyboardInterrupt:
         j = job_storage.load_job(job_id)
+        stop_reason = _consume_stop_reason(job_id, "Stopped by user")
         if j:
             j["status"] = "stopped"
-            j["message"] = "Stopped by user"
+            j["message"] = stop_reason
             j["completed_at"] = datetime.utcnow().isoformat() + "Z"
             job_storage.save_job(j)
             _publish(job_id, j)
-        job_storage.append_job_log(job_id, "WARNING", "Training stopped by user")
+        job_storage.append_job_log(job_id, "WARNING", stop_reason)
 
     except Exception as e:
         j = job_storage.load_job(job_id)
@@ -1656,18 +1791,10 @@ def _training_worker(
         except Exception:
             pass
 
-        # Release the queue slot so the next pending training job can start
-        _qt_id = None
         try:
-            _jrec = job_storage.load_job(job_id)
-            _qt_id = (_jrec or {}).get("queue_task_id")
+            _sync_queue_task_with_job(job_id, admit_pending=True)
         except Exception:
             pass
-        if _qt_id:
-            try:
-                task_queue.complete(_qt_id)
-            except Exception:
-                pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

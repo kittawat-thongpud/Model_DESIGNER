@@ -110,6 +110,7 @@ export interface TrainConfig {
   imgsz: number;
   batch: number;
   workers: number;
+  cache: 'auto' | 'ram' | 'disk' | 'none' | boolean;
   epochs: number;
   patience: number;
   device: string;

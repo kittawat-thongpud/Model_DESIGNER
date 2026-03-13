@@ -179,14 +179,21 @@ def create_app() -> FastAPI:
     # ── Shutdown: stop worker monitor ────────────────────────────────────────
     @application.on_event("shutdown")
     async def shutdown_event():
+        monitoring_config = get_monitoring_config()
+        stop_timeout = float(monitoring_config.get("worker_stop_timeout_s", 5.0))
         try:
             from .services.worker_monitor import stop_monitor
-            monitoring_config = get_monitoring_config()
-            stop_timeout = float(monitoring_config.get("worker_stop_timeout_s", 5.0))
             stop_monitor(timeout=stop_timeout)
             logger.log("system", "INFO", "Worker monitor stopped")
         except Exception as e:
             logger.log("system", "WARNING", f"Worker monitor shutdown failed: {e}")
+        try:
+            from .services.ultra_trainer import shutdown_training_workers
+            stopped = shutdown_training_workers(timeout=stop_timeout)
+            if stopped:
+                logger.log("system", "WARNING", "Training workers stopped for shutdown", stopped)
+        except Exception as e:
+            logger.log("system", "WARNING", f"Training worker shutdown failed: {e}")
 
     # ── Frontend static files (production) ───────────────────────────────────
     from pathlib import Path as _Path

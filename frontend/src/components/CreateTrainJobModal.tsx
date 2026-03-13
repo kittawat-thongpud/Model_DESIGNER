@@ -20,6 +20,7 @@ const DEFAULT_CONFIG: TrainConfig = {
   imgsz: 640,
   batch: 16,
   workers: 8,
+  cache: 'auto',
   epochs: 100,
   patience: 100,
   device: '',
@@ -100,6 +101,13 @@ const OFFICIAL_YOLO_MODELS: ModelSummary[] = [
     updated_at: new Date().toISOString(),
   },
 ];
+
+const CACHE_OPTIONS = [
+  { value: 'auto', label: 'Auto', hint: 'Let backend choose the best cache mode' },
+  { value: 'ram', label: 'RAM', hint: 'Preload dataset into memory for fastest reads' },
+  { value: 'disk', label: 'Disk', hint: 'Use disk-backed dataset cache files' },
+  { value: 'none', label: 'None', hint: 'Disable dataset cache entirely' },
+] as const;
 
 export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: Props) {
   const [customModels, setCustomModels] = useState<ModelSummary[]>([]);
@@ -746,6 +754,20 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                           <NumberInput label="Batch Size" value={config.batch} onChange={v => updateConfig('batch', v)} />
                           <NumberInput label="Image Size" value={config.imgsz} onChange={v => updateConfig('imgsz', v)} />
                           <NumberInput label="Workers" value={config.workers} onChange={v => updateConfig('workers', v)} />
+                          <div>
+                            <label className="block text-xs font-medium text-slate-400 mb-1">Dataset Cache</label>
+                            <select
+                              value={typeof config.cache === 'string' ? config.cache : (config.cache ? 'disk' : 'none')}
+                              onChange={e => updateConfig('cache', e.target.value as TrainConfig['cache'])}
+                              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-emerald-500 focus:outline-none"
+                            >
+                              {CACHE_OPTIONS.map(option => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label} — {option.hint}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
                           <TextInput label="Device" value={config.device} onChange={v => updateConfig('device', v)} placeholder="e.g. 0,1 or cpu" />
                         </div>
 

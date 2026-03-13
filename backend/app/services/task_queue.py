@@ -154,6 +154,42 @@ def on_task_admitted(callback: Callable[[str, str], None]) -> None:
     _admission_callbacks.append(callback)
 
 
+def _fire_admission_callbacks(admitted: list[tuple[str, str]]) -> None:
+    for task_id, task_type in admitted:
+        for cb in _admission_callbacks:
+            try:
+                cb(task_id, task_type)
+            except Exception:
+                pass
+
+
+def _admit_pending_locked(conn: sqlite3.Connection, task_type: str, now: float) -> list[tuple[str, str]]:
+    admitted: list[tuple[str, str]] = []
+    limit = _CONCURRENCY_LIMITS.get(task_type, 1)
+    running_count = conn.execute(
+        "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
+        (task_type,),
+    ).fetchone()[0]
+    while running_count < limit:
+        next_task = conn.execute(
+            """SELECT task_id FROM queue_tasks
+               WHERE task_type=? AND status='pending'
+               ORDER BY priority DESC, created_at ASC
+               LIMIT 1""",
+            (task_type,),
+        ).fetchone()
+        if not next_task:
+            break
+        next_id = next_task["task_id"]
+        conn.execute(
+            "UPDATE queue_tasks SET status='running', started_at=? WHERE task_id=?",
+            (now, next_id),
+        )
+        admitted.append((next_id, task_type))
+        running_count += 1
+    return admitted
+
+
 def enqueue(
     task_type: str,
     ref_id: str | None = None,
@@ -173,6 +209,7 @@ def enqueue(
     now = time.time()
     limit = _CONCURRENCY_LIMITS.get(task_type, 1)
 
+    admitted_callbacks: list[tuple[str, str]] = []
     with _db() as conn:
         running_count = conn.execute(
             "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
@@ -197,55 +234,17 @@ def enqueue(
                 now if admitted else None,
             ),
         )
-
+        if admitted:
+            admitted_callbacks.append((task_id, task_type))
+    if admitted_callbacks:
+        _fire_admission_callbacks(admitted_callbacks)
     return task_id, admitted
 
 
 def complete(task_id: str, error: str | None = None) -> None:
     """Mark a task as completed (or failed) and try to admit the next pending task."""
-    now = time.time()
     final_status = TaskStatus.FAILED if error else TaskStatus.COMPLETED
-
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT task_type FROM queue_tasks WHERE task_id=?", (task_id,)
-        ).fetchone()
-        if not row:
-            return
-        task_type = row["task_type"]
-
-        conn.execute(
-            "UPDATE queue_tasks SET status=?, completed_at=?, error=? WHERE task_id=?",
-            (final_status.value, now, error, task_id),
-        )
-
-        # Try to admit next pending task of same type
-        limit = _CONCURRENCY_LIMITS.get(task_type, 1)
-        running_count = conn.execute(
-            "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
-            (task_type,),
-        ).fetchone()[0]
-
-        if running_count < limit:
-            next_task = conn.execute(
-                """SELECT task_id FROM queue_tasks
-                   WHERE task_type=? AND status='pending'
-                   ORDER BY priority DESC, created_at ASC
-                   LIMIT 1""",
-                (task_type,),
-            ).fetchone()
-            if next_task:
-                next_id = next_task["task_id"]
-                conn.execute(
-                    "UPDATE queue_tasks SET status='running', started_at=? WHERE task_id=?",
-                    (now, next_id),
-                )
-                # Fire callbacks outside the lock
-                for cb in _admission_callbacks:
-                    try:
-                        cb(next_id, task_type)
-                    except Exception:
-                        pass
+    finalize_task(task_id, final_status, error=error, admit_pending=True)
 
 
 def cancel(task_id: str) -> bool:
@@ -277,6 +276,122 @@ def get_task(task_id: str) -> dict | None:
         except Exception:
             pass
         return d
+
+
+def list_tasks(
+    task_type: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    import json as _json
+    clauses = []
+    params: list[Any] = []
+    if task_type:
+        clauses.append("task_type=?")
+        params.append(task_type)
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = (
+        "SELECT task_id, task_type, ref_id, status, priority, payload, error, "
+        "created_at, started_at, completed_at "
+        f"FROM queue_tasks {where_sql} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
+    with _db() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["payload"] = _json.loads(item.get("payload") or "{}")
+        except Exception:
+            pass
+        results.append(item)
+    return results
+
+
+def finalize_task(
+    task_id: str,
+    final_status: TaskStatus | str,
+    error: str | None = None,
+    admit_pending: bool = True,
+) -> bool:
+    now = time.time()
+    if isinstance(final_status, str):
+        final_status = TaskStatus(final_status)
+    admitted_callbacks: list[tuple[str, str]] = []
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT task_type, status FROM queue_tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        current_status = row["status"]
+        if current_status in (
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        ):
+            return False
+        task_type = row["task_type"]
+        conn.execute(
+            "UPDATE queue_tasks SET status=?, completed_at=?, error=? WHERE task_id=?",
+            (final_status.value, now, error, task_id),
+        )
+        if admit_pending and current_status == TaskStatus.RUNNING.value:
+            admitted_callbacks = _admit_pending_locked(conn, task_type, now)
+    if admitted_callbacks:
+        _fire_admission_callbacks(admitted_callbacks)
+    return True
+
+
+def reconcile_tasks(
+    task_type: str,
+    valid_ref_ids: set[str],
+    running_ref_ids: set[str] | None = None,
+    admit_pending: bool = True,
+) -> dict[str, int]:
+    now = time.time()
+    admitted_callbacks: list[tuple[str, str]] = []
+    stale_running = 0
+    orphan_pending = 0
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT task_id, ref_id, status
+               FROM queue_tasks
+               WHERE task_type=? AND status IN ('running', 'pending')""",
+            (task_type,),
+        ).fetchall()
+        for row in rows:
+            ref_id = row["ref_id"]
+            status = row["status"]
+            if status == TaskStatus.RUNNING:
+                if ref_id not in valid_ref_ids or (running_ref_ids is not None and ref_id not in running_ref_ids):
+                    conn.execute(
+                        "UPDATE queue_tasks SET status='failed', completed_at=?, error=? WHERE task_id=?",
+                        (now, "stale queue task reconciled", row["task_id"]),
+                    )
+                    stale_running += 1
+            elif status == TaskStatus.PENDING:
+                if ref_id not in valid_ref_ids:
+                    conn.execute(
+                        "UPDATE queue_tasks SET status='cancelled', completed_at=? WHERE task_id=?",
+                        (now, row["task_id"]),
+                    )
+                    orphan_pending += 1
+        if admit_pending:
+            admitted_callbacks = _admit_pending_locked(conn, task_type, now)
+    if admitted_callbacks:
+        _fire_admission_callbacks(admitted_callbacks)
+    return {
+        "stale_running": stale_running,
+        "orphan_pending": orphan_pending,
+        "admitted": len(admitted_callbacks),
+    }
 
 
 def queue_status(task_type: str | None = None) -> dict:

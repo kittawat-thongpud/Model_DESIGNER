@@ -151,10 +151,10 @@ def validate_train_request(
         result.fail(f"workers must be a non-negative integer, got: {workers!r}")
 
     cache = config.get("cache")
-    if cache not in (None, False, True, "ram", "disk", "off", ""):
+    if cache not in (None, False, True, "auto", "ram", "disk", "none", "off", ""):
         result.warn(
             f"cache='{cache}' is not a recognized value. "
-            "Supported values: False, 'ram', 'disk'."
+            "Supported values: 'auto', 'ram', 'disk', 'none'."
         )
 
     # ── 5. Disk space estimate (coarse) ──────────────────────────────────────

@@ -14,6 +14,7 @@ export default function TrainingConfigDisplay({ config }: TrainingConfigDisplayP
         { key: 'imgsz', label: 'Image Size' },
         { key: 'batch', label: 'Batch Size' },
         { key: 'workers', label: 'Workers' },
+        { key: 'cache', label: 'Dataset Cache' },
         { key: 'hsv_h', label: 'HSV Hue' },
         { key: 'hsv_s', label: 'HSV Saturation' },
         { key: 'hsv_v', label: 'HSV Value' },
@@ -93,7 +94,13 @@ export default function TrainingConfigDisplay({ config }: TrainingConfigDisplayP
     if (value === null || value === undefined) return 'N/A';
     if (typeof value === 'boolean') return value ? 'Yes' : 'No';
     if (typeof value === 'number') return value.toString();
-    if (typeof value === 'string') return value || 'N/A';
+    if (typeof value === 'string') {
+      if (value === 'auto') return 'Auto';
+      if (value === 'ram') return 'RAM';
+      if (value === 'disk') return 'Disk';
+      if (value === 'none') return 'None';
+      return value || 'N/A';
+    }
     if (Array.isArray(value)) return value.join(', ');
     return String(value);
   };

@@ -369,6 +369,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
           <div className="flex gap-4 text-right">
              <StatBadge label="Best mAP50" value={`${(bestMap * 100).toFixed(2)}%`} color="text-emerald-400" />
              <StatBadge label="Progress" value={`${job.epoch} / ${job.total_epochs}`} color="text-white" subtext="Epochs" />
+             <StatBadge label="Model Scale" value={job.model_scale ? job.model_scale.toUpperCase() : '-'} color="text-violet-400" />
              <StatBadge label="Time Elapsed" value={timeElapsed} color="text-blue-400" />
           </div>
         </div>

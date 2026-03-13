@@ -28,6 +28,22 @@ def _default_train_workers() -> int:
         return int(_training_default("workers", 4))
 
 
+def _default_train_cache() -> str | bool:
+    raw = _training_default("cache", "auto")
+    if isinstance(raw, bool):
+        return raw
+    val = str(raw).strip().lower()
+    if val in ("", "auto"):
+        return "auto"
+    if val in ("ram", "disk", "none"):
+        return val
+    if val in ("off", "false", "0"):
+        return "none"
+    if val in ("true", "1"):
+        return True
+    return "auto"
+
+
 class TrainConfig(BaseModel):
     """
     Ultralytics model.train() configuration.
@@ -40,6 +56,7 @@ class TrainConfig(BaseModel):
     imgsz: int = int(_training_default("imgsz", 640))
     batch: int = int(_training_default("batch", 16))
     workers: int = Field(default_factory=_default_train_workers)
+    cache: Literal["auto", "ram", "disk", "none"] | bool = Field(default_factory=_default_train_cache)
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = int(_training_default("epochs", 100))
