@@ -13,3 +13,4 @@ ultralytics>=8.0.0
 thop>=0.1.1 
 scipy
 gdown>=4.6.0
+mcp[cli]>=1.0.0

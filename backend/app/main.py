@@ -147,6 +147,14 @@ def create_app() -> FastAPI:
     ):
         application.include_router(router)
 
+    # ── MCP (Model Context Protocol) interface ───────────────────────────────
+    try:
+        from .mcp.server import create_mcp_app
+        application.mount("/mcp", create_mcp_app())
+        logger.log("system", "INFO", "MCP server mounted at /mcp")
+    except Exception as e:
+        logger.log("system", "WARNING", f"MCP server mount failed: {e}")
+
     # ── Startup: discover plugins ───────────────────────────────────────────
     from .plugins.loader import discover_plugins
     counts = discover_plugins()
