@@ -622,4 +622,4 @@ def create_mcp_app():
       GET  /mcp/sse       — SSE stream (MCP client connects here)
       POST /mcp/messages  — JSON-RPC message posting
     """
-    return mcp.sse_app(mount_path="/mcp")
+    return mcp.sse_app(mount_path="/")

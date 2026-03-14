@@ -151,9 +151,19 @@ def create_app() -> FastAPI:
     try:
         from .mcp.server import create_mcp_app
         application.mount("/mcp", create_mcp_app())
-        logger.log("system", "INFO", "MCP server mounted at /mcp")
+        logger.log("system", "INFO", "MCP server mounted successfully", {
+            "mount_path": "/mcp",
+            "sse_endpoint": "/mcp/sse",
+            "message_endpoint": "/mcp/messages/",
+            "notes": "Connect MCP clients to the SSE endpoint",
+        })
     except Exception as e:
-        logger.log("system", "WARNING", f"MCP server mount failed: {e}")
+        logger.log("system", "WARNING", "MCP server mount failed", {
+            "mount_path": "/mcp",
+            "sse_endpoint": "/mcp/sse",
+            "message_endpoint": "/mcp/messages/",
+            "error": str(e),
+        })
 
     # ── Startup: discover plugins ───────────────────────────────────────────
     from .plugins.loader import discover_plugins

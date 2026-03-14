@@ -12,6 +12,8 @@ MCP interface ถูก mount ไว้ใน backend server เดิม ไม
 | Message (JSON-RPC) | `http://localhost:8000/mcp/messages/` |
 
 > Port 8000 คือ default ของ backend (`run.py`) — เปลี่ยนได้ถ้าสั่ง `--port` อื่น
+>
+> หมายเหตุ: ตัว MCP app ถูก mount ใต้ `/mcp` ใน FastAPI แต่ภายใน FastMCP ใช้ root mount path (`/`) เพื่อหลีกเลี่ยง bug path ซ้ำแบบ `/mcp/mcp/messages/`
 
 ---
 

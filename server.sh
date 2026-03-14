@@ -16,7 +16,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-${SCRIPT_DIR}}"
 LOG_FILE="${APP_DIR}/server.log"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
+PORT=8000
 
+kill_port() {
+    PID=$(lsof -ti:${PORT})
+    if [ ! -z "$PID" ]; then
+        echo "⚠️  Port ${PORT} is in use. Killing process ${PID}..."
+        kill -9 $PID
+        sleep 1
+        echo "✅ Port ${PORT} cleared."
+    fi
+}
 # Fall back to system python if venv not present
 if [ ! -f "${VENV_PYTHON}" ]; then
     VENV_PYTHON="$(which python3)"
@@ -26,6 +36,7 @@ CMD="cd ${APP_DIR} && bash run.sh 2>&1 | tee ${LOG_FILE}"
 
 case "${1}" in
     start)
+        kill_port
         if tmux has-session -t "${SESSION}" 2>/dev/null; then
             echo "⚠️  Session '${SESSION}' is already running."
             echo "   Use: ./server.sh attach  — to view it"
@@ -84,6 +95,7 @@ case "${1}" in
             tmux kill-session -t "${SESSION}"
             sleep 1
         fi
+        kill_port
         tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
         sleep 1
         if tmux has-session -t "${SESSION}" 2>/dev/null; then
