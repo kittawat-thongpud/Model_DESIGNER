@@ -10,6 +10,8 @@ Mount via FastAPI:
     app.mount("/mcp", create_mcp_app())
 """
 from __future__ import annotations
+import socket
+import subprocess
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -25,6 +27,75 @@ from .tools import training as _training
 
 # ── Server instance ──────────────────────────────────────────────────────────
 
+def _detect_local_ipv4_addresses() -> list[str]:
+    candidates: set[str] = {"127.0.0.1", "0.0.0.0"}
+
+    try:
+        host_entries = socket.gethostbyname_ex(socket.gethostname())[2]
+        for ip in host_entries:
+            if ip:
+                candidates.add(ip)
+    except Exception:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip:
+                candidates.add(ip)
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if "inet" not in parts:
+                    continue
+                try:
+                    inet_idx = parts.index("inet")
+                    cidr = parts[inet_idx + 1]
+                    ip = cidr.split("/", 1)[0].strip()
+                    if ip:
+                        candidates.add(ip)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return sorted(candidates)
+
+
+def _build_transport_security() -> TransportSecuritySettings:
+    allowed_hosts = [
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+    ]
+    allowed_origins = [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
+
+    for ip in _detect_local_ipv4_addresses():
+        if ip != "127.0.0.1":
+            allowed_hosts.append(f"{ip}:*")
+            allowed_origins.append(f"http://{ip}:*")
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
 mcp = FastMCP(
     name="model-designer",
     instructions=(
@@ -33,25 +104,7 @@ mcp = FastMCP(
         "All list tools default to summary view to reduce token usage. "
         "Pass view='detail' to get full records."
     ),
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "127.0.0.1:*",
-            "localhost:*",
-            "[::1]:*",
-            "0.0.0.0:*",
-            "10.46.136.183:*",
-            "10.46.136.189:*",
-        ],
-        allowed_origins=[
-            "http://127.0.0.1:*",
-            "http://localhost:*",
-            "http://[::1]:*",
-            "http://0.0.0.0:*",
-            "http://10.46.136.183:*",
-            "http://10.46.136.189:*",
-        ],
-    ),
+    transport_security=_build_transport_security(),
 )
 
 
