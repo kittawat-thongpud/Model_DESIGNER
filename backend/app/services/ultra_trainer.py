@@ -187,6 +187,27 @@ def _mark_job_stopped(job_id: str, message: str, admit_pending: bool) -> None:
     _sync_queue_task_with_job(job_id, admit_pending=admit_pending, error=message)
 
 
+def _finalize_existing_queue_task(job: dict, message: str, admit_pending: bool = False) -> None:
+    queue_task_id = job.get("queue_task_id")
+    if not queue_task_id:
+        return
+    try:
+        task = task_queue.get_task(queue_task_id)
+        if not task:
+            return
+        status = str(task.get("status") or "")
+        if status in ("completed", "failed", "cancelled"):
+            return
+        task_queue.finalize_task(
+            queue_task_id,
+            task_queue.TaskStatus.CANCELLED,
+            error=message,
+            admit_pending=admit_pending,
+        )
+    except Exception:
+        pass
+
+
 def _request_stop(job_id: str, reason: str) -> threading.Thread | None:
     with _lock:
         info = _active_jobs.get(job_id)
@@ -401,6 +422,16 @@ def _restart_job(job_id: str, config: dict) -> None:
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
+    # Resolve worker args before mutating queue/job state.
+    # Official YOLO models (model_id like "yolo:yolov8") do not have a custom YAML file.
+    model_id = str(job.get("model_id") or "")
+    yaml_arg = ""
+    if not model_id.startswith("yolo:"):
+        yaml_arg = str(_resolve_yaml_for_job(job))
+    task_arg = job.get("task", str(_MODEL_DEFAULTS.get("task", "detect")))
+    partition_configs_arg = job.get("partition_configs") or []
+    model_scale_arg = job.get("model_scale")
+
     # Check if there's an existing thread for this job_id
     existing_thread = None
     with _lock:
@@ -418,23 +449,41 @@ def _restart_job(job_id: str, config: dict) -> None:
         if existing_thread.is_alive():
             job_storage.append_job_log(job_id, "WARNING", "Previous worker did not finish in time, proceeding anyway")
 
-    job["status"] = "pending"
-    job["message"] = "Queued"
-    job["completed_at"] = None
-    job_storage.save_job(job)
-
-    with _lock:
-        _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
-
-    t = threading.Thread(
-        target=_training_worker,
-        args=(job_id, str(_resolve_yaml_for_job(job)), job.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
-              config, job.get("partition_configs") or [], job.get("model_scale")),
-        daemon=False,  # Changed to non-daemon for proper cleanup
+    _reconcile_training_queue()
+    _finalize_existing_queue_task(job, "Cancelled due to job restart", admit_pending=False)
+    queue_task_id, admitted = task_queue.enqueue(
+        task_queue.TaskType.TRAINING,
+        ref_id=job_id,
+        payload={
+            "model_id": job.get("model_id"),
+            "model_name": job.get("model_name"),
+            "task": job.get("task"),
+            "restart": True,
+        },
     )
-    with _lock:
-        _active_jobs[job_id]["thread"] = t
-    t.start()
+
+    job["config"] = config
+    job["queue_task_id"] = queue_task_id
+    job["status"] = "pending"
+    job["message"] = "Queued" if not admitted else "Starting..."
+    job["completed_at"] = None
+    job["started_at"] = None
+    job_storage.save_job(job)
+    _publish(job_id, job)
+
+    if admitted:
+        with _lock:
+            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
+        t = threading.Thread(
+            target=_training_worker,
+            args=(job_id, yaml_arg, task_arg, config, partition_configs_arg, model_scale_arg),
+            daemon=False,
+        )
+        with _lock:
+            _active_jobs[job_id]["thread"] = t
+        t.start()
+    else:
+        job_storage.append_job_log(job_id, "INFO", "Job restart queued - waiting for training slot")
 
 
 def _resolve_yaml_for_job(job: dict) -> str:
@@ -447,8 +496,13 @@ def _resolve_yaml_for_job(job: dict) -> str:
 
 
 def cleanup_stale_jobs() -> None:
-    for job in job_storage.list_jobs(status="running"):
-        _mark_job_stopped(str(job["job_id"]), "Stopped due to server restart", admit_pending=False)
+    with _lock:
+        _active_jobs.clear()
+    for status in ("running", "pending"):
+        for job in job_storage.list_jobs(status=status):
+            job_id = str(job["job_id"])
+            _finalize_existing_queue_task(job, "Cancelled due to server restart", admit_pending=False)
+            _mark_job_stopped(job_id, "Stopped due to server restart", admit_pending=False)
     _reconcile_training_queue_with_admission(admit_pending=False)
 
 
