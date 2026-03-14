@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ── Tool imports ─────────────────────────────────────────────────────────────
 from .tools import models as _models
@@ -31,6 +32,25 @@ mcp = FastMCP(
         "datasets, training jobs, weights, and benchmarks. "
         "All list tools default to summary view to reduce token usage. "
         "Pass view='detail' to get full records."
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*",
+            "0.0.0.0:*",
+            "10.46.136.183:*",
+            "10.46.136.189:*",
+        ],
+        allowed_origins=[
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            "http://0.0.0.0:*",
+            "http://10.46.136.183:*",
+            "http://10.46.136.189:*",
+        ],
     ),
 )
 
