@@ -68,11 +68,14 @@ class SystemLogMiddleware(BaseHTTPMiddleware):
     """Auto-logs every HTTP request with method, path, status, and duration."""
 
     async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/mcp/"):
+            return await call_next(request)
+
         start = time.time()
         response = await call_next(request)
         duration_ms = round((time.time() - start) * 1000, 1)
 
-        path = request.url.path
         if path in ("/docs", "/redoc", "/openapi.json", "/favicon.ico"):
             return response
 
