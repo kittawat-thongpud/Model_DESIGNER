@@ -17,6 +17,8 @@ APP_DIR="${APP_DIR:-${SCRIPT_DIR}}"
 LOG_FILE="${APP_DIR}/server.log"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
 PORT=8000
+export MCP_ALLOWED_HOSTS="${MCP_ALLOWED_HOSTS:-rase*,*.ts.net}"
+export MCP_ALLOWED_ORIGINS="${MCP_ALLOWED_ORIGINS:-http://rase*:*,https://rase*:*,http://*.ts.net:*,https://*.ts.net:*}"
 
 kill_port() {
     PID=$(lsof -ti:${PORT})

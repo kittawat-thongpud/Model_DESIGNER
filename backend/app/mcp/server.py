@@ -10,6 +10,7 @@ Mount via FastAPI:
     app.mount("/mcp", create_mcp_app())
 """
 from __future__ import annotations
+import fnmatch
 import os
 import socket
 import subprocess
@@ -17,8 +18,46 @@ from urllib.parse import urlparse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from ..config import CORS_ORIGINS
+
+def _matches_host_pattern(value: str, pattern: str) -> bool:
+    if pattern.endswith(":*"):
+        base_pattern = pattern[:-2]
+        if ":" not in value:
+            return False
+        host_only = value.rsplit(":", 1)[0]
+        return fnmatch.fnmatchcase(host_only, base_pattern)
+    return fnmatch.fnmatchcase(value, pattern)
+
+
+def _matches_origin_pattern(value: str, pattern: str) -> bool:
+    if pattern.endswith(":*"):
+        parsed_value = urlparse(value)
+        parsed_pattern = urlparse(pattern[:-2])
+        if not parsed_value.scheme or not parsed_value.hostname:
+            return False
+        if parsed_pattern.scheme and parsed_value.scheme != parsed_pattern.scheme:
+            return False
+        return fnmatch.fnmatchcase(parsed_value.hostname, parsed_pattern.hostname or "")
+    return fnmatch.fnmatchcase(value, pattern)
+
+
+def _patched_validate_host(self: TransportSecurityMiddleware, host: str | None) -> bool:
+    if not host:
+        return False
+    return any(_matches_host_pattern(host, allowed) for allowed in self.settings.allowed_hosts)
+
+
+def _patched_validate_origin(self: TransportSecurityMiddleware, origin: str | None) -> bool:
+    if not origin:
+        return True
+    return any(_matches_origin_pattern(origin, allowed) for allowed in self.settings.allowed_origins)
+
+
+TransportSecurityMiddleware._validate_host = _patched_validate_host
+TransportSecurityMiddleware._validate_origin = _patched_validate_origin
+
 
 # ── Tool imports ─────────────────────────────────────────────────────────────
 from .tools import models as _models
@@ -108,13 +147,34 @@ def _origins_to_allowed_hosts(origins: list[str]) -> list[str]:
         netloc = parsed.netloc.strip()
         if not netloc:
             continue
-        results.append(netloc if ":" in netloc else f"{netloc}:*")
+        if ":" in netloc:
+            host_only, port = netloc.rsplit(":", 1)
+            if any(ch in host_only for ch in "*?[]"):
+                results.append(f"{host_only}:*")
+            else:
+                results.append(netloc)
+        else:
+            results.append(f"{netloc}:*")
     return results
 
 
 def _parse_csv_env(name: str) -> list[str]:
     raw = os.environ.get(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+DEFAULT_MCP_ALLOWED_HOSTS = [
+    "rase*",
+    "*.ts.net",
+]
+
+
+DEFAULT_MCP_ALLOWED_ORIGINS = [
+    "http://rase*:*",
+    "https://rase*:*",
+    "http://*.ts.net:*",
+    "https://*.ts.net:*",
+]
 
 
 def _build_transport_security() -> TransportSecuritySettings:
@@ -147,9 +207,15 @@ def _build_transport_security() -> TransportSecuritySettings:
             allowed_origins.add(f"https://{base_host}:*")
 
     configured_origins = [origin for origin in CORS_ORIGINS if origin]
+    configured_origins.extend(DEFAULT_MCP_ALLOWED_ORIGINS)
     configured_origins.extend(_parse_csv_env("MCP_ALLOWED_ORIGINS"))
     allowed_origins.update(configured_origins)
     allowed_hosts.update(_origins_to_allowed_hosts(configured_origins))
+
+    for host in DEFAULT_MCP_ALLOWED_HOSTS:
+        pattern = _normalize_host_pattern(host)
+        if pattern:
+            allowed_hosts.add(pattern)
 
     for host in _parse_csv_env("MCP_ALLOWED_HOSTS"):
         pattern = _normalize_host_pattern(host)

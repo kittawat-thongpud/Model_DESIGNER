@@ -21,6 +21,8 @@ $SESSION     = "model-designer"
 $APP_DIR     = $PSScriptRoot
 $LOG_FILE    = Join-Path $APP_DIR "server.log"
 $LAUNCHER    = Join-Path $APP_DIR "pmux_launcher.ps1"
+$env:MCP_ALLOWED_HOSTS = if ([string]::IsNullOrWhiteSpace($env:MCP_ALLOWED_HOSTS)) { "rase*,*.ts.net" } else { $env:MCP_ALLOWED_HOSTS }
+$env:MCP_ALLOWED_ORIGINS = if ([string]::IsNullOrWhiteSpace($env:MCP_ALLOWED_ORIGINS)) { "http://rase*:*,https://rase*:*,http://*.ts.net:*,https://*.ts.net:*" } else { $env:MCP_ALLOWED_ORIGINS }
 
 # Command to run the app inside the launcher
 $CMD = "Set-Location '$APP_DIR'; python run.py *>&1 | Tee-Object -FilePath '$LOG_FILE'"
@@ -53,6 +55,8 @@ $launcherContent = @"
 Set-Location '$AppDir'
 
 $env:PYTHONUTF8 = "1"
+$env:MCP_ALLOWED_HOSTS = "$($env:MCP_ALLOWED_HOSTS)"
+$env:MCP_ALLOWED_ORIGINS = "$($env:MCP_ALLOWED_ORIGINS)"
 $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 python run.py *>&1 | Tee-Object -FilePath '$LogFile'
