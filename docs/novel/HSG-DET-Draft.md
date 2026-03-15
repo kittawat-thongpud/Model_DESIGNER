@@ -119,6 +119,10 @@ The total neck complexity at 1080p:
 
 $$\text{FLOPs}_{neck} = O(HW) + O(K^2 d) \approx \text{PAN cost} + 16.7\text{M ops}$$
 
+In this report, model names written as **HSG-DET [top-k p4, top-k p5]** denote the number of salient feature tokens retained by the Sparse Global Block at the **P4** and **P5** pyramid levels, respectively. For example, **HSG-DET [320,80]** means that the SGB keeps the top 320 tokens from the P4 feature map and the top 80 tokens from the P5 feature map before sparse self-attention is applied. This notation is used throughout the experimental section to distinguish architectural variants that differ only in the sparsity budget assigned to each feature scale.
+
+To make the token budget comparable across model variants, we define the P4 and P5 top-K values as a **percentage of the available spatial tokens** at each feature level. Specifically, we evaluate token-retention ratios of **10%, 20%, 30%, 40%, and 50%**, and convert each ratio into an integer top-K count for the corresponding feature map resolution. Thus, the reported HSG-DET variants represent discrete sparsity schedules in which the global-context branch becomes progressively denser as the retained token percentage increases from 10% to 50%.
+
 ### D. Head: Anchor-Free Decoupled Head
 
 Following YOLOv8 convention, three decoupled branches predict:
@@ -249,6 +253,8 @@ Memory footprint (FP16): ~77 MB weights + ~400–600 MB activations at inference
 | Image size (fine-tune) | 1920 |
 | Augmentation | Mosaic, MixUp, HSV, Flip |
 
+In addition to the optimizer and learning-rate settings, each HSG-DET experiment is indexed by its sparse-token configuration at P4 and P5. We denote each variant as **HSG-DET [top-k p4, top-k p5]**, where the two numbers indicate the retained token counts used by the Sparse Global Block at the corresponding pyramid levels. These values are derived from token-retention ratios of **10% to 50%**, swept in increments of **10%**, so that each reported model corresponds to a controlled increase in global-context capacity rather than an arbitrary manual setting.
+
 ### D. Evaluation Protocol
 
 Standard COCO metrics: mAP@0.5, mAP@0.5:0.95, $\text{AP}_S$ (small), $\text{AP}_M$ (medium), $\text{AP}_L$ (large). Latency measured on NVIDIA T4 GPU, FP16, batch=1, warm-up 100 iterations, averaged over 300 iterations.
@@ -273,6 +279,8 @@ Standard COCO metrics: mAP@0.5, mAP@0.5:0.95, $\text{AP}_S$ (small), $\text{AP}_
 | **HSG-DET (full)** | ✓ | ✓ | — | — |
 
 The ablation isolates contributions of (a) the Sparse Global Block and (b) the one-to-few assignment separately, demonstrating additive improvement.
+
+To improve interpretability, we further recommend reporting the ablation results in the form **HSG-DET [top-k p4, top-k p5] | scale | epoch | optimizer | mAP50 | mAP50-95**, where the top-K pair explicitly identifies the sparse-token budget allocated to the two global-context branches. This presentation makes it easier to analyze whether performance gains arise from larger token-retention ratios, optimizer settings, or model scale, and directly supports comparison across the 10%–50% token-budget sweep.
 
 ---
 

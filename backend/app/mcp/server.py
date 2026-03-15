@@ -10,12 +10,15 @@ Mount via FastAPI:
     app.mount("/mcp", create_mcp_app())
 """
 from __future__ import annotations
+import os
 import socket
 import subprocess
+from urllib.parse import urlparse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from ..config import CORS_ORIGINS
 
 # ── Tool imports ─────────────────────────────────────────────────────────────
 from .tools import models as _models
@@ -73,27 +76,90 @@ def _detect_local_ipv4_addresses() -> list[str]:
     return sorted(candidates)
 
 
+def _detect_local_hostnames() -> list[str]:
+    candidates: set[str] = {"localhost"}
+
+    for value in (socket.gethostname(), socket.getfqdn()):
+        host = str(value or "").strip().lower()
+        if not host:
+            continue
+        candidates.add(host)
+        if "." in host:
+            candidates.add(host.split(".", 1)[0])
+
+    return sorted(candidates)
+
+
+def _normalize_host_pattern(host: str) -> str | None:
+    value = str(host or "").strip()
+    if not value:
+        return None
+    if value.endswith(":*"):
+        return value
+    if ":" in value and not value.startswith("["):
+        return value
+    return f"{value}:*"
+
+
+def _origins_to_allowed_hosts(origins: list[str]) -> list[str]:
+    results: list[str] = []
+    for origin in origins:
+        parsed = urlparse(origin)
+        netloc = parsed.netloc.strip()
+        if not netloc:
+            continue
+        results.append(netloc if ":" in netloc else f"{netloc}:*")
+    return results
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _build_transport_security() -> TransportSecuritySettings:
-    allowed_hosts = [
+    allowed_hosts = {
         "127.0.0.1:*",
         "localhost:*",
         "[::1]:*",
-    ]
-    allowed_origins = [
+    }
+    allowed_origins = {
         "http://127.0.0.1:*",
+        "https://127.0.0.1:*",
         "http://localhost:*",
+        "https://localhost:*",
         "http://[::1]:*",
-    ]
+        "https://[::1]:*",
+    }
 
     for ip in _detect_local_ipv4_addresses():
         if ip != "127.0.0.1":
-            allowed_hosts.append(f"{ip}:*")
-            allowed_origins.append(f"http://{ip}:*")
+            allowed_hosts.add(f"{ip}:*")
+            allowed_origins.add(f"http://{ip}:*")
+            allowed_origins.add(f"https://{ip}:*")
+
+    for host in _detect_local_hostnames():
+        pattern = _normalize_host_pattern(host)
+        if pattern:
+            allowed_hosts.add(pattern)
+            base_host = pattern[:-2] if pattern.endswith(":*") else pattern.split(":", 1)[0]
+            allowed_origins.add(f"http://{base_host}:*")
+            allowed_origins.add(f"https://{base_host}:*")
+
+    configured_origins = [origin for origin in CORS_ORIGINS if origin]
+    configured_origins.extend(_parse_csv_env("MCP_ALLOWED_ORIGINS"))
+    allowed_origins.update(configured_origins)
+    allowed_hosts.update(_origins_to_allowed_hosts(configured_origins))
+
+    for host in _parse_csv_env("MCP_ALLOWED_HOSTS"):
+        pattern = _normalize_host_pattern(host)
+        if pattern:
+            allowed_hosts.add(pattern)
 
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
+        allowed_hosts=sorted(allowed_hosts),
+        allowed_origins=sorted(allowed_origins),
     )
 
 mcp = FastMCP(
