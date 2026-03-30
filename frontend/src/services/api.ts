@@ -14,6 +14,7 @@ import type {
   LogEntry, DashboardStats,
   InferenceResult, InferenceHistoryEntry, InferResult,
   BenchmarkResult, JobCheckpoint,
+  ArchFamily,
 } from '../types';
 
 const API = '';
@@ -66,6 +67,12 @@ export const api = {
   getModelYaml: (id: string) => get<{ model_id: string; yaml: string }>(`/api/models/${id}/yaml`),
   validateModel: (id: string, scale?: string) => post<{ valid: boolean; model_id: string; params: number; gradients: number; flops?: number; layers: number; message: string }>(`/api/models/${id}/validate${scale ? `?scale=${scale}` : ''}`, {}),
   exportModel: (req: ExportRequest) => post<Record<string, unknown>>('/api/models/export', req),
+
+  // ── Arch Plugins ───────────────────────────────────────────────────────
+  listArchPlugins: () => get<ArchFamily[]>('/api/plugins/archs'),
+  getMambaInstallStatus: () => get<{ ok: boolean; status: string; started_at: string | null; finished_at: string | null; error: string | null; log_tail: string[] }>('/api/plugins/mamba_yolo/install-status'),
+  triggerMambaInstall: () => post<{ ok: boolean; status: string; message: string }>('/api/plugins/mamba_yolo/install'),
+  triggerMambaRebuild: () => post<{ ok: boolean; status: string; message: string }>('/api/plugins/mamba_yolo/install?rebuild=true'),
 
   // ── Modules (custom nn.Module blocks) ──────────────────────────────────
   listModules: () => get<ModuleSummary[]>('/api/modules/'),

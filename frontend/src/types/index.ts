@@ -16,7 +16,8 @@ export type PageName =
   | 'weight-editor'
   | 'datasets'
   | 'dataset-detail'
-  | 'inference';
+  | 'inference'
+  | 'plugins';
 
 // ─── Module Designer (custom nn.Module blocks) ──────────────────────────────
 
@@ -186,6 +187,20 @@ export interface EpochMetrics {
   epoch_time: number;
   gpu_memory_mb?: number | null;
   [key: string]: unknown;
+}
+
+export interface ArchScale {
+  scale: string;       // "t", "b", "l", "x", or plugin name for standalone
+  label: string;       // "Tiny (~5 M, ~10 GFLOPs)"
+  plugin_name: string; // "mamba_yolo_t"
+}
+
+export interface ArchFamily {
+  family: string;            // "mamba_yolo", "rtdetr", "hsg_det"
+  display_name: string;      // "Mamba-YOLO", "RT-DETR"
+  task_type: string;
+  description: string;
+  supported_scales: ArchScale[];
 }
 
 export interface JobRecord {

@@ -6,7 +6,7 @@ import { useThemeStore } from '../store/themeStore';
 import {
   LayoutDashboard, Network, Activity, Database,
   Sun, Moon, ArrowUp, PanelLeftClose, PanelLeftOpen, Weight,
-  Workflow, Code2, Microscope,
+  Workflow, Code2, Microscope, Puzzle,
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 
@@ -25,6 +25,7 @@ const MENU_ITEMS: { page: PageName; icon: ReactNode; label: string; section: str
   { page: 'weights', icon: <Weight size={18} />, label: 'Weights', section: 'Operations' },
   { page: 'datasets', icon: <Database size={18} />, label: 'Datasets', section: 'Operations' },
   { page: 'inference', icon: <Microscope size={18} />, label: 'Inference', section: 'Operations' },
+  { page: 'plugins', icon: <Puzzle size={18} />, label: 'Plugins', section: 'System' },
 ];
 
 export default function Sidebar({ currentPage, onNavigate, collapsed, onToggleCollapse }: Props) {

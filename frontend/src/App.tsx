@@ -18,6 +18,7 @@ import DatasetsPage from './pages/DatasetsPage';
 import DatasetDetailPage from './pages/DatasetDetailPage';
 import JobDetailPage from './pages/JobDetailPage';
 import InferencePage from './pages/InferencePage';
+import PluginsPage from './pages/PluginsPage';
 import ToastContainer from './components/ToastContainer';
 import type { PageName } from './types';
 
@@ -122,6 +123,7 @@ export default function App() {
           <DatasetDetailPage datasetName={selectedDatasetName} onBack={handleBackFromDataset} />
         )}
         {currentPage === 'inference' && <InferencePage />}
+        {currentPage === 'plugins' && <PluginsPage />}
       </main>
       <ToastContainer />
     </div>
