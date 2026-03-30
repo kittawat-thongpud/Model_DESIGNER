@@ -52,6 +52,20 @@ kill_port() {
     fi
 }
 
+_service_clear_port() {
+    # Try user-level cleanup first (same behavior as tmux mode)
+    kill_port
+
+    # If another user/service still owns the port, escalate once via sudo.
+    local PID
+    PID=$(lsof -ti:${PORT} 2>/dev/null || true)
+    if [ -n "${PID}" ]; then
+        echo "⚠️  Port ${PORT} still in use after local cleanup. Forcing release with sudo..."
+        sudo fuser -k ${PORT}/tcp >/dev/null 2>&1 || true
+        sleep 1
+    fi
+}
+
 _build_frontend() {
     if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
         echo "📦 Node.js/npm not found — installing via NodeSource (LTS)..."
@@ -133,6 +147,7 @@ case "${1:-}" in
     # ── start ─────────────────────────────────────────────────────────────────
     start)
         if _service_installed; then
+            _service_clear_port
             echo "▶️  Starting systemd service '${SERVICE_NAME}'..."
             sudo systemctl start "${SERVICE_NAME}"
             sleep 1
@@ -162,6 +177,7 @@ case "${1:-}" in
     # ── restart ───────────────────────────────────────────────────────────────
     restart)
         if _service_installed; then
+            _service_clear_port
             echo "🔁 Restarting service '${SERVICE_NAME}'..."
             sudo systemctl restart "${SERVICE_NAME}"
             sleep 1
@@ -232,6 +248,7 @@ case "${1:-}" in
 
         echo "🔁 Restarting server..."
         if _service_installed; then
+            _service_clear_port
             sudo systemctl restart "${SERVICE_NAME}"
             sleep 1
             if systemctl is-active --quiet "${SERVICE_NAME}"; then
