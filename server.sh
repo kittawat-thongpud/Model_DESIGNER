@@ -41,14 +41,33 @@ _service_installed() {
     [ -f "${SERVICE_FILE}" ]
 }
 
+_port_pids() {
+    local pids=""
+    if command -v lsof >/dev/null 2>&1; then
+        pids="$(lsof -tiTCP:${PORT} -sTCP:LISTEN 2>/dev/null || true)"
+    fi
+
+    if [ -z "${pids}" ] && command -v ss >/dev/null 2>&1; then
+        pids="$(ss -ltnp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u)"
+    fi
+
+    echo "${pids}" | xargs -r echo
+}
+
 kill_port() {
-    local PID
-    PID=$(lsof -ti:${PORT} 2>/dev/null || true)
-    if [ -n "${PID}" ]; then
-        echo "⚠️  Port ${PORT} is in use (pid ${PID}). Killing..."
-        kill -9 ${PID}
+    local PIDS
+    PIDS="$(_port_pids)"
+    if [ -n "${PIDS}" ]; then
+        echo "⚠️  Port ${PORT} is in use (pid ${PIDS}). Killing..."
+        kill -9 ${PIDS} 2>/dev/null || true
         sleep 1
+    fi
+
+    PIDS="$(_port_pids)"
+    if [ -z "${PIDS}" ]; then
         echo "✅ Port ${PORT} cleared."
+    else
+        echo "⚠️  Port ${PORT} still in use (pid ${PIDS})."
     fi
 }
 
@@ -57,12 +76,18 @@ _service_clear_port() {
     kill_port
 
     # If another user/service still owns the port, escalate once via sudo.
-    local PID
-    PID=$(lsof -ti:${PORT} 2>/dev/null || true)
-    if [ -n "${PID}" ]; then
+    local PIDS
+    PIDS="$(_port_pids)"
+    if [ -n "${PIDS}" ]; then
         echo "⚠️  Port ${PORT} still in use after local cleanup. Forcing release with sudo..."
         sudo fuser -k ${PORT}/tcp >/dev/null 2>&1 || true
         sleep 1
+        PIDS="$(_port_pids)"
+        if [ -z "${PIDS}" ]; then
+            echo "✅ Port ${PORT} cleared with sudo."
+        else
+            echo "❌ Port ${PORT} is still in use (pid ${PIDS})."
+        fi
     fi
 }
 
