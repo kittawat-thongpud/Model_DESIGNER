@@ -199,14 +199,48 @@ class ModelArchPlugin(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        """Unique machine-readable identifier, e.g. 'hsg_det'."""
+        """Unique machine-readable identifier, e.g. 'mamba_yolo_t'."""
         ...
 
     @property
     @abstractmethod
     def display_name(self) -> str:
-        """Human-readable name for UI, e.g. 'HSG-DET (Medium)'."""
+        """Human-readable name for UI, e.g. 'Mamba-YOLO TINY'."""
         ...
+
+    @property
+    def family(self) -> str:
+        """Group key for models that share an architecture family.
+
+        Plugins with the same family are grouped as one entry in the UI,
+        with scale selection handled by the model-scale selector.
+        Defaults to ``name`` (no grouping) when not overridden.
+        """
+        return self.name
+
+    @property
+    def family_display_name(self) -> str:
+        """UI label for the whole family, e.g. 'Mamba-YOLO'.
+
+        Defaults to ``display_name`` when not overridden.
+        """
+        return self.display_name
+
+    @property
+    def scale(self) -> str | None:
+        """Scale key for this variant within the family, e.g. 't', 'l', 'x'.
+
+        None means this plugin does not participate in scale-grouping.
+        """
+        return None
+
+    @property
+    def scale_label(self) -> str | None:
+        """Human-readable label for this scale, e.g. 'Tiny', 'Large'.
+
+        Used to populate the scale selector in the UI.
+        """
+        return None
 
     @property
     def task_type(self) -> str:
@@ -217,6 +251,16 @@ class ModelArchPlugin(ABC):
     def yaml_path(self) -> "Path":  # type: ignore[name-defined]
         """Absolute path to the Ultralytics-format YAML file."""
         ...
+
+    def preflight_check(self) -> str | None:
+        """Optional pre-training readiness check run before a job is created.
+
+        Return ``None`` if the plugin is ready to train, or a human-readable
+        error string to abort job creation immediately with HTTP 400.
+        This is called in the HTTP request handler so the user gets instant
+        feedback rather than a job that fails seconds after starting.
+        """
+        return None
 
     def register_modules(self) -> None:
         """Inject custom nn.Module classes into ultralytics.nn.modules.

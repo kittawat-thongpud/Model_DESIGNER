@@ -1,157 +1,336 @@
 #!/usr/bin/env bash
-# server.sh — manage Model DESIGNER server session via tmux
+# server.sh — manage Model DESIGNER server (auto: systemd service or tmux)
 #
-# Usage:
-#   ./server.sh start   — start server in background tmux session
-#   ./server.sh attach  — attach to running session (Ctrl+B D to detach)
-#   ./server.sh logs    — tail server log file
-#   ./server.sh stop    — kill server session
-#   ./server.sh status  — show if session is running
-#   ./server.sh restart — restart server without git pull
-#   ./server.sh update  — git pull latest code and restart server
+# Commands:
+#   start             — start server  (service if installed, else tmux)
+#   stop              — stop server
+#   restart           — restart server
+#   update            — git pull + rebuild frontend + restart
+#   status            — show running status and active mode
+#   attach            — attach to tmux session (tmux mode only)
+#   logs              — tail logs  (journalctl in service mode, file in tmux mode)
+#   service-install   — install as systemd service (auto-start on boot)
+#   service-uninstall — remove systemd service
+
+set -euo pipefail
 
 SESSION="model-designer"
-# Auto-detect APP_DIR from script location; allow override via env var
+SERVICE_NAME="model-designer"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-${SCRIPT_DIR}}"
 LOG_FILE="${APP_DIR}/server.log"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
 PORT=8000
+
 export MCP_ALLOWED_HOSTS="${MCP_ALLOWED_HOSTS:-rase*,*.ts.net}"
 export MCP_ALLOWED_ORIGINS="${MCP_ALLOWED_ORIGINS:-http://rase*:*,https://rase*:*,http://*.ts.net:*,https://*.ts.net:*}"
 
-kill_port() {
-    PID=$(lsof -ti:${PORT})
-    if [ ! -z "$PID" ]; then
-        echo "⚠️  Port ${PORT} is in use. Killing process ${PID}..."
-        kill -9 $PID
-        sleep 1
-        echo "✅ Port ${PORT} cleared."
-    fi
-}
 # Fall back to system python if venv not present
 if [ ! -f "${VENV_PYTHON}" ]; then
-    VENV_PYTHON="$(which python3)"
+    VENV_PYTHON="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
 CMD="cd ${APP_DIR} && bash run.sh 2>&1 | tee ${LOG_FILE}"
 
-case "${1}" in
-    start)
-        kill_port
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "⚠️  Session '${SESSION}' is already running."
-            echo "   Use: ./server.sh attach  — to view it"
-            echo "   Use: ./server.sh stop    — to stop it first"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_service_installed() {
+    [ -f "${SERVICE_FILE}" ]
+}
+
+kill_port() {
+    local PID
+    PID=$(lsof -ti:${PORT} 2>/dev/null || true)
+    if [ -n "${PID}" ]; then
+        echo "⚠️  Port ${PORT} is in use (pid ${PID}). Killing..."
+        kill -9 ${PID}
+        sleep 1
+        echo "✅ Port ${PORT} cleared."
+    fi
+}
+
+_build_frontend() {
+    if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+        echo "📦 Node.js/npm not found — installing via NodeSource (LTS)..."
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt-get install -y nodejs
+    fi
+    echo "   Node: $(node --version)  npm: $(npm --version)"
+
+    local FRONTEND_DIR="${APP_DIR}/frontend"
+    if [ -d "${FRONTEND_DIR}" ]; then
+        echo "📦 Installing npm dependencies..."
+        npm --prefix "${FRONTEND_DIR}" install
+        echo "🔨 Building frontend..."
+        if npm --prefix "${FRONTEND_DIR}" run build; then
+            echo "✅ Frontend built successfully."
         else
-            tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
+            echo "❌ Frontend build failed. Aborting."
+            return 1
+        fi
+    else
+        echo "⚠️  No frontend/ directory found — skipping build."
+    fi
+}
+
+
+# ── tmux back-end ─────────────────────────────────────────────────────────────
+
+_tmux_start() {
+    kill_port
+    if tmux has-session -t "${SESSION}" 2>/dev/null; then
+        echo "⚠️  tmux session '${SESSION}' is already running."
+        echo "   Use: ./server.sh attach  — to view"
+        echo "   Use: ./server.sh stop    — to stop first"
+    else
+        tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
+        sleep 1
+        if tmux has-session -t "${SESSION}" 2>/dev/null; then
+            echo "✅ Server started in tmux session '${SESSION}'"
+            echo "   App: http://localhost:${PORT}"
+            echo "   Log: ${LOG_FILE}"
+            echo "   Use: ./server.sh attach  — to view live output"
+        else
+            echo "❌ Session failed to start. Check: cat ${LOG_FILE}"
+        fi
+    fi
+}
+
+_tmux_stop() {
+    if tmux has-session -t "${SESSION}" 2>/dev/null; then
+        tmux kill-session -t "${SESSION}"
+        echo "🛑 tmux session '${SESSION}' stopped."
+    else
+        echo "⚠️  No tmux session '${SESSION}' running."
+    fi
+}
+
+_tmux_restart() {
+    if tmux has-session -t "${SESSION}" 2>/dev/null; then
+        echo "� Stopping tmux session '${SESSION}'..."
+        tmux kill-session -t "${SESSION}"
+        sleep 1
+    fi
+    kill_port
+    tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
+    sleep 1
+    if tmux has-session -t "${SESSION}" 2>/dev/null; then
+        echo "✅ Server restarted (tmux session '${SESSION}')"
+        echo "   Use: ./server.sh logs  — to verify"
+    else
+        echo "❌ Failed to restart. Check: cat ${LOG_FILE}"
+    fi
+}
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+
+    # ── start ─────────────────────────────────────────────────────────────────
+    start)
+        if _service_installed; then
+            echo "▶️  Starting systemd service '${SERVICE_NAME}'..."
+            sudo systemctl start "${SERVICE_NAME}"
             sleep 1
-            if tmux has-session -t "${SESSION}" 2>/dev/null; then
-                echo "✅ Server started in tmux session '${SESSION}'"
-                echo "   App: http://localhost:8000"
-                echo "   Log: ${LOG_FILE}"
-                echo "   Use: ./server.sh attach  — to view live output"
+            if systemctl is-active --quiet "${SERVICE_NAME}"; then
+                echo "✅ Service '${SERVICE_NAME}' is running."
+                echo "   App: http://localhost:${PORT}"
             else
-                echo "❌ Session failed to start. Check: cat ${LOG_FILE}"
+                echo "❌ Service failed to start."
+                echo "   Check: journalctl -u ${SERVICE_NAME} -n 50"
+            fi
+        else
+            _tmux_start
+        fi
+        ;;
+
+    # ── stop ──────────────────────────────────────────────────────────────────
+    stop)
+        if _service_installed; then
+            echo "🛑 Stopping service '${SERVICE_NAME}'..."
+            sudo systemctl stop "${SERVICE_NAME}"
+            echo "✅ Service '${SERVICE_NAME}' stopped."
+        else
+            _tmux_stop
+        fi
+        ;;
+
+    # ── restart ───────────────────────────────────────────────────────────────
+    restart)
+        if _service_installed; then
+            echo "🔁 Restarting service '${SERVICE_NAME}'..."
+            sudo systemctl restart "${SERVICE_NAME}"
+            sleep 1
+            if systemctl is-active --quiet "${SERVICE_NAME}"; then
+                echo "✅ Service '${SERVICE_NAME}' restarted."
+            else
+                echo "❌ Restart failed."
+                echo "   Check: journalctl -u ${SERVICE_NAME} -n 50"
+            fi
+        else
+            _tmux_restart
+        fi
+        ;;
+
+    # ── attach ────────────────────────────────────────────────────────────────
+    attach)
+        if _service_installed; then
+            echo "ℹ️  Running as a systemd service — no tmux session."
+            echo "   Use: ./server.sh logs  — to follow output"
+        else
+            if tmux has-session -t "${SESSION}" 2>/dev/null; then
+                echo "📎 Attaching to '${SESSION}' (Ctrl+B D to detach)..."
+                tmux attach-session -t "${SESSION}"
+            else
+                echo "❌ No session '${SESSION}' running. Use: ./server.sh start"
             fi
         fi
         ;;
-    attach)
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "📎 Attaching to '${SESSION}' (press Ctrl+B then D to detach)..."
-            tmux attach-session -t "${SESSION}"
-        else
-            echo "❌ No session '${SESSION}' running. Use: ./server.sh start"
-        fi
-        ;;
+
+    # ── logs ──────────────────────────────────────────────────────────────────
     logs)
-        if [ -f "${LOG_FILE}" ]; then
-            echo "📄 Tailing ${LOG_FILE} (Ctrl+C to stop)..."
+        if _service_installed; then
+            echo "📄 Streaming journal for '${SERVICE_NAME}' (Ctrl+C to stop)..."
+            journalctl -u "${SERVICE_NAME}" -f --no-pager
+        elif [ -f "${LOG_FILE}" ]; then
+            echo "� Tailing ${LOG_FILE} (Ctrl+C to stop)..."
             tail -f "${LOG_FILE}"
         else
-            echo "❌ Log file not found: ${LOG_FILE}"
+            echo "❌ No log found: ${LOG_FILE}"
         fi
         ;;
-    stop)
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            tmux kill-session -t "${SESSION}"
-            echo "🛑 Session '${SESSION}' stopped."
-        else
-            echo "⚠️  No session '${SESSION}' found."
-        fi
-        ;;
+
+    # ── status ────────────────────────────────────────────────────────────────
     status)
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "✅ Session '${SESSION}' is running."
-            echo "   Use: ./server.sh attach  — to view"
-            echo "   Use: ./server.sh logs    — to tail log"
-            echo "   Use: ./server.sh stop    — to stop"
+        if _service_installed; then
+            echo "── Mode: systemd service ──────────────────────────────────────────────"
+            systemctl status "${SERVICE_NAME}" --no-pager -l || true
         else
-            echo "⛔ Session '${SESSION}' is NOT running."
-            echo "   Use: ./server.sh start   — to start"
+            echo "── Mode: tmux ─────────────────────────────────────────────────────────"
+            if tmux has-session -t "${SESSION}" 2>/dev/null; then
+                echo "✅ Session '${SESSION}' is running."
+                echo "   Use: ./server.sh attach  — to view"
+                echo "   Use: ./server.sh logs    — to tail log"
+                echo "   Use: ./server.sh stop    — to stop"
+            else
+                echo "⛔ Session '${SESSION}' is NOT running."
+                echo "   Use: ./server.sh start"
+            fi
         fi
         ;;
-    restart)
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "🔁 Stopping session '${SESSION}'..."
-            tmux kill-session -t "${SESSION}"
-            sleep 1
-        fi
-        kill_port
-        tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
-        sleep 1
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "✅ Server restarted in tmux session '${SESSION}'"
-            echo "   Use: ./server.sh logs  — to verify"
-        else
-            echo "❌ Failed to restart. Check: cat ${LOG_FILE}"
-        fi
-        ;;
+
+    # ── update ────────────────────────────────────────────────────────────────
     update)
-        echo "🔄 Pulling latest code from git..."
+        echo "🔄 Pulling latest code..."
         git -C "${APP_DIR}" pull
 
-        # ── Install Node.js / npm if missing ──────────────────────────────────
-        if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
-            echo "📦 Node.js/npm not found. Installing via NodeSource (LTS)..."
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-            apt-get install -y nodejs
-        fi
-        echo "   Node: $(node --version)  npm: $(npm --version)"
+        _build_frontend || exit 1
 
-        # ── Build frontend ────────────────────────────────────────────────────
-        FRONTEND_DIR="${APP_DIR}/frontend"
-        if [ -d "${FRONTEND_DIR}" ]; then
-            echo "📦 Installing npm dependencies..."
-            npm --prefix "${FRONTEND_DIR}" install
-            echo "🔨 Building frontend..."
-            npm --prefix "${FRONTEND_DIR}" run build
-            if [ $? -eq 0 ]; then
-                echo "✅ Frontend built successfully."
+        echo "🔁 Restarting server..."
+        if _service_installed; then
+            sudo systemctl restart "${SERVICE_NAME}"
+            sleep 1
+            if systemctl is-active --quiet "${SERVICE_NAME}"; then
+                echo "✅ Service '${SERVICE_NAME}' updated and restarted."
             else
-                echo "❌ Frontend build failed. Aborting restart."
-                exit 1
+                echo "❌ Restart failed."
+                echo "   Check: journalctl -u ${SERVICE_NAME} -n 50"
             fi
         else
-            echo "⚠️  No frontend/ directory found — skipping build."
+            _tmux_restart
+        fi
+        ;;
+
+    # ── service-install ───────────────────────────────────────────────────────
+    service-install)
+        if _service_installed; then
+            echo "⚠️  Service '${SERVICE_NAME}' is already installed (${SERVICE_FILE})."
+            echo "   Use: ./server.sh service-uninstall  — to remove it first"
+            exit 1
         fi
 
-        # ── Restart server ────────────────────────────────────────────────────
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "🔁 Restarting server..."
-            tmux kill-session -t "${SESSION}"
-            sleep 1
-        fi
-        tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
-        sleep 1
-        if tmux has-session -t "${SESSION}" 2>/dev/null; then
-            echo "✅ Server updated and restarted."
-            echo "   Use: ./server.sh logs  — to verify"
+        # Determine the user who should own the service
+        RUN_USER="${SUDO_USER:-$(whoami)}"
+        RUN_GROUP="$(id -gn "${RUN_USER}")"
+        RUN_HOME="$(eval echo "~${RUN_USER}")"
+
+        echo "� Installing systemd service '${SERVICE_NAME}' (user: ${RUN_USER})..."
+
+        sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
+[Unit]
+Description=Model DESIGNER Server
+After=network.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${APP_DIR}
+Environment="HOME=${RUN_HOME}"
+Environment="APP_DIR=${APP_DIR}"
+Environment="MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS}"
+Environment="MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS}"
+ExecStart=/bin/bash ${APP_DIR}/run.sh
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable "${SERVICE_NAME}"
+        sudo systemctl start "${SERVICE_NAME}"
+        sleep 2
+
+        if systemctl is-active --quiet "${SERVICE_NAME}"; then
+            echo "✅ Service '${SERVICE_NAME}' installed, enabled, and running."
+            echo "   App:        http://localhost:${PORT}"
+            echo "   Logs:       ./server.sh logs"
+            echo "   Auto-start: enabled (survives reboot)"
         else
-            echo "❌ Failed to restart. Check: cat ${LOG_FILE}"
+            echo "⚠️  Service installed but failed to start."
+            echo "   Check: journalctl -u ${SERVICE_NAME} -n 50"
         fi
         ;;
-    *)
-        echo "Usage: ./server.sh {start|attach|logs|stop|status|update}"
+
+    # ── service-uninstall ─────────────────────────────────────────────────────
+    service-uninstall)
+        if ! _service_installed; then
+            echo "⚠️  Service '${SERVICE_NAME}' is not installed."
+            exit 1
+        fi
+
+        echo "�️  Removing systemd service '${SERVICE_NAME}'..."
+        sudo systemctl stop    "${SERVICE_NAME}" 2>/dev/null || true
+        sudo systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+        sudo rm -f "${SERVICE_FILE}"
+        sudo systemctl daemon-reload
+
+        echo "✅ Service '${SERVICE_NAME}' removed."
+        echo "   Start in tmux mode with: ./server.sh start"
         ;;
+
+    # ── help ──────────────────────────────────────────────────────────────────
+    *)
+        echo "Usage: ./server.sh <command>"
+        echo ""
+        echo "  start             start server  (service if installed, else tmux)"
+        echo "  stop              stop server"
+        echo "  restart           restart server"
+        echo "  update            git pull + rebuild frontend + restart"
+        echo "  status            show running status and active mode"
+        echo "  attach            attach to tmux session  (tmux mode only)"
+        echo "  logs              tail logs  (journal in service mode, file in tmux mode)"
+        echo "  service-install   install as systemd service (auto-start on boot)"
+        echo "  service-uninstall remove systemd service"
+        ;;
+
 esac

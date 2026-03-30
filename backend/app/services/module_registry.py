@@ -879,6 +879,89 @@ _TORCH_NN_MODULES: list[dict[str, Any]] = [
     },
 ]
 
+# ── Mamba-YOLO custom modules (registered via mamba_yolo package) ────────────
+# These blocks are available when the selective_scan CUDA extension is installed.
+# Training worker calls MambaYOLOPlugin.register_modules() automatically.
+
+_MAMBA_YOLO_MODULES: list[dict[str, Any]] = [
+    {
+        "name": "SimpleStem",
+        "category": "backbone",
+        "description": (
+            "Lightweight convolutional patch-embedding stem (Mamba-YOLO). "
+            "Two stride-2 convolutions: in_ch → mid_ch → out_ch. "
+            "Total spatial stride: 4 (same as ViT PatchEmbed patch_size=4). "
+            "Replaces the standard Conv stem in SSM-based YOLO variants."
+        ),
+        "args": [
+            {"name": "in_ch", "type": "int", "default": 3,
+             "help": "Input channels (3 for RGB)"},
+            {"name": "out_ch", "type": "int", "default": 96,
+             "help": "Output channels"},
+        ],
+        "source": "mamba_yolo",
+    },
+    {
+        "name": "VisionClueMerge",
+        "category": "backbone",
+        "description": (
+            "Spatial-to-channel downsampling block (Mamba-YOLO). "
+            "Gathers 2×2 pixel neighbourhoods into channels (×4), "
+            "then projects to out_ch with 1×1 Conv+BN. Stride=2. "
+            "Used as the down-sampling transition between backbone stages."
+        ),
+        "args": [
+            {"name": "in_ch", "type": "int", "default": 128,
+             "help": "Input channels"},
+            {"name": "out_ch", "type": "int", "default": 256,
+             "help": "Output channels (defaults to in_ch×2)"},
+        ],
+        "source": "mamba_yolo",
+    },
+    {
+        "name": "VSSBlock",
+        "category": "backbone",
+        "description": (
+            "Visual State Space Block (Mamba-YOLO). "
+            "LayerNorm + 2-D Selective State Space (SS2D) + MLP residual. "
+            "Core SSM attention block used throughout backbone stages. "
+            "Requires selective_scan CUDA extension."
+        ),
+        "args": [
+            {"name": "in_channels", "type": "int", "default": 128,
+             "help": "Number of input/output channels"},
+            {"name": "d_state", "type": "int", "default": 16,
+             "help": "SSM state dimension"},
+            {"name": "expand", "type": "int", "default": 2,
+             "help": "Channel expansion factor inside SS2D"},
+            {"name": "drop_path", "type": "float", "default": 0.0,
+             "help": "Stochastic depth rate"},
+        ],
+        "source": "mamba_yolo",
+    },
+    {
+        "name": "XSSBlock",
+        "category": "neck",
+        "description": (
+            "Cross-Stage SS Block (Mamba-YOLO). "
+            "Depthwise-conv pre-mix → VSSBlock → channel-mix output. "
+            "Used in the PAN neck to merge features from two resolution levels "
+            "while applying SSM attention. Replaces C2f in the FPN neck."
+        ),
+        "args": [
+            {"name": "in_channels", "type": "int", "default": 512,
+             "help": "Input channels (concatenated feature channels)"},
+            {"name": "out_channels", "type": "int", "default": 512,
+             "help": "Output channels (defaults to in_channels)"},
+            {"name": "num_blocks", "type": "int", "default": 3,
+             "help": "Number of VSSBlock repetitions"},
+            {"name": "drop_path", "type": "float", "default": 0.0},
+        ],
+        "source": "mamba_yolo",
+    },
+]
+
+
 # ── HSG-DET custom modules (registered via hsg_det package) ─────────────────
 # These blocks must be discovered by Ultralytics before YAML parsing.
 # When the designer generates a YAML that includes these nodes, the training
@@ -923,8 +1006,92 @@ _HSG_DET_MODULES: list[dict[str, Any]] = [
 ]
 
 
+# ── RT-DETR built-in blocks (part of ultralytics.nn.modules) ─────────────────
+# No extra registration needed — these are shipped with Ultralytics.
+
+_RTDETR_MODULES: list[dict[str, Any]] = [
+    {
+        "name": "HGStem",
+        "category": "backbone",
+        "description": (
+            "PPHGNetV2 stem block used in RT-DETR backbone. "
+            "Stacked Conv-BN-ReLU layers with a max-pool downsampler."
+        ),
+        "args": [
+            {"name": "c1", "type": "int", "default": 3, "help": "Input channels"},
+            {"name": "cm", "type": "int", "default": 48, "help": "Mid channels"},
+            {"name": "c2", "type": "int", "default": 128, "help": "Output channels"},
+        ],
+        "source": "ultralytics",
+    },
+    {
+        "name": "HGBlock",
+        "category": "backbone",
+        "description": (
+            "PPHGNetV2 feature extraction block used in RT-DETR backbone. "
+            "Multiple light-weight Conv stages with shortcut aggregation."
+        ),
+        "args": [
+            {"name": "c1", "type": "int", "default": 128, "help": "Input channels"},
+            {"name": "cm", "type": "int", "default": 128, "help": "Mid channels"},
+            {"name": "c2", "type": "int", "default": 512, "help": "Output channels"},
+            {"name": "k", "type": "int", "default": 3, "help": "Kernel size"},
+            {"name": "n", "type": "int", "default": 6, "help": "Number of DW convs"},
+            {"name": "lightconv", "type": "bool", "default": False},
+            {"name": "shortcut", "type": "bool", "default": False},
+            {"name": "act", "type": "str", "default": "ReLU"},
+        ],
+        "source": "ultralytics",
+    },
+    {
+        "name": "AIFI",
+        "category": "neck",
+        "description": (
+            "Attention-based Intra-scale Feature Interaction (RT-DETR). "
+            "Single-scale Transformer encoder that enriches high-level features "
+            "with global context before the Transformer decoder."
+        ),
+        "args": [
+            {"name": "c1", "type": "int", "default": 256, "help": "Input channels"},
+            {"name": "cm", "type": "int", "default": 1024, "help": "FFN hidden dim"},
+            {"name": "num_heads", "type": "int", "default": 8},
+        ],
+        "source": "ultralytics",
+    },
+    {
+        "name": "RepC3",
+        "category": "neck",
+        "description": (
+            "Re-parameterisable C3 block used in RT-DETR hybrid encoder neck. "
+            "Merges features from different scales before the Transformer stage."
+        ),
+        "args": [
+            {"name": "c1", "type": "int", "default": 256, "help": "Input channels"},
+            {"name": "c2", "type": "int", "default": 256, "help": "Output channels"},
+            {"name": "n", "type": "int", "default": 3, "help": "Number of RepConv blocks"},
+            {"name": "e", "type": "float", "default": 1.0, "help": "Channel expansion"},
+        ],
+        "source": "ultralytics",
+    },
+    {
+        "name": "RTDETRDecoder",
+        "category": "head",
+        "description": (
+            "RT-DETR detection head — Transformer decoder with IoU-aware query selection. "
+            "Outputs class probabilities and bounding boxes without NMS."
+        ),
+        "args": [
+            {"name": "nc", "type": "int", "default": 80, "help": "Number of classes"},
+            {"name": "ch", "type": "tuple", "default": [256, 256, 256],
+             "help": "Input channel list from FPN levels"},
+        ],
+        "source": "ultralytics",
+    },
+]
+
+
 def get_all_modules() -> list[dict[str, Any]]:
-    """Return all available modules: built-in + torch.nn + hsg_det + custom."""
+    """Return all available modules: built-in + torch.nn + arch-specific + custom."""
     from . import module_storage
 
     modules = []
@@ -935,6 +1102,14 @@ def get_all_modules() -> list[dict[str, Any]]:
 
     # PyTorch nn.*
     for m in _TORCH_NN_MODULES:
+        modules.append({**m})
+
+    # Mamba-YOLO custom blocks
+    for m in _MAMBA_YOLO_MODULES:
+        modules.append({**m})
+
+    # RT-DETR built-in blocks
+    for m in _RTDETR_MODULES:
         modules.append({**m})
 
     # HSG-DET custom blocks

@@ -4,10 +4,10 @@
  * Extracted from TrainDesignerPage to provide a modal interface for creating
  * training jobs directly from the Training Jobs page.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
-import type { ModelSummary, DatasetInfo, TrainConfig } from '../types';
-import { Play, Settings, Loader2, Search, Layers, X } from 'lucide-react';
+import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily } from '../types';
+import { Play, Settings, Loader2, Search, Layers, X, Download, CheckCircle2 } from 'lucide-react';
 
 interface Props {
   isOpen: boolean;
@@ -102,6 +102,20 @@ const OFFICIAL_YOLO_MODELS: ModelSummary[] = [
   },
 ];
 
+function archFamilyToModelSummary(f: ArchFamily): ModelSummary {
+  return {
+    model_id: `arch:${f.family}`,
+    name: f.display_name,
+    task: f.task_type,
+    layer_count: 0,
+    params: undefined,
+    flops: undefined,
+    input_shape: [3, 640, 640],
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
 const CACHE_OPTIONS = [
   { value: 'auto', label: 'Auto', hint: 'Let backend choose the best cache mode' },
   { value: 'ram', label: 'RAM', hint: 'Preload dataset into memory for fastest reads' },
@@ -111,10 +125,15 @@ const CACHE_OPTIONS = [
 
 export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: Props) {
   const [customModels, setCustomModels] = useState<ModelSummary[]>([]);
+  const [archFamilies, setArchFamilies] = useState<ArchFamily[]>([]);
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [weights, setWeights] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [installStatus, setInstallStatus] = useState<{ status: string; log_tail: string[]; error: string | null } | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const installPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [modelScale, setModelScale] = useState<string>('n');
@@ -126,30 +145,97 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
   // YOLOv8 backbone warm-start selector (for custom/arch models only)
   const [yolov8Backbone, setYolov8Backbone] = useState<string>('');  // '' = disabled, 'yolov8n' etc = enabled
 
+  // ── selective_scan install polling ────────────────────────────────────────
+  const isMambaSelected = selectedModelId?.startsWith('arch:') && selectedModelId?.includes('mamba');
+
+  const startInstallPoll = () => {
+    if (installPollRef.current) return;
+    installPollRef.current = setInterval(async () => {
+      try {
+        const s = await api.getMambaInstallStatus();
+        setInstallStatus({ status: s.status, log_tail: Array.isArray(s.log_tail) ? s.log_tail : [], error: s.error });
+        if (s.status === 'installed') {
+          clearInterval(installPollRef.current!);
+          installPollRef.current = null;
+          setInstalling(false);
+          setStartError(null);
+        } else if (s.status === 'failed') {
+          clearInterval(installPollRef.current!);
+          installPollRef.current = null;
+          setInstalling(false);
+        }
+      } catch { /* ignore */ }
+    }, 3000);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (installPollRef.current) clearInterval(installPollRef.current);
+    };
+  }, []);
+
+  const handleInstall = async () => {
+    setInstalling(true);
+    try {
+      await api.triggerMambaInstall();
+      const s = await api.getMambaInstallStatus();
+      setInstallStatus({ status: s.status, log_tail: s.log_tail, error: s.error });
+      startInstallPoll();
+    } catch (e: any) {
+      setInstalling(false);
+      setInstallStatus(prev => prev ? { ...prev, error: e?.message } : null);
+    }
+  };
+
+  // Auto-start poll if already installing when Mamba is selected
+  useEffect(() => {
+    if (!isMambaSelected) return;
+    api.getMambaInstallStatus().then(s => {
+      setInstallStatus({ status: s.status, log_tail: s.log_tail, error: s.error });
+      if (s.status === 'installing') { setInstalling(true); startInstallPoll(); }
+    }).catch(() => {});
+  }, [isMambaSelected]);
+
   // Auto-select YOLOv8 backbone matching model scale when custom model is selected
   useEffect(() => {
-    if (selectedModelId && !selectedModelId.startsWith('yolo:')) {
+    if (selectedModelId && !selectedModelId.startsWith('yolo:') && !selectedModelId.startsWith('arch:')) {
       setYolov8Backbone(`yolov8${modelScale}`);
     } else {
       setYolov8Backbone('');
     }
   }, [selectedModelId, modelScale]);
   
-  // Merge official YOLO models with custom models
-  const models = [...OFFICIAL_YOLO_MODELS, ...customModels];
+  // Derive the selected arch family (if any)
+  const selectedArchFamily = selectedModelId?.startsWith('arch:')
+    ? archFamilies.find(f => `arch:${f.family}` === selectedModelId) ?? null
+    : null;
+
+  // Merge official YOLO models, arch family models (one per family), and custom models
+  const archFamilyModels = archFamilies.map(archFamilyToModelSummary);
+  const models = [...OFFICIAL_YOLO_MODELS, ...archFamilyModels, ...customModels];
 
   useEffect(() => {
     if (isOpen) {
       setLoading(true);
-      Promise.all([api.listModels(), api.listDatasets(), api.listWeights()])
-        .then(([m, d, w]) => {
+      Promise.all([api.listModels(), api.listDatasets(), api.listWeights(), api.listArchPlugins()])
+        .then(([m, d, w, archs]) => {
           setCustomModels(m ?? []);
           setDatasets(d ?? []);
           setWeights(w ?? []);
+          setArchFamilies(archs ?? []);
         })
         .finally(() => setLoading(false));
     }
   }, [isOpen]);
+
+  // When an arch family is selected, auto-select its first scale
+  const selectedFamilyKey = selectedArchFamily?.family ?? null;
+  useEffect(() => {
+    if (selectedArchFamily && selectedArchFamily.supported_scales.length > 0) {
+      setModelScale(selectedArchFamily.supported_scales[0].scale);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFamilyKey]);
 
   // Calculate scale-specific metrics locally
   const getScaledMetrics = (baseParams?: number, baseFlops?: number, scale: string = 'n') => {
@@ -206,6 +292,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       return;
     }
 
+    setStartError(null);
     setSubmitting(true);
     try {
       const partitionConfigs = Object.entries(partitionSplitConfig)
@@ -223,6 +310,9 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         // Use YOLOv8 with selected scale (e.g., 'yolov8n', 'yolov8s', 'yolov8m', 'yolov8l', 'yolov8x')
         finalConfig.yolo_model = `yolov8${modelScale}`;
         // use_yolo_pretrained is already set by user via radio buttons in UI
+      } else if (selectedModelId.startsWith('arch:')) {
+        // Arch plugin model — backend resolves family + model_scale to the specific plugin
+        // No extra config needed; model_id = "arch:mamba_yolo" + model_scale = "t"
       } else if (yolov8Backbone) {
         // Custom model with YOLOv8 backbone warm-start — pass to backend
         (finalConfig as any).yolov8_backbone = yolov8Backbone;
@@ -244,8 +334,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       setSearchQuery('');
       setPartitionSplitConfig({});
       setYolov8Backbone('');
-    } catch (err) {
-      alert(`Failed to start training: ${err}`);
+    } catch (err: any) {
+      setStartError(err?.message || String(err));
     } finally {
       setSubmitting(false);
     }
@@ -343,17 +433,25 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                               OFFICIAL
                             </span>
                           )}
+                          {m.model_id.startsWith('arch:') && (
+                            <span className="text-[10px] bg-violet-500/20 text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 font-medium">
+                              ARCH
+                            </span>
+                          )}
                           <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">
                             {m.task}
                           </span>
                         </div>
                       </div>
                       <div className="flex items-center gap-3 text-xs text-slate-500">
-                        <span className="flex items-center gap-1"><Layers size={10} /> {m.layer_count} layers</span>
-                        {!m.model_id.startsWith('yolo:') && <span>{new Date(m.updated_at).toLocaleDateString()}</span>}
+                        {!m.model_id.startsWith('arch:') && (
+                          <span className="flex items-center gap-1"><Layers size={10} /> {m.layer_count} layers</span>
+                        )}
+                        {!m.model_id.startsWith('yolo:') && !m.model_id.startsWith('arch:') && <span>{new Date(m.updated_at).toLocaleDateString()}</span>}
                         {m.model_id.startsWith('yolo:') && <span className="text-amber-400">Pretrained on COCO</span>}
+                        {m.model_id.startsWith('arch:') && <span className="text-violet-400">Arch Plugin</span>}
                       </div>
-                      {!m.model_id.startsWith('yolo:') && (
+                      {!m.model_id.startsWith('yolo:') && !m.model_id.startsWith('arch:') && (
                         <div className="mt-1 text-[10px] text-slate-600">
                           Task: <span className="text-slate-500">{m.task}</span>
                         </div>
@@ -379,6 +477,11 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             OFFICIAL YOLO
                           </span>
                         )}
+                        {selectedModelId.startsWith('arch:') && (
+                          <span className="text-[11px] bg-violet-500/20 text-violet-400 px-2 py-1 rounded border border-violet-500/30 font-medium">
+                            ARCH PLUGIN
+                          </span>
+                        )}
                       </h3>
                       <div className="flex items-center gap-4 mt-2 text-sm flex-wrap">
                         {selectedModelId.startsWith('yolo:') && (
@@ -386,19 +489,28 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             ⚡ Pretrained on COCO dataset — ready for transfer learning
                           </span>
                         )}
+                        {selectedModelId.startsWith('arch:') && (
+                          <span className="text-violet-400 text-xs">
+                            🔌 Registered architecture plugin — custom model backbone
+                          </span>
+                        )}
                         <span className="text-slate-500">
                           Task: <span className="text-slate-300">{selectedModel?.task}</span>
                         </span>
-                        {!selectedModelId.startsWith('yolo:') && (
+                        {!selectedModelId.startsWith('yolo:') && !selectedModelId.startsWith('arch:') && (
                           <span className="text-slate-500">
                             ID: <span className="font-mono text-xs text-slate-400">{selectedModelId.substring(0, 8)}</span>
                           </span>
                         )}
                         <span className="text-slate-500">
-                          Scale: <span className="text-emerald-400 font-mono text-xs font-bold">{modelScale.toUpperCase()}</span>
+                          Scale: <span className={`font-mono text-xs font-bold ${selectedArchFamily ? 'text-violet-400' : 'text-emerald-400'}`}>{modelScale.toUpperCase()}</span>
                           {selectedModelId.startsWith('yolo:') && (
                             <span className="text-amber-400 ml-1">(YOLOv8{modelScale})</span>
                           )}
+                          {selectedArchFamily && (() => {
+                            const s = selectedArchFamily.supported_scales.find(sc => sc.scale === modelScale);
+                            return s ? <span className="text-violet-400 ml-1">— {s.label}</span> : null;
+                          })()}
                         </span>
                         {selectedModel?.input_shape && (
                           <span className="text-slate-500">
@@ -422,14 +534,68 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                         })()}
                       </div>
                     </div>
-                    <button
-                      onClick={handleStartTraining}
-                      disabled={submitting || !config.data}
-                      className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2 shadow-lg shadow-emerald-900/20"
-                    >
-                      {submitting ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
-                      Start Training
-                    </button>
+                    <div className="flex flex-col items-end gap-2">
+                      {/* Mamba-YOLO optional CUDA extension panel */}
+                      {isMambaSelected && installStatus !== null && installStatus.status !== 'installed' && (
+                        <div className="bg-slate-900 border border-slate-700 rounded-lg p-3 max-w-sm w-full text-xs space-y-2">
+                          {installStatus.status === 'installing' || installing ? (
+                            <>
+                              <div className="flex items-center gap-2 text-amber-400">
+                                <Loader2 size={14} className="animate-spin" />
+                                <span>Installing selective_scan CUDA extension…</span>
+                              </div>
+                              {installStatus.log_tail.length > 0 && (
+                                <pre className="bg-black/40 rounded p-2 text-slate-400 text-[10px] max-h-20 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                  {installStatus.log_tail.slice(-8).join('\n')}
+                                </pre>
+                              )}
+                              <div className="text-slate-500">Training will start with the PyTorch fallback if not done.</div>
+                            </>
+                          ) : installStatus.status === 'failed' ? (
+                            <>
+                              <div className="flex items-center gap-2 text-amber-400">
+                                <span>⚠</span>
+                                <span>CUDA ext failed — using PyTorch fallback (slower).</span>
+                              </div>
+                              {installStatus.log_tail.length > 0 && (
+                                <pre className="bg-black/40 rounded p-2 text-slate-400 text-[10px] max-h-28 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                                  {installStatus.log_tail.slice(-12).join('\n')}
+                                </pre>
+                              )}
+                              <button onClick={handleInstall} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded text-xs">
+                                <Download size={12} /> Retry Install
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <div className="text-slate-400">
+                                <span className="text-slate-300 font-medium">Optional:</span> CUDA extension speeds up SSM scan (~5–10×).
+                                <br />Training works now with the built-in PyTorch fallback.
+                              </div>
+                              <button onClick={handleInstall} disabled={installing} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white rounded text-xs">
+                                {installing ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                                Install CUDA Extension
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {/* Generic error (non-Mamba) */}
+                      {startError && !isMambaSelected && (
+                        <div className="flex items-start gap-2 bg-red-950/60 border border-red-700/60 text-red-300 text-xs rounded-lg px-3 py-2 max-w-sm">
+                          <span className="mt-0.5 shrink-0">⚠</span>
+                          <span>{startError}</span>
+                        </div>
+                      )}
+                      <button
+                        onClick={handleStartTraining}
+                        disabled={submitting || !config.data}
+                        className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2 shadow-lg shadow-emerald-900/20"
+                      >
+                        {submitting ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} fill="currentColor" />}
+                        Start Training
+                      </button>
+                    </div>
                   </div>
 
                   {/* Tabs */}
@@ -487,25 +653,37 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                         </div>
 
                         <div className="col-span-2">
-                          <label className="block text-xs font-medium text-slate-400 mb-1.5">Model Scale</label>
-                          <div className="flex gap-2">
-                            {['n', 's', 'm', 'l', 'x'].map(scale => (
+                          <label className="block text-xs font-medium text-slate-400 mb-1.5">
+                            {selectedArchFamily ? (
+                              <span>Model Scale <span className="text-violet-400 font-normal">({selectedArchFamily.display_name})</span></span>
+                            ) : 'Model Scale'}
+                          </label>
+                          <div className="flex gap-2 flex-wrap">
+                            {(selectedArchFamily
+                              ? selectedArchFamily.supported_scales.map(s => ({ key: s.scale, label: s.scale.toUpperCase(), sublabel: s.label }))
+                              : ['n', 's', 'm', 'l', 'x'].map(s => ({ key: s, label: s.toUpperCase(), sublabel: undefined }))
+                            ).map(({ key, label, sublabel }) => (
                               <button
-                                key={scale}
-                                onClick={() => setModelScale(scale)}
-                                className={`flex-1 px-4 py-2.5 rounded-lg border transition-all text-sm font-medium ${
-                                  modelScale === scale
-                                    ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.1)]'
+                                key={key}
+                                onClick={() => setModelScale(key)}
+                                className={`flex-1 min-w-[60px] px-3 py-2.5 rounded-lg border transition-all text-sm font-medium ${
+                                  modelScale === key
+                                    ? selectedArchFamily
+                                      ? 'bg-violet-500/10 border-violet-500/50 text-violet-300 shadow-[0_0_10px_rgba(139,92,246,0.15)]'
+                                      : 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.1)]'
                                     : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600 hover:text-slate-300'
                                 }`}
                               >
-                                {scale.toUpperCase()}
+                                <div>{label}</div>
+                                {sublabel && <div className="text-[10px] font-normal opacity-70 mt-0.5 leading-tight">{sublabel}</div>}
                               </button>
                             ))}
                           </div>
-                          <p className="text-[10px] text-slate-500 mt-1.5">
-                            Scale affects model size: n (nano) → s (small) → m (medium) → l (large) → x (xlarge)
-                          </p>
+                          {!selectedArchFamily && (
+                            <p className="text-[10px] text-slate-500 mt-1.5">
+                              Scale affects model size: n (nano) → s (small) → m (medium) → l (large) → x (xlarge)
+                            </p>
+                          )}
                         </div>
 
                         {/* Training Mode for Official YOLO */}
@@ -773,8 +951,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
 
                         <div className="space-y-4">
                           <h4 className="text-sm font-semibold text-white border-b border-slate-800 pb-2">Advanced</h4>
-                          {/* YOLOv8 Backbone Warm-start — only for custom/arch models */}
-                          {selectedModelId && !selectedModelId.startsWith('yolo:') && (
+                          {/* YOLOv8 Backbone Warm-start — only for custom (non-yolo, non-arch) models */}
+                          {selectedModelId && !selectedModelId.startsWith('yolo:') && !selectedModelId.startsWith('arch:') && (
                             <div>
                               <label className="block text-xs font-medium text-indigo-400 mb-1.5">
                                 YOLOv8 Backbone Warm-start

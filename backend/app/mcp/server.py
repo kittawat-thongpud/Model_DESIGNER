@@ -236,6 +236,7 @@ mcp = FastMCP(
         "All list tools default to summary view to reduce token usage. "
         "Pass view='detail' to get full records."
     ),
+    streamable_http_path="/",
     transport_security=_build_transport_security(),
 )
 
@@ -828,3 +829,18 @@ def create_mcp_app():
       POST /mcp/messages  — JSON-RPC message posting
     """
     return mcp.sse_app(mount_path="/")
+
+
+def create_mcp_http_app():
+    """Return a Starlette/ASGI app for mounting in FastAPI under /mcp-http.
+
+    Exposes Streamable HTTP transport (stateless) at:
+      GET/POST/DELETE /mcp-http
+
+    FastAPI strips the mount prefix before forwarding to the sub-app, so the
+    sub-app always sees path="/".  We must set streamable_http_path="/" so
+    the Route inside the sub-app matches every stripped request.
+    """
+    mcp.settings.stateless_http = True
+    mcp.settings.streamable_http_path = "/"
+    return mcp.streamable_http_app()

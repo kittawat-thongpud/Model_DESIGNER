@@ -27,6 +27,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.routing import Route
 
 from . import logging_service as logger
 from .config import APP_NAME, APP_VERSION, CORS_ORIGINS
@@ -34,8 +35,21 @@ from .services.config_service import get_monitoring_config
 
 
 import sys
+import logging as _logging
 # Keep sys.argv empty to prevent Ultralytics CLI parsing
 sys.argv = []
+
+# ─── Suppress noisy AssertionError stack traces from POST /mcp/sse ───────────
+class _SuppressMcpAssertion(_logging.Filter):
+    """Drop the AssertionError log record that Starlette emits when a client
+    POSTs to /mcp/sse (GET-only endpoint).  The 405 response is still sent;
+    only the server-side traceback is suppressed to keep logs clean."""
+    def filter(self, record: _logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("AssertionError" in msg and "mcp" in msg.lower())
+
+_logging.getLogger("starlette.middleware.base").addFilter(_SuppressMcpAssertion())
+_logging.getLogger("uvicorn.error").addFilter(_SuppressMcpAssertion())
 # ─── Safe JSON Response (replaces NaN/Inf with None) ─────────────────────────
 
 def _sanitize(obj: Any) -> Any:
@@ -69,7 +83,7 @@ class SystemLogMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path.startswith("/mcp/"):
+        if path.startswith("/mcp/") or path == "/mcp-http":
             return await call_next(request)
 
         start = time.time()
@@ -85,6 +99,19 @@ class SystemLogMiddleware(BaseHTTPMiddleware):
             "client": request.client.host if request.client else "unknown",
         })
         return response
+
+
+class _ExactPathASGIProxy:
+    def __init__(self, app, mount_path: str):
+        self.app = app
+        self.mount_path = mount_path.rstrip("/")
+
+    async def __call__(self, scope, receive, send):
+        child_scope = dict(scope)
+        child_scope["path"] = "/"
+        child_scope["raw_path"] = b"/"
+        child_scope["root_path"] = scope.get("root_path", "") + self.mount_path
+        await self.app(child_scope, receive, send)
 
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
@@ -141,23 +168,64 @@ def create_app() -> FastAPI:
     from .controllers.benchmark_controller import router as benchmark_router
     from .controllers.package_controller import router as package_router
     from .controllers.health_controller import router as health_router
+    from .controllers.plugin_controller import router as plugin_router
 
     for router in (
         model_router, module_router, train_router,
         dataset_router, dataset_samples_router, job_router,
         weight_router, snapshot_router, log_router, stats_router, stream_router, system_router,
         inference_router, benchmark_router, package_router, health_router,
+        plugin_router,
     ):
         application.include_router(router)
 
     # ── MCP (Model Context Protocol) interface ───────────────────────────────
     try:
-        from .mcp.server import create_mcp_app
+        from .mcp.server import create_mcp_app, create_mcp_http_app, mcp as _mcp_instance
+        mcp_http_app = create_mcp_http_app()
         application.mount("/mcp", create_mcp_app())
+        application.mount("/mcp-http", mcp_http_app)
+        application.router.routes.append(
+            Route("/mcp-http", endpoint=_ExactPathASGIProxy(mcp_http_app, "/mcp-http"))
+        )
+
+        # FastAPI ignores sub-app lifespans on .mount(); we must drive the
+        # StreamableHTTPSessionManager task-group ourselves via startup/shutdown.
+        import asyncio as _asyncio
+
+        _mcp_state: dict = {"event": None, "task": None}
+
+        @application.on_event("startup")
+        async def _start_mcp_http_session_manager():
+            shutdown_event = _asyncio.Event()
+            _mcp_state["event"] = shutdown_event
+
+            async def _lifespan_task():
+                async with _mcp_instance.session_manager.run():
+                    await shutdown_event.wait()
+
+            task = _asyncio.get_event_loop().create_task(_lifespan_task())
+            _mcp_state["task"] = task
+            # brief yield so session_manager._task_group is set before first request
+            await _asyncio.sleep(0.1)
+
+        @application.on_event("shutdown")
+        async def _stop_mcp_http_session_manager():
+            ev = _mcp_state.get("event")
+            if ev is not None:
+                ev.set()
+            task = _mcp_state.get("task")
+            if task is not None:
+                try:
+                    await _asyncio.wait_for(task, timeout=5.0)
+                except Exception:
+                    pass
+
         logger.log("system", "INFO", "MCP server mounted successfully", {
             "mount_path": "/mcp",
             "sse_endpoint": "/mcp/sse",
             "message_endpoint": "/mcp/messages/",
+            "http_endpoint": "/mcp-http",
             "notes": "Connect MCP clients to the SSE endpoint",
         })
     except Exception as e:
@@ -165,6 +233,7 @@ def create_app() -> FastAPI:
             "mount_path": "/mcp",
             "sse_endpoint": "/mcp/sse",
             "message_endpoint": "/mcp/messages/",
+            "http_endpoint": "/mcp-http",
             "error": str(e),
         })
 

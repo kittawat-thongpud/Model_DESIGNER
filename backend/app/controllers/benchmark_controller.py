@@ -327,12 +327,41 @@ def _list_available_datasets(weight_meta: dict | None = None) -> list[dict]:
     return results
 
 
-def _run_benchmark(req: BenchmarkRequest) -> dict:
+def _update_benchmark_failed(benchmark_id: str, error: str) -> None:
+    """Update an in-progress benchmark record to failed status."""
+    out_path = BENCHMARK_DIR / f"{benchmark_id}.json"
+    try:
+        data = json.loads(out_path.read_text()) if out_path.exists() else {"benchmark_id": benchmark_id}
+        data["status"] = "failed"
+        data["error"] = error
+        data["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        out_path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> dict:
     """Blocking — runs in threadpool."""
     import sys
     import torch
     from ultralytics import YOLO
     from pathlib import Path as _Path
+
+    # Generate benchmark_id early and write running status for persistence
+    if benchmark_id is None:
+        benchmark_id = uuid.uuid4().hex[:12]
+    out_path = BENCHMARK_DIR / f"{benchmark_id}.json"
+    out_path.write_text(json.dumps({
+        "benchmark_id": benchmark_id,
+        "weight_id": req.weight_id,
+        "dataset": req.dataset,
+        "split": req.split,
+        "status": "running",
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "conf": req.conf,
+        "iou": req.iou,
+        "imgsz": req.imgsz,
+    }, indent=2))
 
     # Ensure backend/ is in sys.path so custom packages (e.g. hsg_det) are importable
     _backend_dir = str(_Path(__file__).resolve().parents[2])
@@ -495,11 +524,13 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
             pass
 
     result = {
-        "benchmark_id": uuid.uuid4().hex[:12],
+        "benchmark_id": benchmark_id,
         "weight_id": req.weight_id,
         "dataset": req.dataset,
         "split": req.split,
+        "status": "completed",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "elapsed_s": round(elapsed_s, 1),
         # Overall metrics
         "mAP50": round(float(mp.map50), 4) if mp.map50 is not None else None,
@@ -524,8 +555,7 @@ def _run_benchmark(req: BenchmarkRequest) -> dict:
         "imgsz": req.imgsz,
     }
 
-    # Save result to disk
-    out_path = BENCHMARK_DIR / f"{result['benchmark_id']}.json"
+    # Save result to disk (replaces running status)
     out_path.write_text(json.dumps(result, indent=2))
 
     return result
@@ -545,8 +575,25 @@ async def list_benchmark_datasets(weight_id: str | None = None):
 @router.post("/run", summary="Run benchmark validation for a weight")
 async def run_benchmark(req: BenchmarkRequest):
     """Run val() against a dataset and return full benchmark results."""
+    from ..services.task_queue import enqueue, complete, cancel, TaskType
+
+    benchmark_id = uuid.uuid4().hex[:12]
+    task_id, admitted = enqueue(
+        TaskType.BENCHMARK,
+        ref_id=benchmark_id,
+        payload={"weight_id": req.weight_id, "dataset": req.dataset},
+    )
+    if not admitted:
+        cancel(task_id)
+        raise HTTPException(
+            409,
+            "GPU is busy with another training or benchmark job. "
+            "Retry when the current job finishes.",
+        )
+
+    _task_error: str | None = None
     try:
-        result = await asyncio.to_thread(_run_benchmark, req)
+        result = await asyncio.to_thread(_run_benchmark, req, benchmark_id)
         logger.log("system", "INFO", "Benchmark complete", {
             "weight_id": req.weight_id,
             "dataset": req.dataset,
@@ -554,9 +601,15 @@ async def run_benchmark(req: BenchmarkRequest):
         })
         return result
     except ValueError as e:
+        _task_error = str(e)
+        _update_benchmark_failed(benchmark_id, _task_error)
         raise HTTPException(400, str(e))
     except Exception as e:
+        _task_error = str(e)
+        _update_benchmark_failed(benchmark_id, _task_error)
         raise HTTPException(500, f"Benchmark failed: {e}")
+    finally:
+        complete(task_id, error=_task_error)
 
 
 @router.get("/history", summary="List past benchmark results")

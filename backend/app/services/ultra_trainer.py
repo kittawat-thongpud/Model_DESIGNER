@@ -51,7 +51,9 @@ def _normalize_requested_cache(value):
         return None
     if text in ("none", "off", "false", "0"):
         return False
-    if text in ("disk", "true", "1"):
+    if text == "disk":
+        return "disk"
+    if text in ("true", "1"):
         return True
     if text == "ram":
         return "ram"
@@ -730,9 +732,34 @@ def _training_worker(
             job_storage.append_job_log(job_id, "INFO",
                 f"Using arch plugin: {arch_plugin.display_name}")
             arch_plugin.register_modules()
-            yaml_path = str(arch_plugin.yaml_path())
-            job_storage.append_job_log(job_id, "INFO",
-                f"Arch YAML: {yaml_path}")
+            base_yaml_path = arch_plugin.yaml_path()
+            # If the plugin has a scale key, inject it into a job-local YAML copy
+            # so Ultralytics picks the correct depth/width from the scales: block.
+            arch_scale = arch_plugin.scale
+            if arch_scale:
+                import yaml as _yaml
+                yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
+                _scale_key = str(arch_scale).upper()
+                yaml_dict["scale"] = _scale_key
+                _scales = yaml_dict.get("scales")
+                if isinstance(_scales, dict):
+                    _scale_vals = _scales.get(_scale_key)
+                    if _scale_vals is None:
+                        _scale_vals = _scales.get(str(arch_scale).lower())
+                    if _scale_vals is not None and len(_scale_vals) >= 3:
+                        yaml_dict["depth_multiple"] = _scale_vals[0]
+                        yaml_dict["width_multiple"] = _scale_vals[1]
+                        yaml_dict["max_channels"] = _scale_vals[2]
+                        yaml_dict.pop("scales", None)
+                patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
+                patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                yaml_path = str(patched_yaml)
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Arch YAML: {base_yaml_path.name} (scale={_scale_key})")
+            else:
+                yaml_path = str(base_yaml_path)
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Arch YAML: {yaml_path}")
 
             # yolov8_backbone warm-start is opt-in — only when user explicitly selects it in UI
             # (no auto-inject from pretrain_key() anymore)
@@ -744,6 +771,18 @@ def _training_worker(
             if arch_plugin:
                 job_storage.append_job_log(job_id, "INFO",
                     f"Auto-detected arch plugin from YAML: {arch_plugin.display_name}")
+
+        # Muon optimizer in current Ultralytics build expects 2D tensors and can
+        # assert on Mamba-YOLO parameter groups. Force a stable optimizer here.
+        if arch_plugin and arch_plugin.family == "mamba_yolo":
+            _opt = str(config.get("optimizer", "auto") or "auto").strip().lower()
+            if _opt in ("", "auto", "muon"):
+                config["optimizer"] = "AdamW"
+                job_storage.append_job_log(
+                    job_id,
+                    "WARNING",
+                    f"Overriding optimizer='{_opt or 'auto'}' -> 'AdamW' for Mamba-YOLO compatibility.",
+                )
 
         # Ensure config is a dict
         if config is None:

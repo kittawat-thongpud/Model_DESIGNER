@@ -39,6 +39,22 @@ class HSGDetPlugin(ModelArchPlugin):
         return "HSG-DET (Hybrid Sparse-Global Detector)"
 
     @property
+    def family(self) -> str:
+        return "hsg_det"
+
+    @property
+    def family_display_name(self) -> str:
+        return "HSG-DET"
+
+    @property
+    def scale(self) -> str:
+        return "m"
+
+    @property
+    def scale_label(self) -> str:
+        return "Medium (~38.5 M, ~680 GFLOPs)"
+
+    @property
     def task_type(self) -> str:
         return "detect"
 

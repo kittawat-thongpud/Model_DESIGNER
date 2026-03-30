@@ -25,6 +25,37 @@ async def start_training(req: TrainRequest):
         model_name = req.model_id.split(":")[1].upper()  # e.g., "yolo:yolov8" -> "YOLOV8"
         task = str(_MODEL_DEFAULTS.get("task", "detect"))
         yaml_path = ""  # Not used for official YOLO models
+    elif req.model_id.startswith("arch:"):
+        # Arch plugin model — resolve family + scale to specific plugin
+        # model_id = "arch:mamba_yolo", model_scale = "t"  → plugin "mamba_yolo_t"
+        # model_id = "arch:rtdetr",      model_scale = "l"  → plugin "rtdetr_l"
+        # model_id = "arch:hsg_det"      (no scale)         → plugin "hsg_det"
+        family_key = req.model_id[len("arch:"):]
+        scale = (req.model_scale or "").strip().lower()
+        arch_key = f"{family_key}_{scale}" if scale else family_key
+
+        from ..plugins.loader import get_arch_plugin
+        arch_plugin = get_arch_plugin(arch_key)
+        # Fallback: try family key directly (single-variant plugins)
+        if arch_plugin is None and scale:
+            arch_plugin = get_arch_plugin(family_key)
+        if arch_plugin is None:
+            raise HTTPException(404, f"Arch plugin not found: {arch_key!r}")
+        # Run preflight check — e.g. selective_scan install state for Mamba-YOLO
+        preflight_err = arch_plugin.preflight_check()
+        if preflight_err:
+            raise HTTPException(400, preflight_err)
+        # Job name: "Mamba-YOLO T", "RT-DETR L", "HSG-DET M" etc.
+        _scale_upper = (arch_plugin.scale or "").upper()
+        model_name = (
+            f"{arch_plugin.family_display_name} {_scale_upper}"
+            if _scale_upper else arch_plugin.family_display_name
+        )
+        task = arch_plugin.task_type
+        yaml_path = ""  # arch plugin sets yaml_path in training worker
+        # Inject model_arch key so the training worker picks up the plugin
+        config = req.config.to_train_kwargs()
+        config["model_arch"] = arch_plugin.name
     else:
         # Custom model - load from database
         record = model_storage.load_model(req.model_id)
@@ -38,7 +69,8 @@ async def start_training(req: TrainRequest):
         task = record.get("task", str(_MODEL_DEFAULTS.get("task", "detect")))
         model_name = record.get("name", "Untitled")
 
-    config = req.config.to_train_kwargs()
+    if not req.model_id.startswith("arch:"):
+        config = req.config.to_train_kwargs()
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []

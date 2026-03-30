@@ -51,6 +51,57 @@ def all_arch_plugins() -> list[ModelArchPlugin]:
     return list(_arch_plugins.values())
 
 
+def arch_families() -> list[dict]:
+    """Return arch plugins grouped by family.
+
+    Plugins that share the same ``family`` key are collapsed into one entry
+    with a ``supported_scales`` list.  Plugins whose ``scale`` is None are
+    returned as standalone entries (one scale entry with key = name).
+
+    Returns a list of dicts suitable for JSON serialisation:
+    {
+        "family":          str,   # e.g. "mamba_yolo"
+        "display_name":    str,   # e.g. "Mamba-YOLO"
+        "task_type":       str,
+        "description":     str,
+        "supported_scales": [
+            {"scale": "t", "label": "Tiny (~5 M, ~10 GFLOPs)", "plugin_name": "mamba_yolo_t"},
+            ...
+        ]
+    }
+    """
+    from collections import OrderedDict
+
+    families: dict[str, dict] = OrderedDict()
+
+    for plugin in _arch_plugins.values():
+        fam = plugin.family
+        if fam not in families:
+            families[fam] = {
+                "family": fam,
+                "display_name": plugin.family_display_name,
+                "task_type": plugin.task_type,
+                "description": plugin.description,
+                "supported_scales": [],
+            }
+        scale = plugin.scale
+        if scale is not None:
+            families[fam]["supported_scales"].append({
+                "scale": scale,
+                "label": plugin.scale_label or scale.upper(),
+                "plugin_name": plugin.name,
+            })
+        else:
+            # Standalone plugin — expose as single-scale entry using name as scale key
+            families[fam]["supported_scales"].append({
+                "scale": plugin.name,
+                "label": plugin.display_name,
+                "plugin_name": plugin.name,
+            })
+
+    return list(families.values())
+
+
 def find_arch_for_yaml(yaml_path: str) -> "ModelArchPlugin | None":
     """Return the arch plugin whose yaml_path() matches yaml_path, or None.
 

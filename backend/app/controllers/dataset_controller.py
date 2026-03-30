@@ -365,9 +365,13 @@ def _scan_dataset_meta(name: str) -> dict:
 
 # ── Status / Meta / Scan / Delete endpoints ──────────────────────────────────
 
-@router.get("/{name}/status", summary="Check dataset download status")
+@router.get("/{name}/status", summary="Check dataset download / loading status")
 async def dataset_status(name: str):
-    """Check whether a dataset is downloaded. Reads cached meta only (fast)."""
+    """Check whether a dataset is downloaded and whether any loading tasks are queued.
+
+    Returns the availability flag, cached metadata, and any active task_queue
+    entries (pending/running) whose ref_id matches this dataset name.
+    """
     ds = _get_info(name)
     if not ds:
         raise HTTPException(status_code=404, detail=f"Dataset '{name}' not found")
@@ -385,6 +389,30 @@ async def dataset_status(name: str):
         meta = _scan_dataset_meta(key)
     if meta:
         result["meta"] = meta
+
+    # Augment with any pending / running task_queue entries for this dataset
+    try:
+        from ..services import task_queue as _tq
+        active_tasks = _tq.get_active_tasks_for_ref(key)
+        if active_tasks:
+            result["queue_tasks"] = [
+                {
+                    "task_id": t["task_id"],
+                    "task_type": t["task_type"],
+                    "status": t["status"],
+                    "created_at": t["created_at"],
+                    "started_at": t["started_at"],
+                }
+                for t in active_tasks
+            ]
+            result["loading"] = any(t["status"] in ("pending", "running") for t in active_tasks)
+        else:
+            result["queue_tasks"] = []
+            result["loading"] = False
+    except Exception:
+        result["queue_tasks"] = []
+        result["loading"] = False
+
     return result
 
 

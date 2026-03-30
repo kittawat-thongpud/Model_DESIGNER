@@ -51,9 +51,11 @@ DETR [2] introduced set-based object detection with bipartite matching, eliminat
 
 ## III. Key Definitions
 
-**Definition 1 (Sparse Global Block — SGB).** Let $F \in \mathbb{R}^{B \times C \times H \times W}$ be a feature map. The importance score of spatial position $n \in \{1,\ldots,HW\}$ is defined as:
+**Definition 1 (Sparse Global Block — SGB).** Let $F \in \mathbb{R}^{B \times C \times H \times W}$ be a feature map. The importance score of spatial position $n \in \{1,\ldots,HW\}$ is defined as the **L2 activation energy** (squared $\ell_2$ norm across channels):
 
-$$s_n = \frac{1}{C} \sum_{c=1}^{C} F_{bcn}, \quad \forall b$$
+$$s_n = \|F_{bn}\|_2^2 = \sum_{c=1}^{C} F_{bcn}^2, \quad \forall b$$
+
+This measure is strictly non-negative and symmetric with respect to sign, ensuring that both positively and negatively activated channels contribute equally to token saliency. In contrast to a channel mean, $s_n$ cannot be cancelled by opposing activations and thus provides a more reliable proxy for feature magnitude.
 
 The top-K token index set $T_K \subseteq \{1,\ldots,HW\}$, $|T_K| = K$, $K \ll HW$, is selected by:
 

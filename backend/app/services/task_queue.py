@@ -8,11 +8,11 @@ LIGHTWEIGHT (not queued, always allowed):
   - metadata reads / dataset info / model info / weight info
   - status polling / SSE subscription
   - inference on small/explicitly bounded inputs
-  - validation within configurable resource thresholds
 
 HEAVY (queued, admission-controlled):
   - training           → max 1 GPU training job running at a time
-  - benchmark          → max 1 concurrent
+  - benchmark          → max 1 concurrent (GPU)
+  - validation         → max 1 concurrent (GPU, high-priority)
   - dataset extraction / conversion / repartition
   - package import/export
   - large plot generation / report generation
@@ -50,6 +50,7 @@ _QUEUE_CLEANUP_MAX_AGE_S = float(_QUEUE_CONFIG.get("cleanup_max_age_s", 86400 * 
 class TaskType(str, Enum):
     TRAINING = "training"
     BENCHMARK = "benchmark"
+    VALIDATION = "validation"
     DATASET_CONVERSION = "dataset_conversion"
     DATASET_EXTRACTION = "dataset_extraction"
     EXPORT = "export"
@@ -73,6 +74,7 @@ _QUEUE_LIMITS_CONFIG = _QUEUE_CONFIG.get("concurrency_limits", {})
 _CONCURRENCY_LIMITS: dict[str, int] = {
     TaskType.TRAINING: int(_QUEUE_LIMITS_CONFIG.get("training", 1)),
     TaskType.BENCHMARK: int(_QUEUE_LIMITS_CONFIG.get("benchmark", 1)),
+    TaskType.VALIDATION: int(_QUEUE_LIMITS_CONFIG.get("validation", 1)),
     TaskType.DATASET_CONVERSION: int(_QUEUE_LIMITS_CONFIG.get("dataset_conversion", 2)),
     TaskType.DATASET_EXTRACTION: int(_QUEUE_LIMITS_CONFIG.get("dataset_extraction", 2)),
     TaskType.EXPORT: int(_QUEUE_LIMITS_CONFIG.get("export", 2)),
@@ -89,13 +91,29 @@ LIGHTWEIGHT_TASK_TYPES: frozenset[str] = frozenset({
     "status_poll",
     "sse_subscription",
     "inference",       # treated as lightweight under Option A threshold
-    "validation",      # treated as lightweight under Option A threshold
+    # "validation" removed — GPU validation runs through GPU_TASK_TYPES
 })
+
+# GPU tasks compete for a single shared GPU execution slot.
+# When any GPU task is running, no other GPU task can be admitted.
+GPU_TASK_TYPES: frozenset[str] = frozenset({
+    TaskType.TRAINING, TaskType.BENCHMARK, TaskType.VALIDATION,
+})
+_GPU_CONCURRENCY_LIMIT: int = 1
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 _db_lock = threading.Lock()
+
+
+def _gpu_running_count(conn: sqlite3.Connection) -> int:
+    """Count running tasks across all GPU task types (training + benchmark)."""
+    placeholders = ",".join("?" * len(GPU_TASK_TYPES))
+    return conn.execute(
+        f"SELECT COUNT(*) FROM queue_tasks WHERE task_type IN ({placeholders}) AND status='running'",
+        tuple(GPU_TASK_TYPES),
+    ).fetchone()[0]
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -190,6 +208,27 @@ def _admit_pending_locked(conn: sqlite3.Connection, task_type: str, now: float) 
     return admitted
 
 
+def _admit_pending_gpu_locked(conn: sqlite3.Connection, now: float) -> list[tuple[str, str]]:
+    """Admit the next pending GPU task (training or benchmark) respecting the shared GPU slot."""
+    admitted: list[tuple[str, str]] = []
+    placeholders = ",".join("?" * len(GPU_TASK_TYPES))
+    while _gpu_running_count(conn) < _GPU_CONCURRENCY_LIMIT:
+        row = conn.execute(
+            f"""SELECT task_id, task_type FROM queue_tasks
+               WHERE task_type IN ({placeholders}) AND status='pending'
+               ORDER BY priority DESC, created_at ASC LIMIT 1""",
+            tuple(GPU_TASK_TYPES),
+        ).fetchone()
+        if not row:
+            break
+        conn.execute(
+            "UPDATE queue_tasks SET status='running', started_at=? WHERE task_id=?",
+            (now, row["task_id"]),
+        )
+        admitted.append((row["task_id"], row["task_type"]))
+    return admitted
+
+
 def enqueue(
     task_type: str,
     ref_id: str | None = None,
@@ -211,12 +250,17 @@ def enqueue(
 
     admitted_callbacks: list[tuple[str, str]] = []
     with _db() as conn:
-        running_count = conn.execute(
-            "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
-            (task_type,),
-        ).fetchone()[0]
+        if task_type in GPU_TASK_TYPES:
+            running_count = _gpu_running_count(conn)
+            effective_limit = _GPU_CONCURRENCY_LIMIT
+        else:
+            running_count = conn.execute(
+                "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
+                (task_type,),
+            ).fetchone()[0]
+            effective_limit = limit
 
-        admitted = running_count < limit
+        admitted = running_count < effective_limit
         status = TaskStatus.RUNNING if admitted else TaskStatus.PENDING
 
         conn.execute(
@@ -313,6 +357,28 @@ def list_tasks(
     return results
 
 
+def get_active_tasks_for_ref(ref_id: str) -> list[dict]:
+    """Return pending/running tasks whose ref_id matches (e.g. dataset name, job_id)."""
+    import json as _json
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT task_id, task_type, ref_id, status, priority, payload, error, "
+            "created_at, started_at, completed_at "
+            "FROM queue_tasks WHERE ref_id=? AND status IN ('pending','running') "
+            "ORDER BY created_at DESC",
+            (ref_id,),
+        ).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["payload"] = _json.loads(item.get("payload") or "{}")
+        except Exception:
+            pass
+        results.append(item)
+    return results
+
+
 def finalize_task(
     task_id: str,
     final_status: TaskStatus | str,
@@ -343,7 +409,10 @@ def finalize_task(
             (final_status.value, now, error, task_id),
         )
         if admit_pending and current_status == TaskStatus.RUNNING.value:
-            admitted_callbacks = _admit_pending_locked(conn, task_type, now)
+            if task_type in GPU_TASK_TYPES:
+                admitted_callbacks = _admit_pending_gpu_locked(conn, now)
+            else:
+                admitted_callbacks = _admit_pending_locked(conn, task_type, now)
     if admitted_callbacks:
         _fire_admission_callbacks(admitted_callbacks)
     return True
@@ -430,10 +499,13 @@ def queue_status(task_type: str | None = None) -> dict:
         for r in q:
             pending_tasks.append(dict(r))
 
+        gpu_running = _gpu_running_count(conn)
         return {
             "summary": summary,
             "pending": pending_tasks,
             "concurrency_limits": _CONCURRENCY_LIMITS,
+            "gpu_busy": gpu_running >= _GPU_CONCURRENCY_LIMIT,
+            "gpu_running": gpu_running,
         }
 
 

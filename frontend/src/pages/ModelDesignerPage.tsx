@@ -102,38 +102,6 @@ function safeArgs(node: GNode): unknown[] {
   return Array.isArray(node.args) ? node.args : [];
 }
 
-/* ── Param estimation (approximate, no channel inference) ────────────── */
-function estimateParams(mod: string, args: unknown[], repeats: number): number {
-  const a = args.map(v => (typeof v === 'number' ? v : 0));
-  const out = a[0] || 0;
-  const k = a[1] || 3;
-  const cin = out; // rough: assume cin ≈ cout for estimation
-  let p = 0;
-  switch (mod) {
-    case 'Conv':         p = cin * out * k * k + out; break;           // Conv+BN: weight + bias(BN)
-    case 'DWConv':       p = out * k * k + out; break;
-    case 'ConvTranspose':p = cin * out * k * k + out; break;
-    case 'C2f':          p = out * out * 2 + out * out * k * k * 2; break; // rough
-    case 'C3':           p = out * out * 2 + out * out * k * k * 2; break;
-    case 'C3k2':         p = out * out * 3; break;
-    case 'SPPF':         p = out * out * 2; break;
-    case 'SPP':          p = out * out * 2; break;
-    case 'Bottleneck':   p = out * out * 2 * k * k; break;
-    case 'Concat':       p = 0; break;
-    case 'nn.Upsample':  p = 0; break;
-    case 'nn.Identity':  p = 0; break;
-    case 'Detect':       p = out * 85 * 3; break; // rough: 3 scales
-    default:             p = out * out; break; // generic fallback
-  }
-  return Math.round(p * Math.max(repeats, 1));
-}
-
-function formatParams(n: number): string {
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return String(n);
-}
-
 /* ── Edge path generators ───────────────────────────────────────────────── */
 function seqEdgePath(style: EdgeStyle, x1: number, y1: number, x2: number, y2: number): string {
   switch (style) {
@@ -1401,8 +1369,6 @@ export default function ModelDesignerPage({ onBack }: Props) {
               const inBB = bbChainSet.has(node.id);
               const inHD = hdChainSet.has(node.id);
               const roleBorder = inBB ? 'border-purple-500/60' : inHD ? 'border-green-500/60' : '';
-              const nodeParams = estimateParams(node.module, safeArgs(node), node.repeats);
-
               return (
                 <div key={node.id}
                   onMouseDown={e => onNodeMouseDown(e, node.id)}
@@ -1423,7 +1389,6 @@ export default function ModelDesignerPage({ onBack }: Props) {
                       </div>
                       <div className="text-[10px] text-slate-500 truncate mt-0.5 font-mono">
                         [{safeArgs(node).map(a => JSON.stringify(a)).join(', ')}]
-                        {nodeParams > 0 && <span className="text-slate-600 ml-1">~{formatParams(nodeParams)}</span>}
                       </div>
                     </div>
                     <div className="text-right shrink-0">
@@ -1481,16 +1446,6 @@ export default function ModelDesignerPage({ onBack }: Props) {
           </div>
 
           {/* Minimap */}
-          {/* Total params overlay — pinned to canvas viewport */}
-          {(() => {
-            const total = nodes.reduce((s, n) => s + estimateParams(n.module, safeArgs(n), n.repeats), 0);
-            return total > 0 ? (
-              <div className="absolute top-3 right-3 bg-slate-900/80 backdrop-blur-sm border border-slate-700/50 rounded-lg px-3 py-1.5 pointer-events-none z-20">
-                <div className="text-[9px] text-slate-500 uppercase tracking-wider">Est. Params</div>
-                <div className="text-sm font-bold text-white font-mono">{formatParams(total)}</div>
-              </div>
-            ) : null;
-          })()}
 
           {showMinimap && nodes.length > 0 && (
             <div className="absolute bottom-3 right-3 w-40 h-28 bg-slate-900/90 border border-slate-700/50 rounded-lg overflow-hidden pointer-events-none">
