@@ -49,35 +49,49 @@ class CustomValidator(DetectionValidator):
         self.postprocess_times = []
 
     def __call__(self, trainer=None, model=None):
-        """Override validation call to track latency."""
+        """Override validation call to track latency.
+
+        Uses CUDA events for non-blocking timing instead of torch.cuda.synchronize()
+        around every forward — the previous implementation forced a full GPU pipeline
+        flush twice per batch, making val 2–5× slower than training.
+        """
         import time
         import torch
-        
+
         # Reset latency tracking
         self.inference_times = []
         self.preprocess_times = []
         self.postprocess_times = []
-        
+        self._pending_cuda_events = []  # list[(start_event, end_event)]
+
         # Store original model forward to wrap it
         import torch.nn as nn
         is_nn_model = model is not None and isinstance(model, nn.Module)
+        use_cuda_events = is_nn_model and torch.cuda.is_available()
         if is_nn_model:
             original_forward = model.forward
-            
-            def timed_forward(*args, **kwargs):
-                """Wrapper to track inference time."""
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                start = time.time()
-                result = original_forward(*args, **kwargs)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                self.inference_times.append(time.time() - start)
-                return result
-            
+
+            if use_cuda_events:
+                def timed_forward(*args, **kwargs):
+                    """Non-blocking GPU timing via CUDA events."""
+                    start_evt = torch.cuda.Event(enable_timing=True)
+                    end_evt = torch.cuda.Event(enable_timing=True)
+                    start_evt.record()
+                    result = original_forward(*args, **kwargs)
+                    end_evt.record()
+                    self._pending_cuda_events.append((start_evt, end_evt))
+                    return result
+            else:
+                def timed_forward(*args, **kwargs):
+                    """CPU timing (no CUDA available)."""
+                    start = time.time()
+                    result = original_forward(*args, **kwargs)
+                    self.inference_times.append(time.time() - start)
+                    return result
+
             # Temporarily replace forward
             model.forward = timed_forward
-        
+
         try:
             # Run parent validation
             result = super().__call__(trainer=trainer, model=model)
@@ -85,7 +99,14 @@ class CustomValidator(DetectionValidator):
             # Restore original forward
             if is_nn_model:
                 model.forward = original_forward
-        
+
+        # Convert CUDA events → seconds (single sync at the end, not per-batch)
+        if use_cuda_events and self._pending_cuda_events:
+            torch.cuda.synchronize()  # ensure all events recorded
+            for start_evt, end_evt in self._pending_cuda_events:
+                self.inference_times.append(start_evt.elapsed_time(end_evt) / 1000.0)
+            self._pending_cuda_events = []
+
         # Calculate average latencies
         if self.inference_times:
             self.avg_inference_ms = sum(self.inference_times) / len(self.inference_times) * 1000
@@ -97,7 +118,7 @@ class CustomValidator(DetectionValidator):
             self.avg_preprocess_ms = 0
             self.avg_postprocess_ms = 0
             self.total_latency_ms = 0
-        
+
         return result
     
     def update_metrics(self, preds, batch):
