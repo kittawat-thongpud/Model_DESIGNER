@@ -217,19 +217,46 @@ class CustomValidator(DetectionValidator):
                 self.saved_counts[c] = self.saved_counts.get(c, 0) + 1
     
     def preprocess(self, batch):
-        """Track preprocessing time."""
+        """Track preprocessing time + emit heartbeat every 32 batches to detect val hangs."""
         import time
         start = time.time()
         result = super().preprocess(batch)
-        self.preprocess_times.append(time.time() - start)
+        elapsed = time.time() - start
+        self.preprocess_times.append(elapsed)
+
+        # Heartbeat: log every 32 batches OR if this single preprocess took >5s (NFS stall signal)
+        bi = getattr(self, "batch_i", None) or len(self.preprocess_times) - 1
+        job_id = getattr(self, "_heartbeat_job_id", None)
+        total = len(self.dataloader) if self.dataloader is not None else None
+        if job_id and (bi % 32 == 0 or elapsed > 5.0):
+            try:
+                job_storage.append_job_log(
+                    job_id, "DEBUG",
+                    f"[val] batch {bi}/{total or '?'} preprocess={elapsed*1000:.0f}ms",
+                )
+            except Exception:
+                pass
         return result
-    
+
     def postprocess(self, preds):
-        """Track postprocessing time."""
+        """Track postprocessing time + log slow NMS / postprocess batches."""
         import time
         start = time.time()
         result = super().postprocess(preds)
-        self.postprocess_times.append(time.time() - start)
+        elapsed = time.time() - start
+        self.postprocess_times.append(elapsed)
+
+        # Warn if postprocess takes >5s (indicates NaN-in-NMS hang or extreme pred count)
+        job_id = getattr(self, "_heartbeat_job_id", None)
+        if job_id and elapsed > 5.0:
+            bi = getattr(self, "batch_i", None) or len(self.postprocess_times) - 1
+            try:
+                job_storage.append_job_log(
+                    job_id, "WARNING",
+                    f"[val] batch {bi} SLOW postprocess={elapsed:.1f}s (possible NMS stall)",
+                )
+            except Exception:
+                pass
         return result
 
 
@@ -371,13 +398,37 @@ class CustomDetectionTrainer(DetectionTrainer):
     def get_validator(self):
         """Return custom validator."""
         self.loss_names = 'box_loss', 'cls_loss', 'dfl_loss'
-        return CustomValidator(
-            self.test_loader, 
-            save_dir=self.save_dir, 
-            args=copy(self.args), 
+        v = CustomValidator(
+            self.test_loader,
+            save_dir=self.save_dir,
+            args=copy(self.args),
             _callbacks=self.callbacks,
             sample_per_class=self.sample_per_class  # Pass as direct parameter
         )
+        # Enable heartbeat logging in CustomValidator.preprocess/postprocess
+        v._heartbeat_job_id = getattr(self, "job_id", None)
+        return v
+
+    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
+        """Override Ultralytics default that doubles workers for val.
+
+        Ultralytics sets `workers = self.args.workers * 2` for val mode, which causes
+        dataloader thrashing on shared / NFS storage and makes val slower than train.
+        We use the same worker count for both modes to keep val fast.
+        """
+        if mode == "val":
+            original_workers = self.args.workers
+            try:
+                # Multiply by 0.5 so the base impl's `*2` brings it back to original
+                # (We can't directly override since build_dataloader() is called by super().)
+                # Simpler: temporarily halve self.args.workers.
+                self.args.workers = max(1, original_workers // 2) if original_workers > 1 else original_workers
+                # Base impl does workers*2, so with workers=original//2 we get original.
+                # If workers=1, base gives 2 (acceptable minimum).
+                return super().get_dataloader(dataset_path, batch_size, rank, mode)
+            finally:
+                self.args.workers = original_workers
+        return super().get_dataloader(dataset_path, batch_size, rank, mode)
 
         
     def log(self, text: str, level: str = "INFO") -> None:
