@@ -1285,9 +1285,10 @@ class JobCustomTrainer(CustomDetectionTrainer):
         """Return model — RTDETRDetectionModel for RT-DETR, otherwise DetectionModel."""
         if self._is_rtdetr(cfg):
             from ultralytics.nn.tasks import RTDETRDetectionModel
+            from ultralytics.utils import RANK as _RANK
             model = RTDETRDetectionModel(
                 cfg, nc=self.data["nc"], ch=self.data["channels"],
-                verbose=verbose and RANK == -1
+                verbose=verbose and _RANK == -1
             )
             if weights:
                 model.load(weights)
