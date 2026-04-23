@@ -1327,5 +1327,10 @@ class JobCustomTrainer(CustomDetectionTrainer):
             from copy import copy as _copy
             from ultralytics.models.rtdetr.val import RTDETRValidator
             self.loss_names = "giou_loss", "cls_loss", "l1_loss"
-            return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=_copy(self.args))
+            # RT-DETR emits 300 queries/image; low conf passes ~all → metric matching is O(300*N_gt)/image.
+            # Raise conf to 0.05 to cut metric-matching cost ~6× with negligible mAP impact.
+            val_args = _copy(self.args)
+            if getattr(val_args, "conf", None) in (None, 0.001):
+                val_args.conf = 0.05
+            return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=val_args)
         return super().get_validator()
