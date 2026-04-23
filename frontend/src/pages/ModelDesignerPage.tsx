@@ -64,7 +64,7 @@ function uid(): string { return `n${Date.now().toString(36)}_${(++_idCounter).to
 function linkId(): string { return `l${Date.now().toString(36)}_${(++_idCounter).toString(36)}`; }
 
 /* ── Detector modules — singleton blocks, always placed last in head ──── */
-const DETECTOR_MODULES = new Set(['Detect', 'Segment', 'Pose', 'Classify', 'OBB']);
+const DETECTOR_MODULES = new Set(['Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder']);
 
 /* ── Scale presets (depth_multiple, width_multiple, max_channels) ───────── */
 type ScaleKey = 'n' | 's' | 'm' | 'l' | 'x';
@@ -899,7 +899,7 @@ export default function ModelDesignerPage({ onBack }: Props) {
   const addNode = useCallback((moduleName: string, dropPos?: { x: number; y: number }) => {
     const catMod = catalog.find(m => m.name === moduleName);
     // Detector singleton: only one detector block allowed
-    if (catMod?.category === 'detector') {
+    if (DETECTOR_MODULES.has(moduleName)) {
       const existing = nodes.find(n => n.role === 'detector');
       if (existing) {
         showToast(false, `Only one Detector block allowed. Remove the existing "${existing.module}" first.`);
@@ -909,7 +909,7 @@ export default function ModelDesignerPage({ onBack }: Props) {
     const defaultArgs = catMod?.args.filter(a => a.default !== undefined).map(a => a.default) ?? [];
     const lastY = nodes.length > 0 ? Math.max(...nodes.map(n => n.y)) : 0;
     const pos = dropPos ?? { x: INIT_X, y: lastY + NODE_H + NODE_GAP_Y };
-    const role: NodeRole = catMod?.category === 'detector' ? 'detector' : 'normal';
+    const role: NodeRole = DETECTOR_MODULES.has(moduleName) ? 'detector' : 'normal';
     const newNode: GNode = { id: uid(), module: moduleName, repeats: 1, args: defaultArgs, role, x: pos.x, y: pos.y };
     commit([...nodes, newNode], links);
   }, [catalog, nodes, links, commit, showToast]);

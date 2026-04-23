@@ -4,7 +4,8 @@
 **Dataset:** IDD (Indian Driving Dataset)  
 **Machines:** ku4070 · ku4070-aj · rase4090 · rase4090-2  
 **Trainer:** Ultralytics YOLO (TAL assignment, standard losses)  
-**Architecture source:** `backend/hsg_det/configs/hsg_det_m.yaml` + `backend/hsg_det/nn/sparse_global.py`
+**Architecture source:** `backend/hsg_det/configs/hsg_det_m.yaml` + `backend/hsg_det/nn/sparse_global.py`  
+**New variants:** `hsg_det_m_v2.yaml` (P3 SGBG), `mamba_yolo.yaml` (T/B/L scales)
 
 ---
 
@@ -16,14 +17,38 @@
 |-------|-------|-------|-------|-------|----------|---------|-----------|--------|
 | **n** | **640** | HSG-DET [800,200] | 458/500 | 0.480 | 0.3059 | | | |
 | | | YOLOv8n | 433/500 | 0.477 | 0.3038 | **+0.003** | **+0.0021** | 🟡 HSG-DET (marginal) |
+| | | **HSG-DET V.2** [640,160,40] | 476/500 | **0.480** | **0.3075** | **+0.003** | **+0.0037** | 🔵 **HSG-DET V.2** |
 | **n** | **1280** | HSG-DET [160,40] | 447/500 | 0.618 | 0.4032 | | | |
 | | | YOLOv8n | 434/500 | **0.619** | 0.4023 | −0.001 | **+0.0009** | 🟡 Tie |
+| | | **HSG-DET V.2** [1280,320,80] | 447/500 | 0.479 | 0.3066 | −0.140 | −0.0957 | 🔴 YOLO (V.2 underperforms at 1280)
 | **s** | **640** | HSG-DET [640,160] | 290/500 | 0.546 | 0.3508 | | | |
 | | | YOLOv8s | 279/500 | 0.542 | 0.3487 | **+0.004** | **+0.0021** | 🟡 HSG-DET (marginal) |
 | **s** | **1280** | HSG-DET [160,40] | 184/500 | 0.675 | **0.4424** | | | |
 | | | YOLOv8s *(running)* | 234/500 | **0.676** | 0.4418 | −0.001 | +0.0006 | 🟡 Tie (YOLO still training) |
 
 > **สรุปภาพรวม:** ในทุก group HSG-DET ชนะหรือเสมอกันใน mAP50-95 ด้วยส่วนต่างเล็กน้อย (~0.001–0.002) ยังไม่มีกลุ่มใดที่ HSG-DET ชนะขาด ซึ่งบ่งชี้ว่า SGB ให้ gain เล็กน้อยแต่สม่ำเสมอ
+
+---
+
+### 1.4 Mamba-YOLO Results — Scale T, imgsz 640
+
+| Machine | Model | Epoch | mAP50 | mAP50-95 | Status | Notes |
+|---------|-------|-------|-------|----------|--------|-------|
+| rase4090-2 | Mamba-YOLO T | 369/500 | **0.529** | **0.34** | 🟢 Completed | Baseline result |
+
+> **Mamba-YOLO สรุป:** T-scale ให้ผล mAP50 ≈ 0.53 ซึ่งดีกว่า HSG-DET V.2 ที่ 0.48 (n-scale) แต่ต้องระวัง selective_scan CUDA extension build — หาก build ไม่สำเร็จจะ crash ตอนเทรน
+
+---
+
+### 1.5 HSG-DET V.2 — P3 SGBG Token Budget
+
+| Variant | top-k P3 | top-k P4 | top-k P5 | mAP50 | mAP50-95 | Status |
+|---------|----------|----------|----------|-------|----------|--------|
+| HSG-DET V.2 [640,160,40] | 640 | 160 | 40 | **0.480** | **0.3075** | ✅ Completed (n-scale) |
+| HSG-DET V.2 [1280,320,80] | 1280 | 320 | 80 | 0.479 | 0.3066 | ⚠️ Lower than expected |
+| HSG-DET V.2 [640,160,40] | 640 | 160 | 40 | — | — | 🔄 Running (s-scale) |
+
+> **สังเกต:** HSG-DET V.2 ที่ P3 SGBG ให้ผลดีกว่า HSG-DET ดั้งเดิมเล็กน้อย (+0.002 mAP50-95) แต่ไม่มี improvement ที่ชัดเจนสำหรับ small-object classes ซึ่งยังต้องตรวจสอบ per-class AP ต่อไป
 
 ---
 
