@@ -1292,6 +1292,49 @@ class DeferredRTDETRValidator(_RTDETRValidator):
     def init_metrics(self, model):
         super().init_metrics(model)
         self._deferred = []  # list of (preds_cpu, batch_cpu)
+        self.inference_times = []
+        self.preprocess_times = []
+        self.postprocess_times = []
+        # batch["img"] is a zero-memory proxy; disable visualize to avoid indexing it.
+        if hasattr(self, "args") and self.args:
+            self.args.visualize = False
+
+    def preprocess(self, batch):
+        import time
+        start = time.time()
+        result = super().preprocess(batch)
+        elapsed = time.time() - start
+        self.preprocess_times.append(elapsed)
+        bi = getattr(self, "batch_i", None) or len(self.preprocess_times) - 1
+        job_id = getattr(self, "_heartbeat_job_id", None)
+        total = len(self.dataloader) if self.dataloader is not None else None
+        if job_id and (bi % 32 == 0 or elapsed > 5.0):
+            try:
+                job_storage.append_job_log(
+                    job_id, "DEBUG",
+                    f"[val] batch {bi}/{total or '?'} preprocess={elapsed*1000:.0f}ms",
+                )
+            except Exception:
+                pass
+        return result
+
+    def postprocess(self, preds):
+        import time
+        start = time.time()
+        result = super().postprocess(preds)
+        elapsed = time.time() - start
+        self.postprocess_times.append(elapsed)
+        job_id = getattr(self, "_heartbeat_job_id", None)
+        if job_id and elapsed > 5.0:
+            bi = getattr(self, "batch_i", None) or len(self.postprocess_times) - 1
+            try:
+                job_storage.append_job_log(
+                    job_id, "WARNING",
+                    f"[val] batch {bi} SLOW postprocess={elapsed:.1f}s (possible NMS stall)",
+                )
+            except Exception:
+                pass
+        return result
 
     def update_metrics(self, preds, batch):
         # Stash preds + minimal batch on CPU. Skip img pixels (only shape is needed).
@@ -1307,8 +1350,10 @@ class DeferredRTDETRValidator(_RTDETRValidator):
             "ori_shape": batch["ori_shape"],
             "ratio_pad": batch.get("ratio_pad"),
             "im_file": batch.get("im_file"),
-            # Placeholder tensor preserving shape for `_prepare_batch` which reads `img.shape[2:]`
-            "img": torch.empty(img_shape, device="cpu"),
+                # Shape-only proxy — _prepare_batch only reads img.shape[2:].
+                # A full tensor would leak 48 GB (640 batches × 16×3×640×640).
+                # Use a zero-batch slice so shape=(0, C, H, W) → shape[2:] = (H, W) without memory.
+            "img": batch["img"][:0].cpu(),  # zero-memory shape proxy
         }
         self._deferred.append((preds_cpu, batch_cpu))
 
@@ -1455,5 +1500,7 @@ class JobCustomTrainer(CustomDetectionTrainer):
             val_args = _copy(self.args)
             if getattr(val_args, "conf", None) in (None, 0.001):
                 val_args.conf = 0.05
-            return DeferredRTDETRValidator(self.test_loader, save_dir=self.save_dir, args=val_args)
+            v = DeferredRTDETRValidator(self.test_loader, save_dir=self.save_dir, args=val_args)
+            v._heartbeat_job_id = getattr(self, "job_id", None)
+            return v
         return super().get_validator()
