@@ -1266,3 +1266,65 @@ class JobCustomTrainer(CustomDetectionTrainer):
         js.append_job_log(_job_id, "INFO",
             f"JobCustomTrainer.__init__ called with job_id: {_job_id}")
         super().__init__(cfg, overrides, _callbacks)
+
+    @staticmethod
+    def _is_rtdetr(cfg) -> bool:
+        """Detect whether a model config contains RTDETRDecoder."""
+        try:
+            if isinstance(cfg, (str, Path)):
+                text = Path(cfg).read_text()
+                return "RTDETRDecoder" in text
+            if isinstance(cfg, dict):
+                head = cfg.get("head", [])
+                return any("RTDETRDecoder" in str(layer) for layer in head)
+        except Exception:
+            pass
+        return False
+
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """Return model — RTDETRDetectionModel for RT-DETR, otherwise DetectionModel."""
+        if self._is_rtdetr(cfg):
+            from ultralytics.nn.tasks import RTDETRDetectionModel
+            model = RTDETRDetectionModel(
+                cfg, nc=self.data["nc"], ch=self.data["channels"],
+                verbose=verbose and RANK == -1
+            )
+            if weights:
+                model.load(weights)
+            return model
+        return super().get_model(cfg, weights, verbose)
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build dataset — RTDETRDataset for RT-DETR, otherwise standard YOLO dataset."""
+        # DetectionTrainer stores model as string path during init; after setup_model it's an nn.Module.
+        # We detect RTDETR from the original args.model path or the loaded model's yaml.
+        cfg = getattr(self.model, "yaml", None) or self.args.model
+        if self._is_rtdetr(cfg):
+            from copy import copy as _copy
+            from ultralytics.models.rtdetr.train import RTDETRDataset
+            from ultralytics.utils import colorstr
+            return RTDETRDataset(
+                img_path=img_path,
+                imgsz=self.args.imgsz,
+                batch_size=batch,
+                augment=mode == "train",
+                hyp=self.args,
+                rect=False,
+                cache=self.args.cache or None,
+                single_cls=self.args.single_cls or False,
+                prefix=colorstr(f"{mode}: "),
+                classes=self.args.classes,
+                data=self.data,
+                fraction=self.args.fraction if mode == "train" else 1.0,
+            )
+        return super().build_dataset(img_path, mode, batch)
+
+    def get_validator(self):
+        """Return validator — RTDETRValidator for RT-DETR, otherwise standard DetectionValidator."""
+        cfg = getattr(self.model, "yaml", None) or self.args.model
+        if self._is_rtdetr(cfg):
+            from copy import copy as _copy
+            from ultralytics.models.rtdetr.val import RTDETRValidator
+            self.loss_names = "giou_loss", "cls_loss", "l1_loss"
+            return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=_copy(self.args))
+        return super().get_validator()
