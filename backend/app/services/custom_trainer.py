@@ -1202,6 +1202,58 @@ class CustomDetectionTrainer(DetectionTrainer):
 # via the class-level registry _params_registry (keyed by job_id) before
 # model.train() is called, and read back inside __init__.
 
+from ultralytics.models.rtdetr.val import RTDETRValidator as _RTDETRValidator
+
+
+class DeferredRTDETRValidator(_RTDETRValidator):
+    """RT-DETR validator that defers CPU-heavy metric matching until after the val loop.
+
+    Problem: RT-DETR outputs 300 queries/image (no NMS). DetectionValidator.update_metrics
+    runs CPU match_predictions across 10 IoU thresholds × 300 preds × N_gt per image,
+    stalling the GPU between every batch.
+
+    Fix: During the val loop, stash (preds, batch) to CPU memory (img tensor dropped —
+    only shape is needed). After the loop, process all stashed items in get_stats().
+    GPU forward passes run back-to-back; metric matching happens once at the end.
+    """
+
+    def init_metrics(self, model):
+        super().init_metrics(model)
+        self._deferred = []  # list of (preds_cpu, batch_cpu)
+
+    def update_metrics(self, preds, batch):
+        # Stash preds + minimal batch on CPU. Skip img pixels (only shape is needed).
+        preds_cpu = [
+            {k: (v.detach().cpu() if hasattr(v, "detach") else v) for k, v in p.items()}
+            for p in preds
+        ]
+        img_shape = batch["img"].shape
+        batch_cpu = {
+            "cls": batch["cls"].detach().cpu(),
+            "bboxes": batch["bboxes"].detach().cpu(),
+            "batch_idx": batch["batch_idx"].detach().cpu(),
+            "ori_shape": batch["ori_shape"],
+            "ratio_pad": batch.get("ratio_pad"),
+            "im_file": batch.get("im_file"),
+            # Placeholder tensor preserving shape for `_prepare_batch` which reads `img.shape[2:]`
+            "img": torch.empty(img_shape, device="cpu"),
+        }
+        self._deferred.append((preds_cpu, batch_cpu))
+
+    def get_stats(self):
+        # Process all deferred metric updates now (after the GPU val loop finished).
+        # Temporarily switch self.device to CPU so _prepare_batch builds tensors on CPU.
+        prev_device = self.device
+        self.device = torch.device("cpu")
+        try:
+            for preds_cpu, batch_cpu in self._deferred:
+                super().update_metrics(preds_cpu, batch_cpu)
+        finally:
+            self.device = prev_device
+        self._deferred = []
+        return super().get_stats()
+
+
 class JobCustomTrainer(CustomDetectionTrainer):
     """Top-level trainer class used by model.train(trainer=JobCustomTrainer).
 
@@ -1325,12 +1377,11 @@ class JobCustomTrainer(CustomDetectionTrainer):
         cfg = getattr(self.model, "yaml", None) or self.args.model
         if self._is_rtdetr(cfg):
             from copy import copy as _copy
-            from ultralytics.models.rtdetr.val import RTDETRValidator
             self.loss_names = "giou_loss", "cls_loss", "l1_loss"
             # RT-DETR emits 300 queries/image; low conf passes ~all → metric matching is O(300*N_gt)/image.
             # Raise conf to 0.05 to cut metric-matching cost ~6× with negligible mAP impact.
             val_args = _copy(self.args)
             if getattr(val_args, "conf", None) in (None, 0.001):
                 val_args.conf = 0.05
-            return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=val_args)
+            return DeferredRTDETRValidator(self.test_loader, save_dir=self.save_dir, args=val_args)
         return super().get_validator()
