@@ -68,7 +68,8 @@ head:
 
   # ── RT-DETR Transformer Decoder Head ──────────────────────────────────────
   # แทนที่ Detect เดิมด้วย RTDETRDecoder
-  # Args: [num_classes, hidden_dim, num_queries, [input_channels]]
+  # Args: [num_classes, hidden_dim, num_queries]
   # hidden_dim: ปกติใช้ 256 สำหรับการคำนวณที่สมดุล
   # num_queries: 300 คือมาตรฐานที่ให้ mAP สูงและประมวลผลเร็ว
-  - [[18, 21, 24], 1, RTDETRDecoder, [nc, 256, 300, [256, 512, 1024]]] # 25
+  # NOTE: channels [P3, P4, P5] are auto-inserted by parse_model at index 1
+  - [[18, 21, 24], 1, RTDETRDecoder, [nc, 256, 300]] # 25
