@@ -674,7 +674,7 @@ def _training_worker(
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        from ultralytics import YOLO
+        from ultralytics import YOLO, RTDETR
         from . import dataset_yaml, dataset_registry
         from . import module_registry
         from .custom_trainer import CustomDetectionTrainer
@@ -1053,7 +1053,18 @@ def _training_worker(
         with contextlib.redirect_stdout(log_writer), contextlib.redirect_stderr(log_writer):
             if resume_path:
                 # Resume mode: load directly from checkpoint — Ultralytics restores all state
-                model = YOLO(resume_path)
+                # Detect RTDETR from checkpoint metadata (fallback: check original YAML)
+                try:
+                    from ultralytics.utils.torch_utils import safe_load
+                    ckpt = safe_load(resume_path)
+                    ckpt_yaml = ckpt.get("model", {}).get("yaml", "")
+                    is_rtdetr_resume = "RTDETRDecoder" in (ckpt_yaml if isinstance(ckpt_yaml, str) else str(ckpt_yaml))
+                except Exception:
+                    is_rtdetr_resume = False
+                if is_rtdetr_resume:
+                    model = RTDETR(resume_path)
+                else:
+                    model = YOLO(resume_path)
                 job_storage.append_job_log(job_id, "INFO", f"Resuming from checkpoint: {resume_path}")
             elif yolo_model:
                 # Official YOLO model mode
@@ -1067,8 +1078,18 @@ def _training_worker(
                     job_storage.append_job_log(job_id, "INFO", f"Using official YOLO model: {yolo_model}.yaml (from scratch)")
             else:
                 # Custom model from YAML
-                model = YOLO(yaml_path, task=task)
-                job_storage.append_job_log(job_id, "INFO", f"Created model from YAML: {yaml_path}")
+                # Detect RTDETRDecoder to use correct model class (RTDETR uses RTDETRDetectionLoss, not v8DetectionLoss)
+                try:
+                    yaml_text = Path(yaml_path).read_text()
+                    is_rtdetr = "RTDETRDecoder" in yaml_text
+                except Exception:
+                    is_rtdetr = False
+                if is_rtdetr:
+                    model = RTDETR(yaml_path)
+                    job_storage.append_job_log(job_id, "INFO", f"Created RTDETR model from YAML: {yaml_path}")
+                else:
+                    model = YOLO(yaml_path, task=task)
+                    job_storage.append_job_log(job_id, "INFO", f"Created model from YAML: {yaml_path}")
                 job_storage.append_job_log(
                     job_id,
                     "DEBUG",
@@ -1649,6 +1670,14 @@ def _training_worker(
             # NOTE: This is used when NaN happens before last.pt exists.
             if yolo_model:
                 return YOLO(f"{yolo_model}.pt") if use_yolo_pretrained else YOLO(f"{yolo_model}.yaml")
+            # Detect RTDETRDecoder to use correct model class
+            try:
+                yaml_text = Path(yaml_path).read_text()
+                is_rtdetr_retry = "RTDETRDecoder" in yaml_text
+            except Exception:
+                is_rtdetr_retry = False
+            if is_rtdetr_retry:
+                return RTDETR(yaml_path)
             return YOLO(yaml_path, task=task)
 
         # Patch subprocess.run to capture DDP worker stderr before re-raising.
