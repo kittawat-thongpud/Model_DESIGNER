@@ -1006,6 +1006,80 @@ _HSG_DET_MODULES: list[dict[str, Any]] = [
 ]
 
 
+# ── HSG-DETR custom modules (registered via hsg_detr package) ─────────────────
+_HSG_DETR_MODULES: list[dict[str, Any]] = [
+    {
+        "name": "SparseGlobalTokenBlock",
+        "category": "attention",
+        "description": (
+            "Sparse-Token Global Self-Attention (HSG-DETR). "
+            "Internal top-k token selection, sparse self-attention on selected tokens, "
+            "scatter-back to spatial grid, and gated residual fusion. "
+            "Single tensor in / single tensor out for Ultralytics parse_model compatibility. "
+            "Supports dense / topk / hybrid ablation modes."
+        ),
+        "args": [
+            {"name": "out_channels", "type": "int", "default": 256,
+             "help": "Number of channels (channel-preserving; auto-injected by parse_model)"},
+            {"name": "token_budget", "type": "int", "default": 384,
+             "help": "Hard cap on selected tokens (k ≤ min(budget, ratio·N))"},
+            {"name": "ratio", "type": "float", "default": 0.25,
+             "help": "Fraction of spatial tokens to retain (0 < ratio ≤ 1)"},
+            {"name": "mode", "type": "str", "default": "topk",
+             "help": "dense (full attn), topk (sparse attn), or hybrid (local+sparse fusion)"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
+        "name": "SGStem",
+        "category": "backbone",
+        "description": (
+            "HSG-DETR sparse-global stem. Two-stage downsampling with depthwise "
+            "intermediate for spatial detail preservation. Replaces the first two "
+            "Conv(stride=2) layers in a standard YOLO backbone."
+        ),
+        "args": [
+            {"name": "out_channels", "type": "int", "default": 128,
+             "help": "Output channels (auto-injected by parse_model; input is always 3)"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
+        "name": "SGDown",
+        "category": "backbone",
+        "description": (
+            "HSG-DETR clue-preserving downsampling. Separates 1×1 channel alignment "
+            "from 3×3 stride-2 downsampling to enrich saliency cues before spatial "
+            "resolution reduction. Helps downstream token selectors retain small-object signals."
+        ),
+        "args": [
+            {"name": "out_channels", "type": "int", "default": 256,
+             "help": "Output channels (auto-injected by parse_model)"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
+        "name": "RTDETRDecoderSGB",
+        "category": "head",
+        "description": (
+            "HSG-DETR SGB-guided RT-DETR decoder. Inherits RTDETRDecoder and overrides "
+            "query selection to combine classification score with token saliency "
+            "(L2 activation energy) from encoder features. "
+            "Saliency weight is set via the ALPHA class constant (default 0.5)."
+        ),
+        "args": [
+            {"name": "nc", "type": "int", "default": 80,
+             "help": "Number of classes"},
+            {"name": "hd", "type": "int", "default": 256,
+             "help": "Hidden dimension of decoder"},
+            {"name": "nq", "type": "int", "default": 300,
+             "help": "Number of queries"},
+        ],
+        "source": "hsg_detr",
+    },
+]
+
+
 # ── RT-DETR built-in blocks (part of ultralytics.nn.modules) ─────────────────
 # No extra registration needed — these are shipped with Ultralytics.
 
@@ -1116,6 +1190,10 @@ def get_all_modules() -> list[dict[str, Any]]:
     for m in _HSG_DET_MODULES:
         modules.append({**m})
 
+    # HSG-DETR custom blocks
+    for m in _HSG_DETR_MODULES:
+        modules.append({**m})
+
     # Custom user modules
     for rec in module_storage.list_modules():
         modules.append({
@@ -1157,6 +1235,12 @@ def register_custom_modules() -> None:
     except ImportError as e:
         print(f"Warning: Could not import hsg_det: {e}")
 
-    # 2. Future: Dynamic user modules from module_storage
+    # 2. HSG-DETR modules
+    try:
+        import hsg_detr  # noqa: F401
+    except ImportError as e:
+        print(f"Warning: Could not import hsg_detr: {e}")
+
+    # 3. Future: Dynamic user modules from module_storage
     # (Currently they are just config-based, but if we add code generation
     # we would import them here)
