@@ -78,6 +78,7 @@ secrets/
 # ── Node (frontend) ───────────────────────────────────────────────────────────
 node_modules/
 frontend/build/
+frontend/dist/
 frontend/.next/
 frontend/.nuxt/
 frontend/out/
