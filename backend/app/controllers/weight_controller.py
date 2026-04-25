@@ -29,9 +29,10 @@ _WEIGHTS_VISUALIZATION = get_weights_config().get("visualization", {})
 async def create_empty_weight(body: CreateEmptyRequest):
     """Generate a weight file from a model architecture or official YOLO checkpoint.
 
-    - If ``yolo_model`` is set (e.g. 'yolov8n') uses the official Ultralytics model.
-      ``use_pretrained=True`` loads COCO-pretrained weights; False gives random init.
-    - Otherwise uses the custom model YAML identified by ``model_id``.
+    Priority (first match wins):
+    1. ``yolo_model``  → official Ultralytics model (pretrained or random init).
+    2. ``arch_plugin`` or ``model_id`` starting with ``arch:`` → registered arch plugin.
+    3. ``model_id``      → custom model YAML from the database.
     """
     import torch
     from ultralytics import YOLO
@@ -92,9 +93,91 @@ async def create_empty_weight(body: CreateEmptyRequest):
             "file_size_bytes": pt_path.stat().st_size,
         }
 
-    # ── Branch B: Custom model YAML ───────────────────────────────────────────
+    # ── Branch B: Arch plugin model ───────────────────────────────────────────
+    if body.arch_plugin or (body.model_id and body.model_id.startswith("arch:")):
+        from ..plugins.loader import get_arch_plugin
+        from ..utils.yaml_utils import prepare_model_yaml
+
+        if body.arch_plugin:
+            arch_plugin = get_arch_plugin(body.arch_plugin.strip().lower())
+            if not arch_plugin:
+                raise HTTPException(status_code=404, detail=f"Arch plugin not found: {body.arch_plugin!r}")
+        else:
+            family_key = body.model_id[len("arch:"):]
+            scale = (body.model_scale or "").strip().lower()
+            arch_key = f"{family_key}_{scale}" if scale else family_key
+            arch_plugin = get_arch_plugin(arch_key)
+            if arch_plugin is None and scale:
+                arch_plugin = get_arch_plugin(family_key)
+            if arch_plugin is None:
+                raise HTTPException(status_code=404, detail=f"Arch plugin not found: {arch_key!r}")
+
+        preflight_err = arch_plugin.preflight_check()
+        if preflight_err:
+            raise HTTPException(status_code=400, detail=preflight_err)
+
+        arch_plugin.register_modules()
+        yaml_path = arch_plugin.yaml_path()
+
+        try:
+            scale = body.model_scale or arch_plugin.scale
+            patched_yaml = prepare_model_yaml(yaml_path, scale=scale)
+            model = YOLO(str(patched_yaml), task=arch_plugin.task_type)
+            sd = model.model.state_dict()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Arch plugin model instantiation failed: {e}")
+        finally:
+            Path(patched_yaml).unlink(missing_ok=True)
+
+        _scale_upper = (arch_plugin.scale or "").upper()
+        default_name = (
+            f"{arch_plugin.family_display_name} {_scale_upper}"
+            if _scale_upper else arch_plugin.family_display_name
+        )
+        display_name = body.name.strip() if body.name.strip() else default_name
+        model_id_meta = f"arch:{arch_plugin.family}"
+
+        weight_id = weight_storage.save_weight_meta(
+            model_id=model_id_meta,
+            model_name=display_name,
+            job_id=None,
+            dataset="(empty)",
+            epochs_trained=0,
+            final_accuracy=None,
+            final_loss=None,
+        )
+        pt_path = weight_storage.weight_pt_path(weight_id)
+        ckpt = {
+            "model": model.model,
+            "epoch": -1,
+            "optimizer": None,
+            "train_args": {"model_arch": arch_plugin.name},
+            "date": None,
+            "version": None,
+        }
+        torch.save(ckpt, str(pt_path))
+
+        meta = weight_storage.load_weight_meta(weight_id)
+        if meta:
+            meta["file_size_bytes"] = pt_path.stat().st_size
+            meta["key_count"] = len(sd)
+            meta["param_count"] = sum(v.numel() for v in sd.values())
+            weight_storage._store.save(weight_id, meta)
+
+        logger.log("system", "INFO", "Arch plugin weight created", {
+            "weight_id": weight_id, "arch_plugin": arch_plugin.name, "keys": len(sd),
+        })
+        return {
+            "weight_id": weight_id,
+            "model_id": model_id_meta,
+            "model_name": display_name,
+            "key_count": len(sd),
+            "file_size_bytes": pt_path.stat().st_size,
+        }
+
+    # ── Branch C: Custom model YAML ───────────────────────────────────────────
     if not body.model_id:
-        raise HTTPException(status_code=400, detail="Either model_id or yolo_model must be provided")
+        raise HTTPException(status_code=400, detail="Either model_id, yolo_model, or arch_plugin must be provided")
 
     record = model_storage.load_model(body.model_id)
     if not record:

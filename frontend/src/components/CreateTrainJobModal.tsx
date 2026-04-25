@@ -87,19 +87,15 @@ const DEFAULT_CONFIG: TrainConfig = {
 
 type Tab = 'general' | 'optimizer' | 'loss' | 'augmentation' | 'validation';
 
-// Official YOLO model as virtual model card (scale selected via existing scale selector)
+// Official YOLO model families (scale selected via scale selector)
 const OFFICIAL_YOLO_MODELS: ModelSummary[] = [
-  {
-    model_id: 'yolo:yolov8',
-    name: 'YOLOv8 (Official)',
-    task: 'detect',
-    layer_count: 225,
-    params: 3157200,  // Base params for 'n' scale
-    flops: 8.9,       // Base FLOPs for 'n' scale
-    input_shape: [3, 640, 640],
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  },
+  { model_id: 'yolo:yolov5', name: 'YOLOv5 (Official)', task: 'detect', layer_count: 214, params: 2_600_000, flops: 7.2, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:yolov8', name: 'YOLOv8 (Official)', task: 'detect', layer_count: 225, params: 3_200_000, flops: 8.9, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:yolov9', name: 'YOLOv9 (Official)', task: 'detect', layer_count: 236, params: 3_900_000, flops: 10.5, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:yolov10', name: 'YOLOv10 (Official)', task: 'detect', layer_count: 245, params: 2_700_000, flops: 8.1, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:yolo11', name: 'YOLO11 (Official)', task: 'detect', layer_count: 228, params: 2_600_000, flops: 7.8, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:yolo26', name: 'YOLO26 (Official)', task: 'detect', layer_count: 250, params: 3_200_000, flops: 8.9, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { model_id: 'yolo:rtdetr', name: 'RT-DETR (Official)', task: 'detect', layer_count: 198, params: 42_000_000, flops: 130.0, input_shape: [3, 640, 640], created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
 ];
 
 function archFamilyToModelSummary(f: ArchFamily): ModelSummary {
@@ -307,8 +303,16 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       // Detect if official YOLO model is selected
       const finalConfig = { ...config };
       if (selectedModelId.startsWith('yolo:')) {
-        // Use YOLOv8 with selected scale (e.g., 'yolov8n', 'yolov8s', 'yolov8m', 'yolov8l', 'yolov8x')
-        finalConfig.yolo_model = `yolov8${modelScale}`;
+        const family = selectedModelId.split(':')[1]; // e.g., 'yolov8', 'yolov5', 'rtdetr'
+        let yoloKey: string;
+        if (family === 'rtdetr') {
+          yoloKey = `rtdetr-${modelScale}`;
+        } else if (family === 'yolov5') {
+          yoloKey = `yolov5${modelScale}`;
+        } else {
+          yoloKey = `${family}${modelScale}`;
+        }
+        finalConfig.yolo_model = yoloKey;
         // use_yolo_pretrained is already set by user via radio buttons in UI
       } else if (selectedModelId.startsWith('arch:')) {
         // Arch plugin model — backend resolves family + model_scale to the specific plugin
@@ -511,6 +515,14 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             const s = selectedArchFamily.supported_scales.find(sc => sc.scale === modelScale);
                             return s ? <span className="text-violet-400 ml-1">— {s.label}</span> : null;
                           })()}
+                          {!selectedArchFamily && selectedModelId?.startsWith('yolo:') && (() => {
+                            const family = selectedModelId.split(':')[1];
+                            const familyLabels: Record<string, string> = {
+                              yolov5: 'YOLOv5', yolov8: 'YOLOv8', yolov9: 'YOLOv9',
+                              yolov10: 'YOLOv10', yolo11: 'YOLO11', yolo26: 'YOLO26', rtdetr: 'RT-DETR',
+                            };
+                            return <span className="text-amber-400 ml-1">({familyLabels[family] || family}{modelScale.toUpperCase()})</span>;
+                          })()}
                         </span>
                         {selectedModel?.input_shape && (
                           <span className="text-slate-500">
@@ -659,10 +671,26 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             ) : 'Model Scale'}
                           </label>
                           <div className="flex gap-2 flex-wrap">
-                            {(selectedArchFamily
-                              ? selectedArchFamily.supported_scales.map(s => ({ key: s.scale, label: s.scale.toUpperCase(), sublabel: s.label }))
-                              : ['n', 's', 'm', 'l', 'x'].map(s => ({ key: s, label: s.toUpperCase(), sublabel: undefined }))
-                            ).map(({ key, label, sublabel }) => (
+                            {(() => {
+                              if (selectedArchFamily) {
+                                return selectedArchFamily.supported_scales.map(s => ({ key: s.scale, label: s.scale.toUpperCase(), sublabel: s.label }));
+                              }
+                              if (selectedModelId?.startsWith('yolo:')) {
+                                const family = selectedModelId.split(':')[1];
+                                const OFFICIAL_SCALES: Record<string, string[]> = {
+                                  yolov5: ['nu','su','mu','lu','xu'],
+                                  yolov8: ['n','s','m','l','x'],
+                                  yolov9: ['t','s','m','c','e'],
+                                  yolov10: ['n','s','m','b','l','x'],
+                                  yolo11: ['n','s','m','l','x'],
+                                  yolo26: ['n','s','m','l','x'],
+                                  rtdetr: ['l','x'],
+                                };
+                                const scales = OFFICIAL_SCALES[family] || ['n','s','m','l','x'];
+                                return scales.map(s => ({ key: s, label: s.toUpperCase(), sublabel: undefined }));
+                              }
+                              return ['n', 's', 'm', 'l', 'x'].map(s => ({ key: s, label: s.toUpperCase(), sublabel: undefined }));
+                            })().map(({ key, label, sublabel }) => (
                               <button
                                 key={key}
                                 onClick={() => setModelScale(key)}

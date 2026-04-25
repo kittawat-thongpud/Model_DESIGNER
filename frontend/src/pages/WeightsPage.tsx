@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
-import type { WeightRecord, ModelSummary } from '../types';
+import type { WeightRecord, ModelSummary, ArchFamily } from '../types';
 import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download, BarChart2, Pencil, Check, Package, ChevronDown } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { fmtSize, fmtDataset } from '../utils/format';
@@ -32,10 +32,16 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [createScale, setCreateScale] = useState<string>('n');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  // Mode: official | plugin | custom
+  const [createMode, setCreateMode] = useState<'official' | 'plugin' | 'custom'>('official');
   // Official YOLO
-  const [createMode, setCreateMode] = useState<'custom' | 'official'>('official');
-  const [yoloVariant, setYoloVariant] = useState<string>('yolov8');
+  const [officialFamily, setOfficialFamily] = useState<string>('yolov8');
+  const [officialScale, setOfficialScale] = useState<string>('n');
   const [usePretrained, setUsePretrained] = useState(true);
+  // Plugin
+  const [archFamilies, setArchFamilies] = useState<ArchFamily[]>([]);
+  const [pluginFamily, setPluginFamily] = useState<string>('');
+  const [pluginScale, setPluginScale] = useState<string>('n');
 
   // Import state
   const [importing, setImporting] = useState(false);
@@ -59,6 +65,19 @@ export default function WeightsPage({ onOpenWeight }: Props) {
 
   const load = () => { loadWeights(null, true); };
   useEffect(() => { loadWeights(); }, []);
+
+  // Fetch arch families when create modal opens
+  useEffect(() => {
+    if (showCreateModal) {
+      api.listArchPlugins().then((families) => {
+        setArchFamilies(families ?? []);
+        if (families && families.length > 0 && !pluginFamily) {
+          setPluginFamily(families[0].family);
+          setPluginScale(families[0].supported_scales[0]?.scale ?? 'n');
+        }
+      }).catch(() => {});
+    }
+  }, [showCreateModal]);
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -111,7 +130,9 @@ export default function WeightsPage({ onOpenWeight }: Props) {
               onClick={() => {
                 setShowCreateModal(true);
                 setCreateError(null);
-                loadModels(true);
+                setCreateMode('official');
+                setOfficialFamily('yolov8');
+                setOfficialScale('n');
               }}
               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer"
             >
@@ -341,10 +362,10 @@ export default function WeightsPage({ onOpenWeight }: Props) {
           </div>
         )}
 
-        {/* Create Empty Weight Modal */}
+        {/* Create Weight Modal */}
         {showCreateModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowCreateModal(false)}>
-            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[480px] overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[520px] overflow-hidden" onClick={e => e.stopPropagation()}>
               <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
                 <h3 className="text-white font-semibold text-sm flex items-center gap-2">
                   <Plus size={16} className="text-indigo-400" />
@@ -357,112 +378,182 @@ export default function WeightsPage({ onOpenWeight }: Props) {
               <div className="p-5 space-y-4">
                 {/* Mode toggle */}
                 <div className="flex gap-1 p-1 bg-slate-800 rounded-lg">
-                  {(['official', 'custom'] as const).map(mode => (
+                  {([
+                    { key: 'official' as const, label: '⚡ Official', desc: 'YOLO / RT-DETR' },
+                    { key: 'plugin' as const, label: '🔌 Plugin', desc: 'Arch plugins' },
+                    { key: 'custom' as const, label: '🔧 Custom', desc: 'Model Designer' },
+                  ]).map(m => (
                     <button
-                      key={mode}
-                      onClick={() => setCreateMode(mode)}
-                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer ${
-                        createMode === mode
+                      key={m.key}
+                      onClick={() => setCreateMode(m.key)}
+                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer text-center ${
+                        createMode === m.key
                           ? 'bg-indigo-600 text-white shadow'
                           : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      {mode === 'official' ? '⚡ Official YOLO' : '🔧 Custom Model'}
+                      <div>{m.label}</div>
+                      <div className="text-[9px] font-normal opacity-70">{m.desc}</div>
                     </button>
                   ))}
                 </div>
 
-                {/* Official YOLO section */}
+                {/* ── OFFICIAL ── */}
                 {createMode === 'official' && (() => {
-                  const ARCH_SCALES: Record<string, string[]> = {
-                    yolov8: ['n','s','m','l','x'],
-                    yolov9: ['t','s','m','c','e'],
-                    yolov10: ['n','s','m','b','l','x'],
-                    yolov11: ['n','s','m','l','x'],
-                    rtdetr: ['l','x'],
-                  };
-                  const availableScales = ARCH_SCALES[yoloVariant] ?? ['n','s','m','l','x'];
-                  const effectiveScale = availableScales.includes(createScale) ? createScale : availableScales[0];
-                  const modelKey = yoloVariant === 'rtdetr' ? `rtdetr-${effectiveScale}` : `${yoloVariant}${effectiveScale}`;
+                  const OFFICIAL_FAMILIES: { key: string; label: string; scales: string[] }[] = [
+                    { key: 'yolov5', label: 'YOLOv5', scales: ['nu','su','mu','lu','xu'] },
+                    { key: 'yolov8', label: 'YOLOv8', scales: ['n','s','m','l','x'] },
+                    { key: 'yolov9', label: 'YOLOv9', scales: ['t','s','m','c','e'] },
+                    { key: 'yolov10', label: 'YOLOv10', scales: ['n','s','m','b','l','x'] },
+                    { key: 'yolo11', label: 'YOLO11', scales: ['n','s','m','l','x'] },
+                    { key: 'yolo26', label: 'YOLO26', scales: ['n','s','m','l','x'] },
+                    { key: 'rtdetr', label: 'RT-DETR', scales: ['l','x'] },
+                  ];
+                  const family = OFFICIAL_FAMILIES.find(f => f.key === officialFamily) ?? OFFICIAL_FAMILIES[1];
+                  const effScale = family.scales.includes(officialScale) ? officialScale : family.scales[0];
+                  const modelKey = officialFamily === 'rtdetr'
+                    ? `rtdetr-${effScale}`
+                    : officialFamily === 'yolov5'
+                    ? `yolov5${effScale}`
+                    : `${officialFamily}${effScale}`;
                   return (
-                  <>
-                    <div>
-                      <label className="block text-[10px] text-slate-500 mb-1.5">Architecture</label>
-                      <div className="flex flex-wrap gap-1.5">
-                        {(['yolov8','yolov9','yolov10','yolov11','rtdetr'] as const).map(v => (
-                          <button
-                            key={v}
-                            onClick={() => {
-                              setYoloVariant(v);
-                              const sc = ARCH_SCALES[v];
-                              if (!sc.includes(createScale)) setCreateScale(sc[0]);
-                            }}
-                            className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ${
-                              yoloVariant === v
-                                ? v === 'rtdetr'
-                                  ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-400'
-                                  : 'bg-amber-500/20 border-amber-500/50 text-amber-400'
-                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
-                            }`}
-                          >
-                            {v === 'rtdetr' ? 'RT-DETR' : v.replace('yolo', 'YOLO')}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <label className="block text-[10px] text-slate-500 mb-1.5">Scale</label>
-                      <div className="flex gap-1.5">
-                        {availableScales.map(sc => (
-                          <button
-                            key={sc}
-                            onClick={() => setCreateScale(sc)}
-                            className={`flex-1 py-1.5 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
-                              effectiveScale === sc
-                                ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
-                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
-                            }`}
-                          >
-                            {sc.toUpperCase()}
-                          </button>
-                        ))}
-                      </div>
-                      <p className="text-[10px] text-slate-600 mt-1">
-                        Model: <span className="text-amber-400 font-mono">{modelKey}</span>
-                      </p>
-                    </div>
-                    {/* Pretrained toggle */}
-                    <div className="flex items-center justify-between bg-slate-800/60 rounded-lg px-3 py-2.5">
+                    <>
                       <div>
-                        <div className="text-xs text-white font-medium">Load Pretrained Weights</div>
-                        <div className="text-[10px] text-slate-500 mt-0.5">
-                          {usePretrained
-                            ? 'Download COCO-pretrained checkpoint from Ultralytics'
-                            : 'Random initialization — no download needed'}
+                        <label className="block text-[10px] text-slate-500 mb-1.5">Family</label>
+                        <div className="flex flex-wrap gap-1.5">
+                          {OFFICIAL_FAMILIES.map(f => (
+                            <button
+                              key={f.key}
+                              onClick={() => {
+                                setOfficialFamily(f.key);
+                                if (!f.scales.includes(officialScale as any)) setOfficialScale(f.scales[0]);
+                              }}
+                              className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ${
+                                officialFamily === f.key
+                                  ? f.key === 'rtdetr'
+                                    ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-400'
+                                    : 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                              }`}
+                            >
+                              {f.label}
+                            </button>
+                          ))}
                         </div>
                       </div>
-                      <button
-                        onClick={() => setUsePretrained(v => !v)}
-                        className={`w-10 h-5.5 rounded-full relative transition-colors cursor-pointer shrink-0 ml-3 ${
-                          usePretrained ? 'bg-amber-500' : 'bg-slate-600'
-                        }`}
-                        style={{ minWidth: '2.5rem', height: '1.375rem' }}
-                      >
-                        <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
-                          usePretrained ? 'translate-x-5' : 'translate-x-0.5'
-                        }`} />
-                      </button>
-                    </div>
-                    {usePretrained && (
-                      <p className="text-[10px] text-amber-400/80 bg-amber-500/5 border border-amber-500/20 rounded-lg px-3 py-2">
-                        ⚡ Pretrained on COCO — ideal for fine-tuning or transfer learning
-                      </p>
-                    )}
-                  </>
+                      <div>
+                        <label className="block text-[10px] text-slate-500 mb-1.5">Scale</label>
+                        <div className="flex gap-1.5">
+                          {family.scales.map(sc => (
+                            <button
+                              key={sc}
+                              onClick={() => setOfficialScale(sc)}
+                              className={`flex-1 py-1.5 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                                effScale === sc
+                                  ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
+                                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                              }`}
+                            >
+                              {sc.toUpperCase()}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-slate-600 mt-1">
+                          Model: <span className="text-amber-400 font-mono">{modelKey}</span>
+                        </p>
+                      </div>
+                      <div className="flex items-center justify-between bg-slate-800/60 rounded-lg px-3 py-2.5">
+                        <div>
+                          <div className="text-xs text-white font-medium">Load Pretrained Weights</div>
+                          <div className="text-[10px] text-slate-500 mt-0.5">
+                            {usePretrained ? 'Download COCO-pretrained from Ultralytics' : 'Random init — no download'}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => setUsePretrained(v => !v)}
+                          className={`w-10 h-5.5 rounded-full relative transition-colors cursor-pointer shrink-0 ml-3 ${
+                            usePretrained ? 'bg-amber-500' : 'bg-slate-600'
+                          }`}
+                          style={{ minWidth: '2.5rem', height: '1.375rem' }}
+                        >
+                          <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                            usePretrained ? 'translate-x-5' : 'translate-x-0.5'
+                          }`} />
+                        </button>
+                      </div>
+                      {usePretrained && (
+                        <p className="text-[10px] text-amber-400/80 bg-amber-500/5 border border-amber-500/20 rounded-lg px-3 py-2">
+                          ⚡ Pretrained on COCO — ideal for fine-tuning or transfer learning
+                        </p>
+                      )}
+                    </>
                   );
                 })()}
 
-                {/* Custom model section */}
+                {/* ── PLUGIN ── */}
+                {createMode === 'plugin' && (
+                  <>
+                    <div>
+                      <label className="block text-[10px] text-slate-500 mb-1.5">Plugin Family</label>
+                      {archFamilies.length === 0 ? (
+                        <div className="text-xs text-slate-500 py-2">Loading plugins…</div>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5">
+                          {archFamilies.map(f => (
+                            <button
+                              key={f.family}
+                              onClick={() => {
+                                setPluginFamily(f.family);
+                                setPluginScale(f.supported_scales[0]?.scale ?? 'n');
+                              }}
+                              className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ${
+                                pluginFamily === f.family
+                                  ? 'bg-violet-500/20 border-violet-500/50 text-violet-400'
+                                  : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                              }`}
+                            >
+                              {f.display_name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {pluginFamily && (() => {
+                      const fam = archFamilies.find(f => f.family === pluginFamily);
+                      if (!fam) return null;
+                      const effScale = fam.supported_scales.find(s => s.scale === pluginScale)?.scale
+                        ?? fam.supported_scales[0]?.scale ?? 'n';
+                      return (
+                        <>
+                          <div>
+                            <label className="block text-[10px] text-slate-500 mb-1.5">Scale</label>
+                            <div className="flex gap-1.5 flex-wrap">
+                              {fam.supported_scales.map(s => (
+                                <button
+                                  key={s.scale}
+                                  onClick={() => setPluginScale(s.scale)}
+                                  className={`min-w-[48px] py-1.5 px-2 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                                    effScale === s.scale
+                                      ? 'bg-violet-500/20 border-violet-500/50 text-violet-400'
+                                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                                  }`}
+                                >
+                                  <div>{s.scale.toUpperCase()}</div>
+                                  <div className="text-[9px] font-normal opacity-70 leading-tight">{s.label}</div>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <p className="text-[10px] text-slate-600">
+                            Plugin: <span className="text-violet-400 font-mono">{fam.supported_scales.find(s => s.scale === effScale)?.plugin_name ?? ''}</span>
+                          </p>
+                        </>
+                      );
+                    })()}
+                  </>
+                )}
+
+                {/* ── CUSTOM ── */}
                 {createMode === 'custom' && (
                   <>
                     <div>
@@ -508,7 +599,11 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                     type="text"
                     value={weightName}
                     onChange={(e) => setWeightName(e.target.value)}
-                    placeholder={createMode === 'official' ? `e.g. ${yoloVariant === 'rtdetr' ? `rtdetr-${createScale}` : `${yoloVariant}${createScale}`}-finetune` : 'e.g. MyModel-init'}
+                    placeholder={createMode === 'official'
+                      ? `e.g. ${officialFamily === 'rtdetr' ? `rtdetr-${officialScale}` : `${officialFamily}${officialScale}`}-finetune`
+                      : createMode === 'plugin'
+                      ? 'e.g. HSG-DETR-N-init'
+                      : 'e.g. MyModel-init'}
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none placeholder:text-slate-600"
                   />
                 </div>
@@ -529,12 +624,23 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                 <button
                   onClick={async () => {
                     if (createMode === 'custom' && !selectedModelId) return;
+                    if (createMode === 'plugin' && !pluginFamily) return;
                     setCreating(true);
                     setCreateError(null);
                     try {
                       if (createMode === 'official') {
-                        const yoloKey = yoloVariant === 'rtdetr' ? `rtdetr-${createScale}` : `${yoloVariant}${createScale}`;
-                        await api.createEmptyWeight('', weightName, createScale, yoloKey, usePretrained);
+                        const yoloKey = officialFamily === 'rtdetr'
+                          ? `rtdetr-${officialScale}`
+                          : officialFamily === 'yolov5'
+                          ? `yolov5${officialScale}`
+                          : `${officialFamily}${officialScale}`;
+                        await api.createEmptyWeight('', weightName, officialScale, yoloKey, usePretrained);
+                      } else if (createMode === 'plugin') {
+                        const fam = archFamilies.find(f => f.family === pluginFamily);
+                        const scaleEntry = fam?.supported_scales.find(s => s.scale === pluginScale);
+                        if (scaleEntry) {
+                          await api.createEmptyWeight('', weightName, pluginScale, undefined, false, scaleEntry.plugin_name);
+                        }
                       } else {
                         await api.createEmptyWeight(selectedModelId, weightName, createScale);
                       }
@@ -542,6 +648,8 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                       setSelectedModelId('');
                       setWeightName('');
                       setCreateScale('n');
+                      setOfficialScale('n');
+                      setPluginScale('n');
                       load();
                     } catch (e) {
                       setCreateError((e as Error).message);
@@ -549,7 +657,11 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                       setCreating(false);
                     }
                   }}
-                  disabled={(createMode === 'custom' && !selectedModelId) || creating}
+                  disabled={
+                    (createMode === 'custom' && !selectedModelId) ||
+                    (createMode === 'plugin' && !pluginFamily) ||
+                    creating
+                  }
                   className="flex items-center gap-1.5 px-4 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-default"
                 >
                   {creating ? <Loader2 size={12} className="animate-spin" /> : <Network size={12} />}

@@ -47,6 +47,17 @@ _YOLO_PRETRAINED: list[dict] = [
      "param_count": 3_400_000, "description": "YOLOv8 Nano segmentation — COCO"},
     {"model_key": "yolov8s-seg", "display_name": "YOLOv8s-seg", "task": "segmentation",
      "param_count": 11_800_000, "description": "YOLOv8 Small segmentation — COCO"},
+    # YOLO26 Detection
+    {"model_key": "yolo26n", "display_name": "YOLO26n (Nano)", "task": "detection",
+     "param_count": 3_200_000, "description": "YOLO26 Nano — 3.2M params, fastest, NMS-free"},
+    {"model_key": "yolo26s", "display_name": "YOLO26s (Small)", "task": "detection",
+     "param_count": 11_200_000, "description": "YOLO26 Small — 11.2M params, NMS-free"},
+    {"model_key": "yolo26m", "display_name": "YOLO26m (Medium)", "task": "detection",
+     "param_count": 25_900_000, "description": "YOLO26 Medium — 25.9M params, NMS-free"},
+    {"model_key": "yolo26l", "display_name": "YOLO26l (Large)", "task": "detection",
+     "param_count": 43_700_000, "description": "YOLO26 Large — 43.7M params, NMS-free"},
+    {"model_key": "yolo26x", "display_name": "YOLO26x (XLarge)", "task": "detection",
+     "param_count": 68_200_000, "description": "YOLO26 XLarge — 68.2M params, NMS-free"},
 ]
 
 _DOWNLOAD_URL = "https://github.com/ultralytics/assets/releases/download/v8.2.0/{key}.pt"
