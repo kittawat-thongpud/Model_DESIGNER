@@ -1,6 +1,4 @@
-# HSG-DETR — Sparse-Token SGB with RT-DETR Decoder
-# Phase 1: Standard Conv backbone + SparseGlobalTokenBlock in neck/head
-# Phase 2: SGStem / SGDown replace Conv blocks in backbone
+# HSG-DETR-N — SGB-guided RT-DETR DecoderSGB (NANO scale)
 nc: 80
 
 scales:
@@ -50,4 +48,4 @@ head:
   - [-1, 3, C2f, [1024, False]]                        # 23  P5-final
 
   # RT-DETR decoder (auto-detected by trainer)
-  - [[17, 20, 23], 1, RTDETRDecoder, [nc, 128, 100]]     # 24  # n scale: hd=128, nq=100
+  - [[17, 20, 23], 1, RTDETRDecoderSGB, [nc, 128, 100]]     # 24  # n scale: hd=128, nq=100

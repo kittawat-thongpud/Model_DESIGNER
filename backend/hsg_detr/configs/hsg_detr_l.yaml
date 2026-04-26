@@ -1,4 +1,4 @@
-# HSG-DETR-L — Sparse-Token SGB with RT-DETR Decoder (LARGE scale)
+# HSG-DETR-L — SGB-guided RT-DETR DecoderSGB (LARGE scale)
 nc: 80
 
 scales:
@@ -48,5 +48,5 @@ head:
   - [-1, 3, C2f, [1024, False]]                        # 23  P5-final
 
   # RT-DETR decoder (auto-detected by trainer)
-  - [[17, 20, 23], 1, RTDETRDecoder, [nc, 384, 300]]     # 24  # l scale: hd=384, nq=300
+  - [[17, 20, 23], 1, RTDETRDecoderSGB, [nc, 384, 300]]     # 24  # l scale: hd=384, nq=300
 
