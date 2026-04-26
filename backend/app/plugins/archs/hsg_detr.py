@@ -16,10 +16,10 @@ from ..loader import register_arch
 _CONFIGS_DIR = Path(__file__).resolve().parents[3] / "hsg_detr" / "configs"
 
 _SCALE_DESCRIPTIONS = {
-    "n": ("Nano",    "~2–3 M",  "~5–8 GFLOPs",  "100 queries"),
-    "s": ("Small",   "~4–5 M",  "~8–12 GFLOPs", "150 queries"),
-    "m": ("Medium",  "~6–8 M",  "~14–18 GFLOPs","200 queries"),
-    "l": ("Large",   "~11–15 M","~25–40 GFLOPs","300 queries"),
+    "n": ("Nano",    "~5.9 M",  "~9.6 GFLOPs",  "100 queries"),
+    "s": ("Small",   "~20.9 M", "~41.8 GFLOPs", "150 queries"),
+    "m": ("Medium",  "~33.8 M", "~87.1 GFLOPs","200 queries"),
+    "l": ("Large",   "~56.3 M","~184.8 GFLOPs","300 queries"),
 }
 
 
