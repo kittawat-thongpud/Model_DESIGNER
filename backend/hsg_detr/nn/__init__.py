@@ -1,7 +1,7 @@
 """
 HSG-DETR neural network module registration.
 
-Mirrors the Mamba-YOLO pattern: injects ``SparseGlobalTokenBlock`` (and
+Mirrors the Mamba-YOLO pattern: injects ``SGTokenBlock`` (and
 future blocks) into ``ultralytics.nn.tasks.parse_model`` via source-level
 patching so ``base_modules`` recognises them and auto-injects ``[c1, c2]``.
 
@@ -10,14 +10,14 @@ Idempotent — safe to call ``register()`` multiple times.
 from __future__ import annotations
 
 from .sparse_global_token import (
-    SparseGlobalTokenBlock,
+    SGTokenBlock,
     SGStem,
     SGDown,
     RTDETRDecoderSGB,
 )
 
 _MODULES: dict[str, type] = {
-    "SparseGlobalTokenBlock": SparseGlobalTokenBlock,
+    "SGTokenBlock": SGTokenBlock,
     "SGStem": SGStem,
     "SGDown": SGDown,
     "RTDETRDecoderSGB": RTDETRDecoderSGB,

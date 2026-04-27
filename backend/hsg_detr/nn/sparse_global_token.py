@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from ultralytics.nn.modules.head import RTDETRDecoder
 
 
-class SparseGlobalTokenBlock(nn.Module):
+class SGTokenBlock(nn.Module):
     """
     Sparse-Token Global Self-Attention block.
 
