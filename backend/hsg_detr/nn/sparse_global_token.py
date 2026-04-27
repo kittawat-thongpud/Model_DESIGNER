@@ -49,8 +49,13 @@ class SparseGlobalTokenBlock(nn.Module):
             f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
         )
         self.c = c2
-        self.token_budget = token_budget
-        self.ratio = ratio
+        # Guard: if token_budget is a float in (0,1) it was actually a ratio
+        # arg passed from a YAML that omits token_budget (e.g. [channels, ratio])
+        if isinstance(token_budget, float) and token_budget < 1.0:
+            ratio = token_budget
+            token_budget = 99999  # effectively unbounded — ratio controls k
+        self.token_budget = int(token_budget)
+        self.ratio = float(ratio)
         self.mode = mode
 
         # 1×1 projections — no spatial aggregation, just channel mixing
