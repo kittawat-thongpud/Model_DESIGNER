@@ -188,7 +188,7 @@ class SparseGlobalTokenBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        N = H * W
+        N = int(H) * int(W)
 
         k_actual = self._select_k(N)
         self.last_N = N
