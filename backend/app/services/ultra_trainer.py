@@ -2008,14 +2008,14 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
 
     required_ram = int(dataset_bytes * _SAFETY_FACTOR * _ddp_factor)
 
-    # Hard limit protection
+    # Hard limit protection — dataset too large for RAM cache
     if dataset_bytes > _MAX_RAM_CACHE:
         job_storage.append_job_log(
             job_id,
             "INFO",
-            f"Cache strategy: disk — dataset decoded size exceeds RAM cache cap ({_MAX_RAM_CACHE/(1024**3):.1f} GB)"
+            f"Cache strategy: False (direct read) — dataset decoded size exceeds RAM cache cap ({_MAX_RAM_CACHE/(1024**3):.1f} GB)"
         )
-        return True
+        return False
 
     if free_ram > 0 and dataset_bytes > 0 and free_ram >= required_ram:
 
@@ -2032,26 +2032,26 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
 
         return "ram"
 
-    # fallback disk cache
-    chosen = True
+    # RAM insufficient — use direct read (False) instead of disk .npy cache.
+    # On local NVMe, direct JPEG reads are faster than .npy since JPEG is
+    # 10-30x smaller and avoids the one-time .npy write overhead entirely.
+    gb = dataset_bytes / (1024 ** 3) if dataset_bytes > 0 else 0
+    free_gb = free_ram / (1024 ** 3) if free_ram > 0 else 0
 
-    if free_ram > 0 and dataset_bytes > 0:
-        gb = dataset_bytes / (1024 ** 3)
-        free_gb = free_ram / (1024 ** 3)
-
+    if gb > 0:
         job_storage.append_job_log(
             job_id,
             "INFO",
-            f"Cache strategy: disk — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB"
+            f"Cache strategy: False (direct read) — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB"
         )
     else:
         job_storage.append_job_log(
             job_id,
             "INFO",
-            "Cache strategy: disk — dataset size unknown"
+            "Cache strategy: False (direct read) — dataset size unknown"
         )
 
-    return chosen
+    return False
 
 
 def _redirect_cache_to_tmp(ds_root: "Path | None", job_id: str) -> None:
@@ -2141,7 +2141,7 @@ def _get_optimal_workers() -> int:
 
     # ── Bare-metal / no quota ────────────────────────────────────────────────
     cpu_count = os.cpu_count() or 4
-    return max(2, min(cpu_count // 2, 8))
+    return max(2, min(cpu_count // 2, 16))
 
 
 def _should_stop(job_id: str) -> bool:
