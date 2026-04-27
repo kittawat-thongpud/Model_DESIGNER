@@ -494,7 +494,17 @@ def _resolve_yaml_for_job(job: dict) -> str:
     yaml_path = model_storage.load_model_yaml_path(job["model_id"])
     if yaml_path and Path(yaml_path).exists():
         return str(yaml_path)
-    raise ValueError(f"YAML not found for model {job['model_id']}")
+    # Fallback: resolve via arch plugin stored in job config
+    config = job.get("config") or {}
+    model_arch_key = config.get("model_arch")
+    if model_arch_key:
+        from ..plugins.loader import get_arch_plugin
+        arch_plugin = get_arch_plugin(model_arch_key)
+        if arch_plugin:
+            p = arch_plugin.yaml_path()
+            if p and Path(p).exists():
+                return str(p)
+    raise ValueError(f"YAML not found for model arch:{job.get('model_id', '')}")
 
 
 def cleanup_stale_jobs() -> None:
