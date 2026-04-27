@@ -494,17 +494,28 @@ def _resolve_yaml_for_job(job: dict) -> str:
     yaml_path = model_storage.load_model_yaml_path(job["model_id"])
     if yaml_path and Path(yaml_path).exists():
         return str(yaml_path)
-    # Fallback: resolve via arch plugin stored in job config
+    # Fallback: resolve via arch plugin.
+    # Try job config first (may be absent if config.pop removed it during train).
+    # Then try model_id with 'arch:' prefix (set when arch plugin was used).
+    from ..plugins.loader import get_arch_plugin
     config = job.get("config") or {}
-    model_arch_key = config.get("model_arch")
-    if model_arch_key:
-        from ..plugins.loader import get_arch_plugin
-        arch_plugin = get_arch_plugin(model_arch_key)
+    candidates = []
+    if config.get("model_arch"):
+        candidates.append(config["model_arch"])
+    model_id = str(job.get("model_id") or "")
+    if model_id.startswith("arch:"):
+        family_key = model_id[len("arch:"):]
+        model_scale = str(job.get("model_scale") or "").strip().lower()
+        if model_scale:
+            candidates.append(f"{family_key}_{model_scale}")
+        candidates.append(family_key)
+    for key in candidates:
+        arch_plugin = get_arch_plugin(key)
         if arch_plugin:
             p = arch_plugin.yaml_path()
             if p and Path(p).exists():
                 return str(p)
-    raise ValueError(f"YAML not found for model arch:{job.get('model_id', '')}")
+    raise ValueError(f"YAML not found for model '{job.get('model_id', '')}')")
 
 
 def cleanup_stale_jobs() -> None:
