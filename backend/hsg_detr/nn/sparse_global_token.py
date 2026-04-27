@@ -62,8 +62,9 @@ class SparseGlobalTokenBlock(nn.Module):
         # Layer norm on selected tokens (channel dim)
         self.norm = nn.LayerNorm(c2)
 
-        # Learnable gate α (initialised to 0 → starts as identity)
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Learnable gate α (initialised to 0.1 → SGB contributes from epoch 1
+        # instead of starting as identity and waiting for the gate to open).
+        self.gate = nn.Parameter(torch.full((1,), 0.1))
 
         self._attn_scale = c2 ** -0.5
 
@@ -76,7 +77,7 @@ class SparseGlobalTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 nn.BatchNorm2d(c2),
             )
-            self.local_gate = nn.Parameter(torch.zeros(1))
+            self.local_gate = nn.Parameter(torch.full((1,), 0.1))
         else:
             self.local_dw = None
             self.local_gate = None
@@ -363,7 +364,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         nd: int = 100,
         label_noise_ratio: float = 0.5,
         box_noise_scale: float = 1.0,
-        learnt_init_query: bool = False,
+        learnt_init_query: bool = True,
     ) -> None:
         super().__init__(
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
