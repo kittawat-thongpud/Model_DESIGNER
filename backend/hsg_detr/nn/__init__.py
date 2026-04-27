@@ -16,11 +16,29 @@ from .sparse_global_token import (
     RTDETRDecoderSGB,
 )
 
+# Also include hsg_det's SparseGlobalTokenBlock so that when hsg_detr
+# rebuilds parse_model via source-patch, SparseGlobalTokenBlock stays
+# in base_modules and gets c1 injected correctly.
+try:
+    from hsg_det.nn.sparse_global import (
+        SparseGlobalBlock,
+        SparseGlobalBlockGated,
+        SparseGlobalTokenBlock,
+    )
+    _HSG_DET_MODULES: dict[str, type] = {
+        "SparseGlobalBlock": SparseGlobalBlock,
+        "SparseGlobalBlockGated": SparseGlobalBlockGated,
+        "SparseGlobalTokenBlock": SparseGlobalTokenBlock,
+    }
+except ImportError:
+    _HSG_DET_MODULES = {}
+
 _MODULES: dict[str, type] = {
     "SGTokenBlock": SGTokenBlock,
     "SGStem": SGStem,
     "SGDown": SGDown,
     "RTDETRDecoderSGB": RTDETRDecoderSGB,
+    **_HSG_DET_MODULES,
 }
 
 _registered = False
