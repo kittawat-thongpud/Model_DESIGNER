@@ -62,9 +62,9 @@ class SparseGlobalTokenBlock(nn.Module):
         # Layer norm on selected tokens (channel dim)
         self.norm = nn.LayerNorm(c2)
 
-        # Learnable gate α (initialised to 0.1 → SGB contributes from epoch 1
-        # instead of starting as identity and waiting for the gate to open).
-        self.gate = nn.Parameter(torch.full((1,), 0.1))
+        # Learnable gate α — sigmoid(0.0)=0.5, contributes 50% from epoch 1
+        # sigmoid keeps gate in (0,1) and prevents negative suppression
+        self.gate = nn.Parameter(torch.zeros(1))
 
         self._attn_scale = c2 ** -0.5
 
@@ -77,7 +77,7 @@ class SparseGlobalTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 nn.BatchNorm2d(c2),
             )
-            self.local_gate = nn.Parameter(torch.full((1,), 0.1))
+            self.local_gate = nn.Parameter(torch.zeros(1))
         else:
             self.local_dw = None
             self.local_gate = None
@@ -194,12 +194,14 @@ class SparseGlobalTokenBlock(nn.Module):
         self.last_N = N
         self.last_k = k_actual
         self.last_mode = self.mode
-        self.last_gate = float(self.gate.item())
 
         # Projections
         q = self.q_proj(x).view(B, C, N)   # [B, C, N]
         kk = self.k_proj(x).view(B, C, N)  # [B, C, N]
         v = self.v_proj(x).view(B, C, N)   # [B, C, N]
+
+        gate = torch.sigmoid(self.gate)
+        self.last_gate = float(gate.item())
 
         if self.mode == "dense":
             # Full self-attention on all tokens (ablation baseline)
@@ -208,9 +210,9 @@ class SparseGlobalTokenBlock(nn.Module):
             self.last_indices = topk_idx
             self.last_saliency = self._compute_saliency(x)
             delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, N)
-            return x + self.gate * delta
+            return x + gate * delta
 
-        # ── topk / hybrid: select salient tokens ────────────────────────
+        # ── topk / hybrid: select salient tokens ───────────────────────────────────
         importance = self._compute_saliency(x)
         self.last_saliency = importance
         topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
@@ -219,11 +221,12 @@ class SparseGlobalTokenBlock(nn.Module):
         delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, k_actual)
 
         if self.mode == "hybrid" and self.local_dw is not None:
+            local_gate = torch.sigmoid(self.local_gate)
             local_delta = self.local_dw(x)
-            return x + self.gate * delta + self.local_gate * local_delta
+            return x + gate * delta + local_gate * local_delta
 
         # Standard topk mode
-        return x + self.gate * delta
+        return x + gate * delta
 
 
 # ─────────────────────────────────────────────────────────────────────────────

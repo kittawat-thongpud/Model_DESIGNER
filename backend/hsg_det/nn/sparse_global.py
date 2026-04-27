@@ -156,14 +156,158 @@ class SparseGlobalBlockGated(nn.Module):
     def __init__(self, c: int, k: int = 512) -> None:
         super().__init__()
         self.block = SparseGlobalBlock(c, k)
-        # Initialise gate to 0 → starts as identity
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Initialise gate to 0.1 → SGB contributes from epoch 1
+        self.gate = nn.Parameter(torch.full((1,), 0.1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Use _attention_delta() (not block.forward) to avoid double-residual:
         # block.forward() = x + delta, so x + gate*(x+delta) would be wrong.
         # Correct form: x + gate*delta  → identity when gate=0, full correction as gate→1
         return x + self.gate * self.block._attention_delta(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SparseGlobalTokenBlock — token-budget aware variant (HSG-DET / HSG-DETR shared)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SparseGlobalTokenBlock(nn.Module):
+    """
+    Sparse-Token Global Self-Attention block.
+
+    Internally performs top-k token selection, sparse self-attention,
+    scatter-back, and gated residual fusion.  Returns a single tensor
+    so it is transparent to Ultralytics ``parse_model``.
+
+    Args:
+        c1 (int): Input channels (auto-injected by parse_model).
+        c2 (int): Output channels (auto-injected by parse_model from YAML args[0]).
+        ratio (float): Fraction of spatial tokens to retain; k = ratio·N (scales with imgsz).
+        mode (str): One of ``"dense"``, ``"topk"``, ``"hybrid"``.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        ratio: float = 0.25,
+        mode: str = "topk",
+    ) -> None:
+        super().__init__()
+        assert c1 == c2, (
+            f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
+        )
+        self.c = c2
+        self.ratio = ratio
+        self.mode = mode
+
+        self.q_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.k_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.v_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.out_proj = nn.Conv2d(c2, c2, 1, bias=False)
+
+        self.norm = nn.LayerNorm(c2)
+
+        # Learnable gate α — sigmoid(0.0)=0.5, contributes 50% from epoch 1
+        # Using sigmoid keeps gate in (0,1) and prevents negative suppression
+        self.gate = nn.Parameter(torch.zeros(1))
+
+        self._attn_scale = c2 ** -0.5
+
+        if mode == "hybrid":
+            self.local_dw = nn.Sequential(
+                nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
+                nn.BatchNorm2d(c2),
+                nn.SiLU(),
+                nn.Conv2d(c2, c2, 1, bias=False),
+                nn.BatchNorm2d(c2),
+            )
+            self.local_gate = nn.Parameter(torch.zeros(1))
+        else:
+            self.local_dw = None
+            self.local_gate = None
+
+    def _compute_saliency(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+        importance = x.view(B, C, N).float().pow(2).sum(dim=1)
+        return torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _select_k(self, N: int) -> int:
+        if self.mode == "dense":
+            return N
+        return max(1, int(self.ratio * N))
+
+    def _sparse_attention_delta(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        kk: torch.Tensor,
+        v: torch.Tensor,
+        topk_idx: torch.Tensor,
+        k_actual: int,
+    ) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)
+
+        q_sel = torch.gather(q, 2, idx_exp).transpose(1, 2)
+        k_sel = torch.gather(kk, 2, idx_exp).transpose(1, 2)
+        v_sel = torch.gather(v, 2, idx_exp).transpose(1, 2)
+
+        orig_dtype = q_sel.dtype
+        norm_w = self.norm.weight
+        norm_b = self.norm.bias
+        q_sel = F.layer_norm(
+            q_sel.float(), self.norm.normalized_shape,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
+            self.norm.eps,
+        )
+        k_sel = F.layer_norm(
+            k_sel.float(), self.norm.normalized_shape,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
+            self.norm.eps,
+        )
+        v_sel = v_sel.float()
+
+        attn = torch.bmm(q_sel, k_sel.transpose(1, 2)) * float(self._attn_scale)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = attn.clamp(min=-80.0, max=80.0)
+        attn = attn - attn.max(dim=-1, keepdim=True).values
+        attn = torch.softmax(attn, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attended = torch.bmm(attn, v_sel).to(orig_dtype)
+
+        out = v.clone().view(B, C, N)
+        out.scatter_(2, idx_exp, attended.transpose(1, 2))
+        return self.out_proj(out.view(B, C, H, W))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+        k_actual = self._select_k(N)
+
+        q = self.q_proj(x).view(B, C, N)
+        kk = self.k_proj(x).view(B, C, N)
+        v = self.v_proj(x).view(B, C, N)
+
+        gate = torch.sigmoid(self.gate)
+
+        if self.mode == "dense":
+            topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+            delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, N)
+            return x + gate * delta
+
+        importance = self._compute_saliency(x)
+        topk_idx = torch.topk(importance, k_actual, dim=1).indices
+        delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, k_actual)
+
+        if self.mode == "hybrid" and self.local_dw is not None:
+            local_gate = torch.sigmoid(self.local_gate)
+            return x + gate * delta + local_gate * self.local_dw(x)
+
+        return x + gate * delta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +331,7 @@ def _register_into_ultralytics() -> None:
     _CLASSES = {
         "SparseGlobalBlock": SparseGlobalBlock,
         "SparseGlobalBlockGated": SparseGlobalBlockGated,
+        "SparseGlobalTokenBlock": SparseGlobalTokenBlock,
     }
     try:
         import ultralytics.nn.modules as ulm

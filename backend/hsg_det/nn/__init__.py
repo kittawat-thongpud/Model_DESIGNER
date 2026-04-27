@@ -7,6 +7,7 @@ into the Ultralytics nn.modules namespace automatically.
 from .sparse_global import (
     SparseGlobalBlock,
     SparseGlobalBlockGated,
+    SparseGlobalTokenBlock,
     _register_into_ultralytics,
 )
 
@@ -16,4 +17,5 @@ _register_into_ultralytics()
 __all__ = [
     "SparseGlobalBlock",
     "SparseGlobalBlockGated",
+    "SparseGlobalTokenBlock",
 ]
