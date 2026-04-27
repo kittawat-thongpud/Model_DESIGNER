@@ -229,6 +229,11 @@ class SGTokenBlock(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# Backward-compat alias: old checkpoints pickled the class under the old name
+# before the rename. Keep so torch.load can unpickle legacy .pt files.
+SparseGlobalTokenBlock = SGTokenBlock
+
+
 class SGStem(nn.Module):
     """
     Sparse-Global stem with two-stage downsampling and a depthwise intermediate
