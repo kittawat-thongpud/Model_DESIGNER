@@ -119,10 +119,10 @@ class SparseGlobalTokenBlock(nn.Module):
     def _select_k(self, N: int) -> int:
         """Compute effective k based on mode and constraints."""
         if self.mode == "dense":
-            return N
+            return int(N)
         # topk / hybrid use same sparse selection
-        k = max(1, int(self.ratio * N))
-        return min(k, self.token_budget, N)
+        k = max(1, int(float(self.ratio) * int(N)))
+        return min(k, self.token_budget, int(N))
 
     def _sparse_attention_delta(
         self,

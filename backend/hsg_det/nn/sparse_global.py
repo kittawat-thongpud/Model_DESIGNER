@@ -234,8 +234,8 @@ class SparseGlobalTokenBlock(nn.Module):
 
     def _select_k(self, N: int) -> int:
         if self.mode == "dense":
-            return N
-        return max(1, int(self.ratio * N))
+            return int(N)
+        return max(1, int(float(self.ratio) * int(N)))
 
     def _sparse_attention_delta(
         self,
