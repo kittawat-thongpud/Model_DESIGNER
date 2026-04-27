@@ -31,8 +31,7 @@ class SparseGlobalTokenBlock(nn.Module):
     Args:
         c1 (int): Input channels (auto-injected by parse_model).
         c2 (int): Output channels (auto-injected by parse_model from YAML args[0]).
-        token_budget (int): Hard cap on selected tokens (k = min(token_budget, ratio·N)).
-        ratio (float): Fraction of spatial tokens to retain (0 < ratio ≤ 1).
+        ratio (float): Fraction of spatial tokens to retain; k = ratio·N (scales with imgsz).
         mode (str): One of ``"dense"``, ``"topk"``, ``"hybrid"``.
     """
 
@@ -40,7 +39,6 @@ class SparseGlobalTokenBlock(nn.Module):
         self,
         c1: int,
         c2: int,
-        token_budget: int = 384,
         ratio: float = 0.25,
         mode: str = "topk",
     ) -> None:
@@ -49,12 +47,6 @@ class SparseGlobalTokenBlock(nn.Module):
             f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
         )
         self.c = c2
-        # Guard: if token_budget is a float in (0,1) it was actually a ratio
-        # arg passed from a YAML that omits token_budget (e.g. [channels, ratio])
-        if isinstance(token_budget, float) and token_budget < 1.0:
-            ratio = token_budget
-            token_budget = 99999  # effectively unbounded — ratio controls k
-        self.token_budget = int(token_budget)
         self.ratio = float(ratio)
         self.mode = mode
 
@@ -125,9 +117,7 @@ class SparseGlobalTokenBlock(nn.Module):
         """Compute effective k based on mode and constraints."""
         if self.mode == "dense":
             return int(N)
-        # topk / hybrid use same sparse selection
-        k = max(1, int(float(self.ratio) * int(N)))
-        return min(k, self.token_budget, int(N))
+        return max(1, min(int(float(self.ratio) * int(N)), int(N)))
 
     def _sparse_attention_delta(
         self,
