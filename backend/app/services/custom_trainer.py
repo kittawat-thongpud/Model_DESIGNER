@@ -819,9 +819,9 @@ class CustomDetectionTrainer(DetectionTrainer):
             torch.cuda.empty_cache()
             import gc
             gc.collect()
-            if hasattr(self, 'loss_items'):
-                # Explicitly clear loss tensor to free GPU memory
-                self.loss_items = None
+            if hasattr(self, 'loss_items') and self.loss_items is not None:
+                # Move loss tensor to CPU to free GPU memory but keep for validator
+                self.loss_items = self.loss_items.cpu()
 
         # Run parent validation (all ranks must execute this)
         val_start = time.time()
