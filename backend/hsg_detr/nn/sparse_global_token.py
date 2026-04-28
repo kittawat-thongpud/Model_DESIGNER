@@ -59,9 +59,10 @@ class SGTokenBlock(nn.Module):
         # Layer norm on selected tokens (channel dim)
         self.norm = nn.LayerNorm(c2)
 
-        # Learnable gate α — sigmoid(0.0)=0.5, contributes 50% from epoch 1
-        # sigmoid keeps gate in (0,1) and prevents negative suppression
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Learnable gate α — init to -4.0 so sigmoid(-4)≈0.018 at epoch 1
+        # grows gradually as training stabilises; prevents early NaN from
+        # large delta contribution before projections are calibrated
+        self.gate = nn.Parameter(torch.full((1,), -4.0))
 
         self._attn_scale = c2 ** -0.5
 
@@ -159,7 +160,13 @@ class SGTokenBlock(nn.Module):
             norm_b.float() if norm_b is not None else None,
             self.norm.eps,
         )
-        v_sel = v_sel.float()
+        v_sel = F.layer_norm(
+            v_sel.float(),
+            self.norm.normalized_shape,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
+            self.norm.eps,
+        )
 
         # Sparse self-attention (stable softmax)
         attn = torch.bmm(q_sel, k_sel.transpose(1, 2)) * float(self._attn_scale)
@@ -169,13 +176,17 @@ class SGTokenBlock(nn.Module):
         attn = torch.softmax(attn, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attended = torch.bmm(attn, v_sel)  # [B, k, C]
+        attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
         attended = attended.to(orig_dtype)
 
         # Scatter back to spatial grid
         out = v.clone().view(B, C, N)  # [B, C, N]
         out.scatter_(2, idx_exp, attended.transpose(1, 2))
         out = out.view(B, C, H, W)
-        return self.out_proj(out)
+        delta = self.out_proj(out)
+        # Clamp delta to prevent gradient explosion, especially early in training
+        delta = delta.clamp(-6.0, 6.0)
+        return delta
 
     # ------------------------------------------------------------------ #
     # Forward
