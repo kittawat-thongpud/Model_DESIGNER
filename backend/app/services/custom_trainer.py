@@ -456,14 +456,53 @@ class CustomDetectionTrainer(DetectionTrainer):
             LOGGER.info(f"[{level}] {text}")
     
     def _do_train(self, world_size=1):
-        """Override training loop to add custom logging."""
+        """Override training loop to add custom logging and DDP cleanup."""
         self.log(f"Starting training for {self.epochs} epochs", "INFO")
         
-        # BaseTrainer._do_train() takes no positional args in Ultralytics 8.4.x
-        result = super()._do_train()
-        
-        self.log("Training loop completed", "INFO")
-        return result
+        try:
+            # BaseTrainer._do_train() takes no positional args in Ultralytics 8.4.x
+            result = super()._do_train()
+            self.log("Training loop completed", "INFO")
+            return result
+        except Exception as e:
+            self.log(f"Training failed with error: {e}", "ERROR")
+            # Cleanup orphaned DDP processes on failure
+            self._cleanup_ddp_processes()
+            raise
+        finally:
+            # Always cleanup DDP processes after training ends
+            self._cleanup_ddp_processes()
+    
+    def _cleanup_ddp_processes(self):
+        """Cleanup orphaned DDP/torchrun processes."""
+        try:
+            import psutil
+            import os
+            current_pid = os.getpid()
+            killed = []
+            for proc in psutil.process_iter(['pid', 'ppid', 'name', 'cmdline']):
+                try:
+                    info = proc.info
+                    cmdline = ' '.join(info.get('cmdline', [])) if info.get('cmdline') else ''
+                    name = info.get('name', '')
+                    if any(x in cmdline or x in name for x in ['torchrun', 'torch.distributed.run']):
+                        pid = info.get('pid', 0)
+                        if pid != current_pid and pid != os.getppid():
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=1)
+                                killed.append(pid)
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                killed.append(pid)
+                            except (psutil.NoSuchProcess, PermissionError):
+                                pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if killed:
+                self.log(f"Cleaned up DDP processes: {killed}", "WARNING")
+        except ImportError:
+            pass
     
     def _setup_train(self):
         """Override setup to add logging."""
