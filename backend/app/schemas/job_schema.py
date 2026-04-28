@@ -84,7 +84,7 @@ class TrainConfig(BaseModel):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     pretrained: str = str(_training_default("pretrained", ""))               # weight path or weight_id
-    yolo_model: Literal["", "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"] = str(_training_default("yolo_model", ""))  # official YOLO model
+    yolo_model: str = str(_training_default("yolo_model", ""))  # official or custom YOLO model key (e.g., "yolov8n", "yolo26n")
     use_yolo_pretrained: bool = bool(_training_default("use_yolo_pretrained", True))   # use YOLO pretrained weights (False = train from scratch)
     freeze: int | list[int] = _training_default("freeze", 0)        # freeze first N layers or specific indices
     resume: bool = bool(_training_default("resume", False))               # resume training from last checkpoint
