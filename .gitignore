@@ -98,3 +98,8 @@ temp/
 *.orig
 .agent/
 convert.csv
+
+# ── Script generated analysis files ───────────────────────────────────────────
+training_state/
+top_performers*.json
+jobs_summary*.json
