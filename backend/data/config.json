@@ -127,6 +127,7 @@
   "cache": {
     "sample_image_count": 200,
     "decompress_factor": 30,
+    "num_threads": 16,
     "ram_cache": {
       "windows_safety_factor": 3.0,
       "default_safety_factor": 1.5,

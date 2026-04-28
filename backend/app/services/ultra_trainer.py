@@ -1360,6 +1360,24 @@ def _training_worker(
         else:
             train_kwargs["cache"] = _user_cache
 
+        # Set NUM_THREADS for parallel image loading from config (default 16 for fast NVMe)
+        _cache_config = get_cache_config()
+        _num_threads = int(_cache_config.get("num_threads", 16))
+        try:
+            import ultralytics.data.dataset as _ultra_ds
+            import ultralytics.utils as _ultra_utils
+            _ultra_ds.NUM_THREADS = _num_threads
+            _ultra_utils.NUM_THREADS = _num_threads
+            job_storage.append_job_log(
+                job_id, "INFO",
+                f"NUM_THREADS set to {_num_threads} for parallel image loading"
+            )
+        except Exception as _nt_err:
+            job_storage.append_job_log(
+                job_id, "DEBUG",
+                f"Could not set NUM_THREADS: {_nt_err}"
+            )
+
         # If dataset lives on FUSE/remote mounts, Ultralytics setup can appear to hang
         # due to heavy stat()/glob across 100k+ files and/or multiprocessing overhead.
         # Mitigation: force workers=0 and disable Ultralytics dataset cache writing.

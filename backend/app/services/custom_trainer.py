@@ -1454,6 +1454,21 @@ class JobCustomTrainer(CustomDetectionTrainer):
 
         from . import job_storage as js
         _job_id = self._custom_params.get("job_id") or overrides.get("job_id", "unknown")
+        self.job_id = _job_id
+
+        # Set NUM_THREADS for parallel image loading
+        try:
+            from .config_service import get_cache_config
+            _cache_cfg = get_cache_config()
+            _num_threads = int(_cache_cfg.get("num_threads", 16))
+            import ultralytics.data.dataset as _ultra_ds
+            import ultralytics.utils as _ultra_utils
+            _ultra_ds.NUM_THREADS = _num_threads
+            _ultra_utils.NUM_THREADS = _num_threads
+            js.append_job_log(_job_id, "INFO", f"NUM_THREADS set to {_num_threads}")
+        except Exception as _nt_err:
+            js.append_job_log(_job_id, "DEBUG", f"Could not set NUM_THREADS: {_nt_err}")
+
         js.append_job_log(_job_id, "INFO",
             f"JobCustomTrainer.__init__ called with job_id: {_job_id}")
         super().__init__(cfg, overrides, _callbacks)
