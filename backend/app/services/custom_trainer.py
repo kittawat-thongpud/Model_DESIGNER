@@ -357,6 +357,16 @@ class CustomDetectionTrainer(DetectionTrainer):
                 cfg.pop(key, None)
             
             clean_overrides = {}  # Already merged
+            
+            # Cache strategy: default to disk cache (True) for HSG-DETR if not set.
+            # Direct read (False) causes JPEG decode overhead every epoch.
+            if cfg.get('cache') is None or cfg.get('cache') == 'auto':
+                cfg['cache'] = True
+                if self.job_id:
+                    job_storage.append_job_log(
+                        self.job_id, "INFO",
+                        "Cache strategy: disk (default for HSG-DETR - cache not explicitly set)"
+                    )
         
         super().__init__(cfg, clean_overrides, _callbacks)
         
