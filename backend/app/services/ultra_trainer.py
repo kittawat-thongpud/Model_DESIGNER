@@ -530,7 +530,7 @@ def cleanup_stale_jobs() -> None:
 
 
 def cleanup_zombie_workers() -> dict[str, str]:
-    """Detect and clean up zombie worker threads.
+    """Detect and clean up zombie worker threads and their DDP subprocesses.
     
     Returns dict of {job_id: status} for cleaned up workers.
     """
@@ -564,9 +564,64 @@ def cleanup_zombie_workers() -> dict[str, str]:
                     _sync_queue_task_with_job(job_id, admit_pending=True, error="Worker thread died unexpectedly")
                     cleaned[job_id] = "marked_failed"
                 
+                # Kill orphaned DDP subprocesses
+                _kill_ddp_processes(job_id)
+                
                 _active_jobs.pop(job_id, None)
     
     return cleaned
+
+
+def _kill_ddp_processes(job_id: str) -> None:
+    """Kill orphaned DDP/torchrun subprocesses for a job.
+    
+    Uses psutil if available, falls back to pkill command.
+    """
+    killed = []
+    try:
+        import psutil
+        current_pid = os.getpid()
+        for proc in psutil.process_iter(['pid', 'ppid', 'name', 'cmdline']):
+            try:
+                info = proc.info
+                # Look for torchrun, torch.distributed.run, or python training processes
+                cmdline = ' '.join(info.get('cmdline', [])) if info.get('cmdline') else ''
+                name = info.get('name', '')
+                if any(x in cmdline or x in name for x in ['torchrun', 'torch.distributed.run', 'multiprocessing.spawn']):
+                    # Check if orphaned (parent is init or parent is this process but thread is dead)
+                    ppid = info.get('ppid', 0)
+                    pid = info.get('pid', 0)
+                    if pid != current_pid and pid != os.getppid():
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=2)
+                            killed.append(pid)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                            killed.append(pid)
+                        except (psutil.NoSuchProcess, PermissionError):
+                            pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except ImportError:
+        pass
+    
+    # Fallback: use pkill for remaining processes
+    try:
+        import subprocess
+        # Kill torchrun processes
+        subprocess.run(['pkill', '-9', '-f', 'torchrun'], capture_output=True)
+        subprocess.run(['pkill', '-9', '-f', 'torch.distributed.run'], capture_output=True)
+        subprocess.run(['pkill', '-9', '-f', 'generate_ddp_file'], capture_output=True)
+    except Exception:
+        pass
+    
+    if killed:
+        job_storage.append_job_log(
+            job_id, "WARNING",
+            f"Killed orphaned DDP processes: {killed}"
+        )
 
 
 def get_worker_health() -> dict[str, Any]:
