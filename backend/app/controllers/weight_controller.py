@@ -313,10 +313,27 @@ async def get_weight(weight_id: str):
 
 @router.get("/{weight_id}/info", summary="Get model params and GFLOPs from weight file")
 async def get_weight_info(weight_id: str):
-    """Load the .pt file via Ultralytics YOLO and return parameter count + GFLOPs."""
+    """Load the .pt file via Ultralytics YOLO and return parameter count + GFLOPs.
+
+    For custom model architectures, registers the arch plugin before loading
+    so that custom layer modules are available during model reconstruction.
+    """
     pt_path = weight_storage.weight_pt_path(weight_id)
     if not pt_path.exists():
         raise HTTPException(status_code=404, detail=f"Weight file not found: {weight_id}")
+
+    # Register arch plugin for custom models before loading .pt file
+    weight_meta = weight_storage.load_weight_meta(weight_id)
+    model_id = weight_meta.get("model_id") if weight_meta else None
+    if model_id:
+        from ..services import model_storage
+        yaml_path = model_storage.load_model_yaml_path(model_id)
+        if yaml_path:
+            from ..plugins.loader import find_arch_for_yaml
+            arch_plugin = find_arch_for_yaml(str(yaml_path))
+            if arch_plugin:
+                arch_plugin.register_modules()
+
     try:
         from ultralytics import YOLO
         from ultralytics.utils.torch_utils import get_flops
