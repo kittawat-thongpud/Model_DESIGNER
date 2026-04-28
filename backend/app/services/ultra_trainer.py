@@ -2043,9 +2043,9 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
 
         return "ram"
 
-    # RAM insufficient — use direct read (False) instead of disk .npy cache.
-    # On local NVMe, direct JPEG reads are faster than .npy since JPEG is
-    # 10-30x smaller and avoids the one-time .npy write overhead entirely.
+    # RAM insufficient — use disk cache (True) for large datasets.
+    # Direct read (False) causes JPEG decode overhead every epoch which is
+    # slower than .npy disk cache even on NVMe for datasets > 20GB.
     gb = dataset_bytes / (1024 ** 3) if dataset_bytes > 0 else 0
     free_gb = free_ram / (1024 ** 3) if free_ram > 0 else 0
 
@@ -2053,16 +2053,16 @@ def _select_cache_strategy(ds_root: "Path | None", job_id: str, is_remote_fs: bo
         job_storage.append_job_log(
             job_id,
             "INFO",
-            f"Cache strategy: False (direct read) — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB"
+            f"Cache strategy: disk — dataset ~{gb:.1f} GB > free RAM {free_gb:.1f} GB"
         )
     else:
         job_storage.append_job_log(
             job_id,
             "INFO",
-            "Cache strategy: False (direct read) — dataset size unknown"
+            "Cache strategy: disk — dataset size unknown"
         )
 
-    return False
+    return True  # Use disk cache (.npy) instead of direct read
 
 
 def _redirect_cache_to_tmp(ds_root: "Path | None", job_id: str) -> None:
