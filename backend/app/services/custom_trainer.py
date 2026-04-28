@@ -813,6 +813,16 @@ class CustomDetectionTrainer(DetectionTrainer):
                     "message": f"Validating epoch {self.epoch + 1}...",
                 })
         
+        # Clean GPU memory before validation (free training tensors/graphs)
+        if torch.cuda.is_available():
+            # Clear cached memory and run garbage collection
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            if hasattr(self, 'loss_items'):
+                # Explicitly clear loss tensor to free GPU memory
+                self.loss_items = None
+
         # Run parent validation (all ranks must execute this)
         val_start = time.time()
         metrics = super().validate()
