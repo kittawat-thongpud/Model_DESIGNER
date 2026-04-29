@@ -415,17 +415,20 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         cls_score = enc_outputs_scores.max(-1).values          # (bs, h*w)
         token_energy = features.pow(2).sum(-1)                  # (bs, h*w)
 
-        # Per-sample min-max normalisation (stable)
+        # Per-sample min-max normalisation with NaN/Inf protection
         eps = 1e-6
         cls_min = cls_score.min(1, keepdim=True).values
         cls_max = cls_score.max(1, keepdim=True).values
-        cls_score_norm = (cls_score - cls_min) / (cls_max - cls_min + eps)
+        cls_range = (cls_max - cls_min).clamp(min=eps)
+        cls_score_norm = ((cls_score - cls_min) / cls_range).clamp(-10.0, 10.0)
 
         energy_min = token_energy.min(1, keepdim=True).values
         energy_max = token_energy.max(1, keepdim=True).values
-        energy_norm = (token_energy - energy_min) / (energy_max - energy_min + eps)
+        energy_range = (energy_max - energy_min).clamp(min=eps)
+        energy_norm = ((token_energy - energy_min) / energy_range).clamp(-10.0, 10.0)
 
-        combined = cls_score_norm + self.alpha * energy_norm
+        # Clamp combined score to prevent explosion
+        combined = (cls_score_norm + self.alpha * energy_norm).clamp(-20.0, 20.0)
         topk_ind = torch.topk(combined, self.num_queries, dim=1).indices.view(-1)
 
         # ── Remainder identical to base RTDETRDecoder ──────────────────
