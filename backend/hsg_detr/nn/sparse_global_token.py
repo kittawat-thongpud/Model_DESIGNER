@@ -191,7 +191,15 @@ class SGTokenBlock(nn.Module):
 
         # Scatter back to spatial grid
         out = v.clone().view(B, C, N)  # [B, C, N]
-        out.scatter_(2, idx_exp, attended.transpose(1, 2))
+
+        # Guard: sanitize attended before scatter to prevent NaN propagation
+        attended_clean = torch.nan_to_num(attended.transpose(1, 2), nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Guard: ensure idx_exp is valid for scatter
+        idx_exp = torch.clamp(idx_exp, 0, N - 1)
+        idx_exp = torch.nan_to_num(idx_exp, nan=0).long()
+
+        out.scatter_(2, idx_exp, attended_clean)
         out = out.view(B, C, H, W)
         delta = self.out_proj(out)
         # Sanitize and clamp delta to prevent gradient explosion and NaN propagation
@@ -232,7 +240,17 @@ class SGTokenBlock(nn.Module):
         # ── topk / hybrid: select salient tokens ───────────────────────────────────
         importance = self._compute_saliency(x)
         self.last_saliency = importance
+
+        # Guard: if all importance is NaN, fall back to uniform selection
+        if not torch.isfinite(importance).any():
+            importance = torch.ones_like(importance)
+
         topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
+
+        # Guard: validate indices are in valid range [0, N)
+        topk_idx = torch.clamp(topk_idx, 0, N - 1)
+        topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
+
         self.last_indices = topk_idx
 
         delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, k_actual)
@@ -456,6 +474,11 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
         topk_ind = torch.topk(combined, self.num_queries, dim=1).indices.view(-1)
 
+        # Guard: validate topk indices before using for indexing
+        N_features = features.shape[1]  # h*w
+        topk_ind = torch.clamp(topk_ind, 0, N_features - 1)
+        topk_ind = torch.nan_to_num(topk_ind, nan=0).long()
+
         # ── Remainder identical to base RTDETRDecoder ──────────────────
         batch_ind = (
             torch.arange(end=bs, dtype=topk_ind.dtype)
@@ -463,6 +486,9 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             .repeat(1, self.num_queries)
             .view(-1)
         )
+
+        # Guard: ensure batch_ind is also valid
+        batch_ind = torch.clamp(batch_ind, 0, bs - 1)
 
         top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
         top_k_anchors = self.anchors[:, topk_ind].view(bs, self.num_queries, -1)
