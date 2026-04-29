@@ -67,7 +67,7 @@ class HSGDetRPlugin(ModelArchPlugin):
             "scatter-back with gated residual, RTDETRDecoder head. "
             "SGB-centric architecture: sparse global reasoning is the core "
             "feature representation, not an add-on. "
-            "Warm-start from YOLOv8 backbone weights."
+            "Scratch training recommended during stability/debug runs."
         )
 
     def yaml_path(self) -> Path:
@@ -87,123 +87,19 @@ class HSGDetRPlugin(ModelArchPlugin):
         return None
 
     def warm_start(self, model, log_fn=None, model_scale: str | None = None) -> dict:
-        """Transfer shape-matching backbone layers from YOLOv8 into model."""
-        from pathlib import Path
-        import torch
-
-        def _log(msg: str):
-            if log_fn:
-                log_fn(msg)
-
-        _SCALE_MAP = {
-            "n": "yolov8n", "s": "yolov8s", "m": "yolov8m",
-            "l": "yolov8l", "x": "yolov8x",
-        }
-        scale = (model_scale or "").lower()
-        yolo_key = _SCALE_MAP.get(scale)
-        if yolo_key is None:
-            _log("Backbone warm-start: no model_scale provided — skipping")
-            return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-
-        _log(f"Backbone warm-start: HSG-DETR scale='{scale}' → source={yolo_key}.pt")
-
-        cache_candidates = [
-            Path.home() / ".config" / "Ultralytics" / f"{yolo_key}.pt",
-            Path.home() / "AppData" / "Roaming" / "Ultralytics" / f"{yolo_key}.pt",
-        ]
-        src_pt: Path | None = next((p for p in cache_candidates if p.exists()), None)
-
-        if src_pt is None:
-            _log(f"Backbone warm-start: {yolo_key}.pt not in cache — attempting download...")
-            try:
-                from ultralytics import YOLO as _YOLO
-                _tmp = _YOLO(f"{yolo_key}.pt")
-                src_pt = next((p for p in cache_candidates if p.exists()), None)
-                if src_pt is None:
-                    cwd_pt = Path(f"{yolo_key}.pt")
-                    if cwd_pt.exists():
-                        src_pt = cwd_pt
-                if src_pt is None:
-                    _log(f"Backbone warm-start: cannot locate {yolo_key}.pt after download — skipping")
-                    return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-            except Exception as e:
-                _log(f"Backbone warm-start: download failed ({e}) — training from scratch")
-                return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-
-        _log(f"Backbone warm-start: loading source weights from {src_pt}")
-
-        try:
-            raw = torch.load(src_pt, map_location="cpu", weights_only=False)
-        except Exception as e:
-            _log(f"Backbone warm-start: failed to load {src_pt} ({e}) — skipping")
-            return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-
-        if isinstance(raw, dict) and "model" in raw:
-            src_obj = raw["model"]
-            src_sd_raw = src_obj.float().state_dict() if hasattr(src_obj, "state_dict") else src_obj
-        elif isinstance(raw, dict):
-            src_sd_raw = raw
-        else:
-            _log("Backbone warm-start: unrecognised checkpoint format — skipping")
-            return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-
-        _PFX = "model."
-        src_sd = {
-            (k[len(_PFX):] if k.startswith(_PFX) else k): v
-            for k, v in src_sd_raw.items()
-            if isinstance(v, torch.Tensor)
-        }
-
-        try:
-            tgt_nn = model.model
-            tgt_sd_raw = tgt_nn.state_dict()
-        except Exception as e:
-            _log(f"Backbone warm-start: cannot read target state_dict ({e}) — skipping")
-            return {"transferred": 0, "skipped": 0, "total_src": 0, "total_tgt": 0, "matched_layers": []}
-
-        tgt_sd = {
-            (k[len(_PFX):] if k.startswith(_PFX) else k): v
-            for k, v in tgt_sd_raw.items()
-        }
-
-        transferred = 0
-        skipped = 0
-        matched_layers: set[str] = set()
-        skipped_layers: set[str] = set()
-
-        new_tgt = dict(tgt_sd)
-        for key, tgt_tensor in tgt_sd.items():
-            layer_id = key.split(".")[0]
-            if key not in src_sd:
-                skipped += 1
-                continue
-            src_tensor = src_sd[key]
-            if src_tensor.shape == tgt_tensor.shape:
-                new_tgt[key] = src_tensor.to(tgt_tensor.dtype)
-                transferred += 1
-                matched_layers.add(layer_id)
-            else:
-                skipped += 1
-                skipped_layers.add(layer_id)
-
-        restored_sd = {
-            (_PFX + k if not k.startswith(_PFX) else k): v
-            for k, v in new_tgt.items()
-        }
-        tgt_nn.load_state_dict(restored_sd, strict=False)
-
-        total_tgt_keys = len(tgt_sd)
-        pct = transferred / total_tgt_keys * 100 if total_tgt_keys else 0
-        _log(f"Warm-start: {transferred}/{total_tgt_keys} tensors ({pct:.1f}%) transferred")
-        _log(f"  matched layers : {sorted(matched_layers, key=lambda x: int(x) if x.isdigit() else 999)}")
-        _log(f"  skipped layers : {sorted(skipped_layers, key=lambda x: int(x) if x.isdigit() else 999)}")
+        """Warm-start disabled for stability debugging."""
+        if log_fn:
+            log_fn(
+                "Backbone warm-start: disabled for HSG-DETR stability debug — "
+                "training from scratch"
+            )
 
         return {
-            "transferred": transferred,
-            "skipped": skipped,
-            "total_src": len(src_sd),
-            "total_tgt": len(tgt_sd),
-            "matched_layers": sorted(matched_layers),
+            "transferred": 0,
+            "skipped": 0,
+            "total_src": 0,
+            "total_tgt": 0,
+            "matched_layers": [],
         }
 
 
