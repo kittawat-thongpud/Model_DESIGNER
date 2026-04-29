@@ -20,6 +20,16 @@ import torch.nn.functional as F
 from ultralytics.nn.modules.head import RTDETRDecoder
 
 
+def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
+    """Clamp tensor to finite range and replace NaN/Inf with 0."""
+    return torch.nan_to_num(
+        x,
+        nan=0.0,
+        posinf=limit,
+        neginf=-limit,
+    ).clamp(-limit, limit)
+
+
 class SGTokenBlock(nn.Module):
     """
     Sparse-Token Global Self-Attention block.
@@ -75,7 +85,7 @@ class SGTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 nn.BatchNorm2d(c2),
             )
-            self.local_gate = nn.Parameter(torch.zeros(1))
+            self.local_gate = nn.Parameter(torch.full((1,), -4.0))
         else:
             self.local_dw = None
             self.local_gate = None
@@ -184,7 +194,8 @@ class SGTokenBlock(nn.Module):
         out.scatter_(2, idx_exp, attended.transpose(1, 2))
         out = out.view(B, C, H, W)
         delta = self.out_proj(out)
-        # Clamp delta to prevent gradient explosion, especially early in training
+        # Sanitize and clamp delta to prevent gradient explosion and NaN propagation
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=6.0, neginf=-6.0)
         delta = delta.clamp(-6.0, 6.0)
         return delta
 
@@ -409,11 +420,17 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
         # Encoder projection (same as base)
         features = self.enc_output(self.valid_mask * feats)  # bs, h*w, hd
+        features = _finite_or_zero(features, limit=20.0)
+
         enc_outputs_scores = self.enc_score_head(features)     # bs, h*w, nc
+        enc_outputs_scores = _finite_or_zero(enc_outputs_scores, limit=20.0)
 
         # ── Saliency-weighted query selection ───────────────────────────
-        cls_score = enc_outputs_scores.max(-1).values          # (bs, h*w)
-        token_energy = features.pow(2).sum(-1)                  # (bs, h*w)
+        cls_score = enc_outputs_scores.float().max(-1).values          # (bs, h*w)
+
+        feat32 = features.float().clamp(-20.0, 20.0)
+        token_energy = feat32.square().sum(-1)
+        token_energy = torch.nan_to_num(token_energy, nan=0.0, posinf=1e4, neginf=0.0)
 
         # Per-sample min-max normalisation with NaN/Inf protection
         eps = 1e-6
@@ -429,6 +446,14 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
         # Clamp combined score to prevent explosion
         combined = (cls_score_norm + self.alpha * energy_norm).clamp(-20.0, 20.0)
+        combined = torch.nan_to_num(combined, nan=-1e4, posinf=20.0, neginf=-1e4)
+
+        # Mask invalid anchors before topk
+        valid = self.valid_mask.squeeze(-1).bool()  # [1, N]
+        if valid.shape[0] == 1 and bs > 1:
+            valid = valid.expand(bs, -1)
+        combined = combined.masked_fill(~valid, torch.finfo(combined.dtype).min)
+
         topk_ind = torch.topk(combined, self.num_queries, dim=1).indices.view(-1)
 
         # ── Remainder identical to base RTDETRDecoder ──────────────────
