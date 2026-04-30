@@ -43,6 +43,8 @@ def _finite_logit_box(x: torch.Tensor, limit: float = 10.0) -> torch.Tensor:
 def _sanitize_decoder_output(obj):
     """Recursively sanitize RT-DETR decoder outputs without changing structure."""
     if isinstance(obj, torch.Tensor):
+        if not torch.is_floating_point(obj):
+            return obj
         if obj.shape[-1:] == (4,):
             return _finite_unit_box(obj)
         return _finite_or_zero(obj, limit=30.0)
