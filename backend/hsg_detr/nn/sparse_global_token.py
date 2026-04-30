@@ -416,8 +416,9 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     """
 
     ALPHA_MAX: float = 0.5  # maximum saliency weighting
-    DN_LOGIT_LIMIT: float = 8.0
-    REFINE_EPS: float = 1e-4
+    DN_LOGIT_LIMIT: float = 4.0
+    REFINE_EPS: float = 1e-3
+    BBOX_DELTA_LIMIT: float = 4.0
 
     def __init__(
         self,
@@ -603,6 +604,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
             head_input = F.layer_norm(output.float(), (output.shape[-1],))
             bbox = self.dec_bbox_head[i](head_input)
+            bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
             refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
             refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
 
@@ -612,7 +614,8 @@ class RTDETRDecoderSGB(RTDETRDecoder):
                     dec_bboxes.append(refined_bbox)
                 else:
                     prev_ref = _safe_unit_interval(last_refined_bbox, eps=self.REFINE_EPS)
-                    dec_bboxes.append(torch.sigmoid(bbox + _safe_inverse_sigmoid(prev_ref, eps=self.REFINE_EPS)))
+                    prev_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(prev_ref, eps=self.REFINE_EPS))
+                    dec_bboxes.append(_safe_unit_interval(prev_bbox, eps=self.REFINE_EPS))
             elif i == self.decoder.eval_idx:
                 dec_cls.append(self.dec_score_head[i](head_input))
                 dec_bboxes.append(refined_bbox)
