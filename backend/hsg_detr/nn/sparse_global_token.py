@@ -30,33 +30,6 @@ def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     ).clamp(-limit, limit)
 
 
-def _finite_unit_box(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """Return finite normalized boxes for RT-DETR loss/decoder contracts."""
-    return torch.nan_to_num(x, nan=0.5, posinf=1.0 - eps, neginf=eps).clamp(eps, 1.0 - eps)
-
-
-def _finite_logit_box(x: torch.Tensor, limit: float = 10.0) -> torch.Tensor:
-    """Return finite inverse-sigmoid box logits for RT-DETR decoder contracts."""
-    return torch.nan_to_num(x, nan=0.0, posinf=limit, neginf=-limit).clamp(-limit, limit)
-
-
-def _sanitize_decoder_output(obj):
-    """Recursively sanitize RT-DETR decoder outputs without changing structure."""
-    if isinstance(obj, torch.Tensor):
-        if not torch.is_floating_point(obj):
-            return obj
-        if obj.shape[-1:] == (4,):
-            return _finite_unit_box(obj)
-        return _finite_or_zero(obj, limit=30.0)
-    if isinstance(obj, tuple):
-        return tuple(_sanitize_decoder_output(v) for v in obj)
-    if isinstance(obj, list):
-        return [_sanitize_decoder_output(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _sanitize_decoder_output(v) for k, v in obj.items()}
-    return obj
-
-
 class SGTokenBlock(nn.Module):
     """
     Sparse-Token Global Self-Attention block.
@@ -239,7 +212,6 @@ class SGTokenBlock(nn.Module):
     # ------------------------------------------------------------------ #
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _finite_or_zero(x, limit=20.0)
         B, C, H, W = x.shape
         N = int(H) * int(W)
 
@@ -249,9 +221,9 @@ class SGTokenBlock(nn.Module):
         self.last_mode = self.mode
 
         # Projections
-        q = _finite_or_zero(self.q_proj(x), limit=20.0).view(B, C, N)    # [B, C, N]
-        kk = _finite_or_zero(self.k_proj(x), limit=20.0).view(B, C, N)   # [B, C, N]
-        v = _finite_or_zero(self.v_proj(x), limit=20.0).view(B, C, N)    # [B, C, N]
+        q = self.q_proj(x).view(B, C, N)   # [B, C, N]
+        kk = self.k_proj(x).view(B, C, N)  # [B, C, N]
+        v = self.v_proj(x).view(B, C, N)   # [B, C, N]
 
         gate = torch.sigmoid(self.gate)
         self.last_gate = float(gate.item())
@@ -263,7 +235,7 @@ class SGTokenBlock(nn.Module):
             self.last_indices = topk_idx
             self.last_saliency = self._compute_saliency(x)
             delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, N)
-            return _finite_or_zero(x + gate * delta, limit=20.0)
+            return x + gate * delta
 
         # ── topk / hybrid: select salient tokens ───────────────────────────────────
         importance = self._compute_saliency(x)
@@ -285,11 +257,11 @@ class SGTokenBlock(nn.Module):
 
         if self.mode == "hybrid" and self.local_dw is not None:
             local_gate = torch.sigmoid(self.local_gate)
-            local_delta = _finite_or_zero(self.local_dw(x), limit=6.0)
-            return _finite_or_zero(x + gate * delta + local_gate * local_delta, limit=20.0)
+            local_delta = self.local_dw(x)
+            return x + gate * delta + local_gate * local_delta
 
         # Standard topk mode
-        return _finite_or_zero(x + gate * delta, limit=20.0)
+        return x + gate * delta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -351,11 +323,10 @@ class SGStem(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _finite_or_zero(x, limit=20.0)
-        x = _finite_or_zero(self.cv1(x), limit=20.0)
-        x = _finite_or_zero(self.cv2(x), limit=20.0)
-        x = _finite_or_zero(self.cv3(x), limit=20.0)
-        return _finite_or_zero(self.cv4(x), limit=20.0)
+        x = self.cv1(x)
+        x = self.cv2(x)
+        x = self.cv3(x)
+        return self.cv4(x)
 
 
 class SGDown(nn.Module):
@@ -391,9 +362,7 @@ class SGDown(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _finite_or_zero(x, limit=20.0)
-        x = _finite_or_zero(self.cv1(x), limit=20.0)
-        return _finite_or_zero(self.cv2(x), limit=20.0)
+        return self.cv2(self.cv1(x))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -446,11 +415,6 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         )
         self.alpha = self.ALPHA
 
-    def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> tuple | torch.Tensor:
-        """Run RT-DETR decoder with finite-input/output guards for stable losses."""
-        x = [_finite_or_zero(feat, limit=20.0) for feat in x]
-        return _sanitize_decoder_output(super().forward(x, batch))
-
     def _get_decoder_input(
         self,
         feats: torch.Tensor,
@@ -466,11 +430,6 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         regions identified by the upstream SGB encoder.
         """
         bs = feats.shape[0]
-        feats = _finite_or_zero(feats, limit=20.0)
-        if dn_embed is not None:
-            dn_embed = _finite_or_zero(dn_embed, limit=20.0)
-        if dn_bbox is not None:
-            dn_bbox = _finite_logit_box(dn_bbox, limit=10.0)
         if self.dynamic or self.shapes != shapes:
             self.anchors, self.valid_mask = self._generate_anchors(
                 shapes, dtype=feats.dtype, device=feats.device
@@ -534,29 +493,22 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
         top_k_anchors = self.anchors[:, topk_ind].view(bs, self.num_queries, -1)
 
-        top_k_features = _finite_or_zero(top_k_features, limit=20.0)
-        top_k_anchors = _finite_logit_box(top_k_anchors, limit=10.0)
-
-        refer_bbox = _finite_logit_box(self.enc_bbox_head(top_k_features) + top_k_anchors, limit=10.0)
-        enc_bboxes = _finite_unit_box(refer_bbox.sigmoid())
+        refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
+        enc_bboxes = refer_bbox.sigmoid()
         if dn_bbox is not None:
             refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
-        refer_bbox = _finite_logit_box(refer_bbox, limit=10.0)
         enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
-        enc_scores = _finite_or_zero(enc_scores, limit=30.0)
 
         embeddings = (
             self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
             if self.learnt_init_query
             else top_k_features
         )
-        embeddings = _finite_or_zero(embeddings, limit=20.0)
         if self.training:
             refer_bbox = refer_bbox.detach()
             if not self.learnt_init_query:
                 embeddings = embeddings.detach()
         if dn_embed is not None:
             embeddings = torch.cat([dn_embed, embeddings], 1)
-        embeddings = _finite_or_zero(embeddings, limit=20.0)
 
         return embeddings, refer_bbox, enc_bboxes, enc_scores
