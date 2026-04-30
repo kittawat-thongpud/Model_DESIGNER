@@ -21,7 +21,7 @@ from copy import copy
 from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.utils import LOGGER, ops
 from ultralytics.cfg import get_cfg
-from ultralytics.utils.torch_utils import ModelEMA
+from ultralytics.utils.torch_utils import ModelEMA, unwrap_model
 
 from . import job_storage
 from .config_service import get_monitoring_config
@@ -562,12 +562,30 @@ class CustomDetectionTrainer(DetectionTrainer):
         finally:
             done.set()
 
+        self._calibrate_amp_scaler_for_hsg_detr()
         self.log(
             f"Training setup complete - {self.train_loader.dataset.ni} train images, "
             f"{self.test_loader.dataset.ni} val images",
             "INFO",
         )
         return result
+
+    def _calibrate_amp_scaler_for_hsg_detr(self) -> None:
+        """Use a lower AMP initial scale for HSG-DETR to avoid first-batch overflows."""
+        if not getattr(self, "amp", False) or not hasattr(self, "scaler"):
+            return
+
+        model = unwrap_model(self.model)
+        has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+        if not has_hsg_decoder:
+            return
+
+        init_scale = 1024.0
+        try:
+            self.scaler = torch.amp.GradScaler("cuda", enabled=True, init_scale=init_scale, growth_interval=2000)
+        except TypeError:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=True, init_scale=init_scale, growth_interval=2000)
+        self.log(f"HSG-DETR AMP scaler calibrated: init_scale={init_scale:g}", "INFO")
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
@@ -672,6 +690,11 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Log offending gradients and skip a bounded number of bad optimizer steps."""
         self._nonfinite_grad_steps += 1
         diagnostics = self._collect_nonfinite_grad_diagnostics(limit=12)
+        amp_scale = None
+        try:
+            amp_scale = float(self.scaler.get_scale())
+        except Exception:
+            pass
         if self.job_id:
             job_storage.append_job_log(
                 self.job_id,
@@ -681,6 +704,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                     "type": "nonfinite_gradients",
                     "skip_count": self._nonfinite_grad_steps,
                     "max_skip_count": self._max_nonfinite_grad_skips,
+                    "amp_scale": amp_scale,
                     "diagnostics": diagnostics,
                 },
             )
