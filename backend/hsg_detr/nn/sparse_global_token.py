@@ -7,7 +7,7 @@ with Ultralytics ``parse_model``.  Supports three ablation modes:
   - ``topk``   : hard top-k sparse attention (O(k²d)) — production
   - ``hybrid`` : dense local + sparse global fusion — accuracy
 
-Metadata (selected indices, saliency scores, gate value) are stored as
+        Metadata (selected indices, saliency scores, residual scale) are stored as
 instance attributes for debug / visualization without breaking ``parse_model``
 (single tensor return).
 """
@@ -28,6 +28,14 @@ def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
         posinf=limit,
         neginf=-limit,
     ).clamp(-limit, limit)
+
+
+def _make_gn(channels: int) -> nn.GroupNorm:
+    """Return a GroupNorm layer without BatchNorm running buffers."""
+    groups = min(32, int(channels))
+    while int(channels) % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, int(channels), eps=1e-5)
 
 
 class SGTokenBlock(nn.Module):
@@ -60,6 +68,9 @@ class SGTokenBlock(nn.Module):
         self.ratio = float(ratio)
         self.mode = mode
 
+        self.pre_norm = _make_gn(c2)
+        self.delta_norm = _make_gn(c2)
+
         # 1×1 projections — no spatial aggregation, just channel mixing
         self.q_proj = nn.Conv2d(c2, c2, 1, bias=False)
         self.k_proj = nn.Conv2d(c2, c2, 1, bias=False)
@@ -69,10 +80,9 @@ class SGTokenBlock(nn.Module):
         # Layer norm on selected tokens (channel dim)
         self.norm = nn.LayerNorm(c2)
 
-        # Learnable gate α — init to -4.0 so sigmoid(-4)≈0.018 at epoch 1
-        # grows gradually as training stabilises; prevents early NaN from
-        # large delta contribution before projections are calibrated
-        self.gate = nn.Parameter(torch.full((1,), -4.0))
+        # Per-channel LayerScale residual.  Starting near identity keeps the
+        # CNN/PAN path dominant while the sparse branch calibrates.
+        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
 
         self._attn_scale = c2 ** -0.5
 
@@ -80,15 +90,15 @@ class SGTokenBlock(nn.Module):
         if mode == "hybrid":
             self.local_dw = nn.Sequential(
                 nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
-                nn.BatchNorm2d(c2),
+                _make_gn(c2),
                 nn.SiLU(),
                 nn.Conv2d(c2, c2, 1, bias=False),
-                nn.BatchNorm2d(c2),
+                _make_gn(c2),
             )
-            self.local_gate = nn.Parameter(torch.full((1,), -4.0))
+            self.local_gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
         else:
             self.local_dw = None
-            self.local_gate = None
+            self.local_gamma = None
 
         # Debug metadata (populated during forward, accessible via get_debug_state)
         self.last_indices: torch.Tensor | None = None
@@ -202,9 +212,9 @@ class SGTokenBlock(nn.Module):
         out.scatter_(2, idx_exp, attended_clean)
         out = out.view(B, C, H, W)
         delta = self.out_proj(out)
-        # Sanitize and clamp delta to prevent gradient explosion and NaN propagation
-        delta = torch.nan_to_num(delta, nan=0.0, posinf=6.0, neginf=-6.0)
-        delta = delta.clamp(-6.0, 6.0)
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+        delta = 6.0 * torch.tanh(delta.float() / 6.0)
+        delta = self.delta_norm(delta).to(orig_dtype)
         return delta
 
     # ------------------------------------------------------------------ #
@@ -220,25 +230,27 @@ class SGTokenBlock(nn.Module):
         self.last_k = k_actual
         self.last_mode = self.mode
 
-        # Projections
-        q = self.q_proj(x).view(B, C, N)   # [B, C, N]
-        kk = self.k_proj(x).view(B, C, N)  # [B, C, N]
-        v = self.v_proj(x).view(B, C, N)   # [B, C, N]
+        x_branch = self.pre_norm(x.float()).to(dtype=x.dtype)
 
-        gate = torch.sigmoid(self.gate)
-        self.last_gate = float(gate.item())
+        # Projections
+        q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]
+        kk = self.k_proj(x_branch).view(B, C, N)  # [B, C, N]
+        v = self.v_proj(x_branch).view(B, C, N)   # [B, C, N]
+
+        gamma = self.gamma.to(dtype=x.dtype)
+        self.last_gate = float(gamma.detach().abs().mean().item())
 
         if self.mode == "dense":
             # Full self-attention on all tokens (ablation baseline)
             # Use all positions as "selected"
             topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
             self.last_indices = topk_idx
-            self.last_saliency = self._compute_saliency(x)
-            delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, N)
-            return x + gate * delta
+            self.last_saliency = self._compute_saliency(x_branch)
+            delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
+            return x + gamma * delta
 
         # ── topk / hybrid: select salient tokens ───────────────────────────────────
-        importance = self._compute_saliency(x)
+        importance = self._compute_saliency(x_branch)
         self.last_saliency = importance
 
         # Guard: if all importance is NaN, fall back to uniform selection
@@ -253,15 +265,15 @@ class SGTokenBlock(nn.Module):
 
         self.last_indices = topk_idx
 
-        delta = self._sparse_attention_delta(x, q, kk, v, topk_idx, k_actual)
+        delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
 
         if self.mode == "hybrid" and self.local_dw is not None:
-            local_gate = torch.sigmoid(self.local_gate)
-            local_delta = self.local_dw(x)
-            return x + gate * delta + local_gate * local_delta
+            local_delta = self.local_dw(x_branch)
+            local_gamma = self.local_gamma.to(dtype=x.dtype)
+            return x + gamma * delta + local_gamma * local_delta
 
         # Standard topk mode
-        return x + gate * delta
+        return x + gamma * delta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,23 +314,23 @@ class SGStem(nn.Module):
         # Stage 1: 2× downsample + detail preservation
         self.cv1 = nn.Sequential(
             nn.Conv2d(c1, mid, k, stride=2, padding=k // 2, bias=False),
-            nn.BatchNorm2d(mid),
+            _make_gn(mid),
             nn.SiLU(),
         )
         self.cv2 = nn.Sequential(
             nn.Conv2d(mid, mid, k, stride=1, padding=k // 2, groups=mid, bias=False),
-            nn.BatchNorm2d(mid),
+            _make_gn(mid),
             nn.SiLU(),
         )
         # Stage 2: channel expansion + 2× downsample
         self.cv3 = nn.Sequential(
             nn.Conv2d(mid, mid2, 1, bias=False),
-            nn.BatchNorm2d(mid2),
+            _make_gn(mid2),
             nn.SiLU(),
         )
         self.cv4 = nn.Sequential(
             nn.Conv2d(mid2, c2, k, stride=2, padding=k // 2, bias=False),
-            nn.BatchNorm2d(c2),
+            _make_gn(c2),
             nn.SiLU(),
         )
 
@@ -352,12 +364,12 @@ class SGDown(nn.Module):
         super().__init__()
         self.cv1 = nn.Sequential(
             nn.Conv2d(c1, c2, 1, bias=False),
-            nn.BatchNorm2d(c2),
+            _make_gn(c2),
             nn.SiLU(),
         )
         self.cv2 = nn.Sequential(
             nn.Conv2d(c2, c2, k, stride=2, padding=k // 2, bias=False),
-            nn.BatchNorm2d(c2),
+            _make_gn(c2),
             nn.SiLU(),
         )
 
@@ -386,10 +398,10 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     Args (same as RTDETRDecoder + alpha):
         nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act, eval_idx,
         nd, label_noise_ratio, box_noise_scale, learnt_init_query
-        alpha (float): Saliency weighting coefficient.  Default 0.5.
+        alpha (float): Cold-start saliency weighting coefficient, bounded by 0.5.
     """
 
-    ALPHA: float = 0.5  # saliency weighting (class-level default)
+    ALPHA_MAX: float = 0.5  # maximum saliency weighting
 
     def __init__(
         self,
@@ -413,7 +425,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
         )
-        self.alpha = self.ALPHA
+        self.register_buffer("alpha_logit", torch.tensor(-6.0), persistent=True)
 
     def _get_decoder_input(
         self,
@@ -436,17 +448,16 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             )
             self.shapes = shapes
 
-        # Encoder projection (same as base)
+        # Encoder projection (same as base). Keep these tensors unsanitized for
+        # the loss path; only guarded copies are used for top-k selection.
         features = self.enc_output(self.valid_mask * feats)  # bs, h*w, hd
-        features = _finite_or_zero(features, limit=20.0)
-
         enc_outputs_scores = self.enc_score_head(features)     # bs, h*w, nc
-        enc_outputs_scores = _finite_or_zero(enc_outputs_scores, limit=20.0)
 
         # ── Saliency-weighted query selection ───────────────────────────
-        cls_score = enc_outputs_scores.float().max(-1).values          # (bs, h*w)
+        score_for_select = _finite_or_zero(enc_outputs_scores.detach(), limit=20.0)
+        cls_score = score_for_select.float().max(-1).values          # (bs, h*w)
 
-        feat32 = features.float().clamp(-20.0, 20.0)
+        feat32 = _finite_or_zero(features.detach(), limit=20.0).float()
         token_energy = feat32.square().sum(-1)
         token_energy = torch.nan_to_num(token_energy, nan=0.0, posinf=1e4, neginf=0.0)
 
@@ -462,8 +473,8 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         energy_range = (energy_max - energy_min).clamp(min=eps)
         energy_norm = ((token_energy - energy_min) / energy_range).clamp(-10.0, 10.0)
 
-        # Clamp combined score to prevent explosion
-        combined = (cls_score_norm + self.alpha * energy_norm).clamp(-20.0, 20.0)
+        alpha = float(self.ALPHA_MAX) * torch.sigmoid(self.alpha_logit.float())
+        combined = (cls_score_norm + alpha * energy_norm).clamp(-20.0, 20.0)
         combined = torch.nan_to_num(combined, nan=-1e4, posinf=20.0, neginf=-1e4)
 
         # Mask invalid anchors before topk

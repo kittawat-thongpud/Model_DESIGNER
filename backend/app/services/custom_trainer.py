@@ -640,8 +640,57 @@ class CustomDetectionTrainer(DetectionTrainer):
             super_method()
 
     def optimizer_step(self):
-        """Override optimizer step."""
-        super().optimizer_step()
+        """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
+        self.scaler.unscale_(self.optimizer)
+        self._assert_batchnorm_buffers_finite("before optimizer step")
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=10.0,
+                error_if_nonfinite=True,
+            )
+        except TypeError:
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+            if not torch.isfinite(total_norm):
+                raise NaNLossError(f"NaN/Inf gradient norm detected: {float(total_norm)}")
+        except RuntimeError as e:
+            raise NaNLossError(f"NaN/Inf gradient norm detected: {e}") from e
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad()
+        self._assert_batchnorm_buffers_finite("before EMA update")
+        if self.ema:
+            self.ema.update(self.model)
+
+    def _assert_batchnorm_buffers_finite(self, phase: str) -> None:
+        """Fail before EMA/save if BatchNorm running buffers become non-finite."""
+        issues = []
+        for name, module in self.model.named_modules():
+            if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                continue
+            for buffer_name in ("running_mean", "running_var"):
+                tensor = getattr(module, buffer_name, None)
+                if tensor is not None and not torch.isfinite(tensor).all():
+                    finite = torch.isfinite(tensor)
+                    bad = int((~finite).sum().item())
+                    issues.append(f"{name}.{buffer_name}: bad={bad}/{tensor.numel()}")
+                    break
+            if len(issues) >= 8:
+                break
+
+        if not issues:
+            return
+
+        message = f"NaN/Inf BatchNorm buffer detected {phase}: " + "; ".join(issues)
+        if self.job_id:
+            job_storage.append_job_log(
+                self.job_id,
+                "ERROR",
+                message,
+                {"type": "nonfinite_bn_buffer", "phase": phase, "issues": issues},
+            )
+        raise NaNLossError(message)
 
     def _on_batch_end(self):
         """Called after every batch via callback. Tracks ni internally."""
