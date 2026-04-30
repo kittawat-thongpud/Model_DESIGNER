@@ -545,6 +545,7 @@ $$
 Since \(g\) is a scalar parameter independent of \(F\), the final term is zero, giving
 
 $$
+
 \frac{\partial \mathcal{L}}{\partial F}
 =
 \frac{\partial \mathcal{L}}{\partial F'}
