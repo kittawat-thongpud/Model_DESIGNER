@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
+from ultralytics.nn.modules.utils import inverse_sigmoid
 
 
 def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
@@ -44,6 +45,17 @@ def _fp32_context(device: torch.device):
     if device.type in {"cuda", "cpu"}:
         return torch.autocast(device_type=device.type, enabled=False)
     return nullcontext()
+
+
+def _safe_unit_interval(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Keep box coordinates away from exact 0/1 so inverse-sigmoid stays bounded."""
+    return x.clamp(min=eps, max=1.0 - eps)
+
+
+def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Numerically safer inverse sigmoid used in the decoder refinement loop."""
+    x = _safe_unit_interval(x, eps=eps)
+    return torch.log(x / (1.0 - x))
 
 
 class SGTokenBlock(nn.Module):
@@ -404,6 +416,8 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     """
 
     ALPHA_MAX: float = 0.5  # maximum saliency weighting
+    DN_LOGIT_LIMIT: float = 8.0
+    REFINE_EPS: float = 1e-4
 
     def __init__(
         self,
@@ -509,6 +523,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
         enc_bboxes = refer_bbox.sigmoid()
         if dn_bbox is not None:
+            dn_bbox = dn_bbox.clamp(-self.DN_LOGIT_LIMIT, self.DN_LOGIT_LIMIT)
             refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
         enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
 
@@ -525,3 +540,85 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             embeddings = torch.cat([dn_embed, embeddings], 1)
 
         return embeddings, refer_bbox, enc_bboxes, enc_scores
+
+    def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> tuple | torch.Tensor:
+        """RT-DETR forward with a safer decoder refinement loop for early training."""
+        from ultralytics.models.utils.ops import get_cdn_group
+
+        feats, shapes = self._get_encoder_input(x)
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+        if dn_bbox is not None:
+            dn_bbox = dn_bbox.clamp(-self.DN_LOGIT_LIMIT, self.DN_LOGIT_LIMIT)
+
+        embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
+        dec_bboxes, dec_scores = self._safe_decoder_forward(
+            embed,
+            refer_bbox,
+            feats,
+            shapes,
+            attn_mask=attn_mask,
+        )
+        out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
+        if self.training:
+            return out
+        y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
+        return y if self.export else (y, out)
+
+    def _safe_decoder_forward(
+        self,
+        embed: torch.Tensor,
+        refer_bbox: torch.Tensor,
+        feats: torch.Tensor,
+        shapes: list,
+        attn_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mirror the base decoder but keep reference boxes in a safer numeric range."""
+        output = embed
+        dec_bboxes = []
+        dec_cls = []
+        last_refined_bbox = None
+        refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
+
+        for i, layer in enumerate(self.decoder.layers):
+            ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
+            output = layer(
+                output,
+                ref_for_layer.to(dtype=output.dtype),
+                feats,
+                shapes,
+                padding_mask,
+                attn_mask,
+                self.query_pos_head(ref_for_layer).to(dtype=output.dtype),
+            )
+
+            head_input = F.layer_norm(output.float(), (output.shape[-1],))
+            bbox = self.dec_bbox_head[i](head_input)
+            refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
+            refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
+
+            if self.training:
+                dec_cls.append(self.dec_score_head[i](head_input))
+                if i == 0:
+                    dec_bboxes.append(refined_bbox)
+                else:
+                    prev_ref = _safe_unit_interval(last_refined_bbox, eps=self.REFINE_EPS)
+                    dec_bboxes.append(torch.sigmoid(bbox + _safe_inverse_sigmoid(prev_ref, eps=self.REFINE_EPS)))
+            elif i == self.decoder.eval_idx:
+                dec_cls.append(self.dec_score_head[i](head_input))
+                dec_bboxes.append(refined_bbox)
+                break
+
+            last_refined_bbox = refined_bbox
+            refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+
+        return torch.stack(dec_bboxes), torch.stack(dec_cls)
