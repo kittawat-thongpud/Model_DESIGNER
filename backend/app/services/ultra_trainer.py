@@ -384,7 +384,17 @@ def _reconcile_training_queue() -> dict[str, int]:
 
 
 def _reconcile_training_queue_with_admission(admit_pending: bool) -> dict[str, int]:
-    valid_job_ids = {str(job.get("job_id")) for job in job_storage.list_jobs() if job.get("job_id")}
+    jobs = job_storage.list_jobs()
+    terminal_synced = 0
+    for job in jobs:
+        if job.get("status") in ("completed", "failed", "stopped") and job.get("queue_task_id"):
+            try:
+                _sync_queue_task_with_job(str(job.get("job_id")), admit_pending=admit_pending)
+                terminal_synced += 1
+            except Exception:
+                pass
+
+    valid_job_ids = {str(job.get("job_id")) for job in jobs if job.get("job_id")}
     running_job_ids = _running_training_job_ids()
     result = task_queue.reconcile_tasks(
         task_queue.TaskType.TRAINING,
@@ -392,7 +402,8 @@ def _reconcile_training_queue_with_admission(admit_pending: bool) -> dict[str, i
         running_ref_ids=running_job_ids,
         admit_pending=admit_pending,
     )
-    if result.get("stale_running") or result.get("orphan_pending") or result.get("admitted"):
+    result["terminal_synced"] = terminal_synced
+    if result.get("stale_running") or result.get("orphan_pending") or result.get("admitted") or terminal_synced:
         from .. import logging_service as _ls
         _ls.log("training", "WARNING", "Reconciled stale training queue state", result)
     return result

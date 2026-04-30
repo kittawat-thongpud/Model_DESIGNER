@@ -10,6 +10,8 @@ Caching:
   - Per-record LRU cache (configurable max size) for load() calls.
   - An in-memory index (_index.json) for fast list_all() without globbing.
   - Cache is invalidated on save() and delete().
+  - Cache hits are checked against file mtimes so updates written by a
+    different process are visible without restarting the server.
 """
 from __future__ import annotations
 import json
@@ -51,6 +53,7 @@ class BaseJsonStorage:
 
         # ── LRU cache ──
         self._cache: OrderedDict[str, dict] = OrderedDict()
+        self._cache_mtimes: dict[str, float | None] = {}
         self._cache_max = cache_max_size
         self._lock = threading.Lock()
 
@@ -74,16 +77,31 @@ class BaseJsonStorage:
         return d
 
     def _cache_put(self, record_id: str, data: dict) -> None:
+        try:
+            mtime = self._path(record_id).stat().st_mtime
+        except Exception:
+            mtime = None
         with self._lock:
             if record_id in self._cache:
                 self._cache.move_to_end(record_id)
             self._cache[record_id] = data
+            self._cache_mtimes[record_id] = mtime
             while len(self._cache) > self._cache_max:
-                self._cache.popitem(last=False)
+                old_record_id, _ = self._cache.popitem(last=False)
+                self._cache_mtimes.pop(old_record_id, None)
 
     def _cache_get(self, record_id: str) -> dict | None:
+        try:
+            current_mtime = self._path(record_id).stat().st_mtime
+        except Exception:
+            current_mtime = None
         with self._lock:
             if record_id in self._cache:
+                cached_mtime = self._cache_mtimes.get(record_id)
+                if cached_mtime != current_mtime:
+                    self._cache.pop(record_id, None)
+                    self._cache_mtimes.pop(record_id, None)
+                    return None
                 self._cache.move_to_end(record_id)
                 return self._cache[record_id]
         return None
@@ -91,10 +109,12 @@ class BaseJsonStorage:
     def _cache_remove(self, record_id: str) -> None:
         with self._lock:
             self._cache.pop(record_id, None)
+            self._cache_mtimes.pop(record_id, None)
 
     def _cache_clear(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._cache_mtimes.clear()
 
     # ── Index management ─────────────────────────────────────────────────────
 
