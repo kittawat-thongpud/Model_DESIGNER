@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 BACKEND_DIR  = PROJECT_ROOT / "backend"
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 PID_FILE     = PROJECT_ROOT / ".model_designer.pid"   # tracks our process
+JOBS_DIR     = BACKEND_DIR / "data" / "jobs"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -66,8 +67,78 @@ def _kill_group(pid: int, sig_type: str = "TERM") -> None:
         print(f"   Warning: kill_group({pid}, {sig_type}): {e}")
 
 
+def _worker_pid_files() -> list[Path]:
+    if not JOBS_DIR.exists():
+        return []
+    return list(JOBS_DIR.glob("*/worker_process.pid"))
+
+
+def _kill_training_worker_pid(pid: int, sig_type: str = "TERM") -> None:
+    """Kill an isolated training worker process group by its tracked PID."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        sig = signal.SIGTERM if sig_type == "TERM" else signal.SIGKILL
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except Exception:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        print(f"   Warning: kill_training_worker_pid({pid}, {sig_type}): {e}")
+
+
+def clean_training_workers() -> None:
+    """Clean isolated training workers left behind by a backend crash/restart."""
+    pid_files = _worker_pid_files()
+    if not pid_files:
+        return
+
+    cleaned = 0
+    for pid_file in pid_files:
+        try:
+            pid = int(pid_file.read_text().strip().splitlines()[0])
+        except Exception:
+            pid_file.unlink(missing_ok=True)
+            continue
+
+        meta_file = pid_file.with_name("worker_process.json")
+        if not _pid_is_alive(pid):
+            pid_file.unlink(missing_ok=True)
+            meta_file.unlink(missing_ok=True)
+            continue
+
+        job_id = pid_file.parent.name
+        print(f"⚠️  Found stale training worker (job={job_id}, pid={pid}) — cleaning up...")
+        _kill_training_worker_pid(pid, "TERM")
+        for _ in range(10):
+            time.sleep(0.5)
+            if not _pid_is_alive(pid):
+                break
+        else:
+            print("   Training worker SIGTERM timeout — forcing SIGKILL...")
+            _kill_training_worker_pid(pid, "KILL")
+            time.sleep(0.5)
+
+        if not _pid_is_alive(pid):
+            pid_file.unlink(missing_ok=True)
+            meta_file.unlink(missing_ok=True)
+        cleaned += 1
+
+    if cleaned:
+        print(f"   Cleaned {cleaned} stale training worker(s).")
+
+
 def clean_boot() -> None:
     """Kill any stale worker from a previous run before starting fresh."""
+    clean_training_workers()
+
     pid = _read_pid()
     if pid is None:
         return
@@ -95,6 +166,7 @@ def clean_boot() -> None:
 def clean_shutdown(backend_proc: subprocess.Popen) -> None:
     """Gracefully terminate the process group, escalate to SIGKILL if needed."""
     if backend_proc.poll() is not None:
+        clean_training_workers()
         return  # already dead
 
     print("   Sending stop signal to process group...")
@@ -111,6 +183,7 @@ def clean_shutdown(backend_proc: subprocess.Popen) -> None:
         backend_proc.wait()
 
     PID_FILE.unlink(missing_ok=True)
+    clean_training_workers()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

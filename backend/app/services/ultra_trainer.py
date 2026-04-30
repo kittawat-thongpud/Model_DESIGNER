@@ -9,6 +9,9 @@ Wraps YOLO model.train() with:
 from __future__ import annotations
 import os
 import sys
+import json
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -20,6 +23,8 @@ from typing import Any
 # This is necessary because Ultralytics checks sys.argv and tries to parse CLI commands
 import sys
 import os
+
+_ORIGINAL_ARGV = sys.argv[:]
 
 # Set environment variable to disable CLI mode
 os.environ['YOLO_CLI'] = '0'
@@ -97,14 +102,14 @@ task_queue.on_task_admitted(_on_training_task_admitted)
 
 
 def _launch_thread(job_id: str, job: dict) -> None:
-    """Spawn the training worker thread for a job record."""
+    """Spawn a supervisor thread that owns an isolated training subprocess."""
     yaml_path = ""
     try:
         yaml_path = _resolve_yaml_for_job(job)
     except ValueError:
         pass
     t = threading.Thread(
-        target=_training_worker,
+        target=_training_process_supervisor,
         args=(job_id, yaml_path, job.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
               dict(job.get("config", {})),
               job.get("partition_configs") or [],
@@ -113,9 +118,254 @@ def _launch_thread(job_id: str, job: dict) -> None:
     )
     with _lock:
         if job_id not in _active_jobs:
-            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
+            _active_jobs[job_id] = _active_entry()
         _active_jobs[job_id]["thread"] = t
     t.start()
+
+
+def _active_entry() -> dict[str, Any]:
+    return {"thread": None, "process": None, "stop": False, "stop_reason": None}
+
+
+def _worker_args_path(job_id: str) -> Path:
+    return JOBS_DIR / job_id / "worker_args.json"
+
+
+def _worker_pid_path(job_id: str) -> Path:
+    return JOBS_DIR / job_id / "worker_process.pid"
+
+
+def _worker_meta_path(job_id: str) -> Path:
+    return JOBS_DIR / job_id / "worker_process.json"
+
+
+def _start_training_subprocess(
+    job_id: str,
+    yaml_path: str,
+    task: str,
+    config: dict[str, Any],
+    partition_configs: list[dict[str, Any]] | None,
+    model_scale: str | None,
+) -> subprocess.Popen:
+    """Start the real trainer in a separate Python process.
+
+    PyTorch/CUDA native crashes (segfault, SIGKILL, OOM killer) then take down
+    only the training child, leaving the FastAPI server alive to mark the job.
+    """
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    args_path = _worker_args_path(job_id)
+    payload = {
+        "job_id": job_id,
+        "yaml_path": yaml_path,
+        "task": task,
+        "config": config,
+        "partition_configs": partition_configs or [],
+        "model_scale": model_scale,
+    }
+    args_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    backend_dir = str(Path(__file__).resolve().parent.parent.parent)
+    env = os.environ.copy()
+    cur_pythonpath = env.get("PYTHONPATH", "")
+    if backend_dir not in cur_pythonpath.split(os.pathsep):
+        env["PYTHONPATH"] = backend_dir + (os.pathsep + cur_pythonpath if cur_pythonpath else "")
+    env["YOLO_CLI"] = "0"
+    env["MD_JOB_ID"] = job_id
+    env["MD_TRAINING_CHILD"] = "1"
+
+    worker_log = job_dir / "worker_process.log"
+    log_fh = open(worker_log, "ab", buffering=0)
+    cmd = [
+        sys.executable,
+        "-m",
+        "app.services.ultra_trainer",
+        "--worker",
+        str(args_path),
+    ]
+    job_storage.append_job_log(
+        job_id,
+        "INFO",
+        f"Launching isolated training process: {' '.join(cmd)}",
+        {"worker_log": str(worker_log)},
+    )
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(Path(__file__).resolve().parents[3]),
+        env=env,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    proc._md_log_fh = log_fh  # type: ignore[attr-defined]
+    try:
+        pgid = os.getpgid(proc.pid) if os.name != "nt" else proc.pid
+    except Exception:
+        pgid = proc.pid
+    _worker_pid_path(job_id).write_text(f"{proc.pid}\n", encoding="utf-8")
+    _worker_meta_path(job_id).write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "pid": proc.pid,
+                "pgid": pgid,
+                "started_at": datetime.utcnow().isoformat() + "Z",
+                "cmd": cmd,
+                "worker_log": str(worker_log),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    job_storage.append_job_log(job_id, "INFO", f"Training worker PID saved: pid={proc.pid}, pgid={pgid}")
+    return proc
+
+
+def _returncode_message(returncode: int) -> str:
+    if returncode < 0:
+        sig = -returncode
+        try:
+            sig_name = signal.Signals(sig).name
+        except Exception:
+            sig_name = f"SIG{sig}"
+        if sig_name == "SIGSEGV":
+            return "Training worker crashed with SIGSEGV (native PyTorch/CUDA fault)"
+        if sig_name == "SIGKILL":
+            return "Training worker was killed with SIGKILL (possible OS OOM killer)"
+        return f"Training worker exited from signal {sig_name}"
+    return f"Training worker exited with code {returncode}"
+
+
+def _terminate_worker_process(job_id: str, reason: str, timeout: float | None = None) -> None:
+    if timeout is None:
+        timeout = _TRAINING_WORKER_STOP_JOIN_TIMEOUT_S
+    with _lock:
+        info = _active_jobs.get(job_id)
+        proc = info.get("process") if info else None
+    if not proc or proc.poll() is not None:
+        return
+    job_storage.append_job_log(job_id, "INFO", f"Stopping isolated training process: {reason}")
+    try:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        job_storage.append_job_log(job_id, "WARNING", "Training process did not stop in time; killing it")
+        try:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+    except Exception as exc:
+        job_storage.append_job_log(job_id, "WARNING", f"Training process stop warning: {exc}")
+
+
+def _training_process_supervisor(
+    job_id: str,
+    yaml_path: str,
+    task: str,
+    config: dict[str, Any],
+    partition_configs: list[dict[str, Any]] | None = None,
+    model_scale: str | None = None,
+) -> None:
+    """Parent-side supervisor for the isolated training subprocess."""
+    proc: subprocess.Popen | None = None
+    try:
+        proc = _start_training_subprocess(job_id, yaml_path, task, config, partition_configs, model_scale)
+        with _lock:
+            info = _active_jobs.get(job_id)
+            if info is not None:
+                info["process"] = proc
+
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                break
+            if _should_stop(job_id):
+                reason = _consume_stop_reason(job_id, "Stopped by user")
+                _terminate_worker_process(job_id, reason)
+                break
+            time.sleep(1.0)
+
+        returncode = proc.poll()
+        stop_requested = False
+        with _lock:
+            info = _active_jobs.get(job_id)
+            stop_requested = bool(info and info.get("stop"))
+
+        job = job_storage.load_job(job_id)
+        if stop_requested:
+            message = "Stopped by user"
+            if job and job.get("status") not in ("completed", "failed", "stopped"):
+                job["status"] = "stopped"
+                job["message"] = message
+                job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                job_storage.save_job(job)
+                _publish(job_id, job)
+                job_storage.append_job_log(job_id, "WARNING", message)
+            return
+
+        if returncode and returncode != 0:
+            message = _returncode_message(returncode)
+            if job and job.get("status") in ("running", "pending"):
+                job["status"] = "failed"
+                job["message"] = message
+                job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                job_storage.save_job(job)
+                _publish(job_id, job)
+            job_storage.append_job_log(job_id, "ERROR", message, {"returncode": returncode})
+            if returncode < 0:
+                job_storage.append_job_log(
+                    job_id,
+                    "ERROR",
+                    "Server survived isolated training worker crash; inspect worker_process.log and kernel logs.",
+                )
+        elif job and job.get("status") == "running":
+            message = "Training worker exited without updating terminal job status"
+            job["status"] = "failed"
+            job["message"] = message
+            job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            job_storage.save_job(job)
+            _publish(job_id, job)
+            job_storage.append_job_log(job_id, "ERROR", message)
+
+    except Exception as exc:
+        job = job_storage.load_job(job_id)
+        if job and job.get("status") in ("running", "pending"):
+            job["status"] = "failed"
+            job["message"] = f"Training supervisor failed: {exc}"
+            job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            job_storage.save_job(job)
+            _publish(job_id, job)
+        job_storage.append_job_log(job_id, "ERROR", f"Training supervisor failed: {exc}")
+    finally:
+        with _lock:
+            _active_jobs.pop(job_id, None)
+        event_bus.clear_last_event(train_channel(job_id))
+        for path in (_worker_pid_path(job_id), _worker_meta_path(job_id)):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            if proc is not None:
+                log_fh = getattr(proc, "_md_log_fh", None)
+                if log_fh is not None:
+                    try:
+                        log_fh.close()
+                    except Exception:
+                        pass
+            _sync_queue_task_with_job(job_id, admit_pending=True)
+        except Exception as exc:
+            try:
+                job_storage.append_job_log(job_id, "WARNING", f"Queue sync after worker exit failed: {exc}")
+            except Exception:
+                pass
 
 
 def _running_training_job_ids() -> set[str]:
@@ -238,6 +488,7 @@ def shutdown_training_workers(timeout: float | None = None) -> dict[str, str]:
     results: dict[str, str] = {}
     for job_id in active:
         thread = _request_stop(job_id, "Stopped due to server shutdown")
+        _terminate_worker_process(job_id, "Stopped due to server shutdown", timeout=timeout)
         if thread and thread.is_alive():
             job_storage.append_job_log(job_id, "INFO", "Server shutdown requested - stopping worker thread...")
             thread.join(timeout=timeout)
@@ -321,9 +572,9 @@ def start_training(
     if admitted:
         # Slot available — start immediately
         with _lock:
-            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
+            _active_jobs[job_id] = _active_entry()
         t = threading.Thread(
-            target=_training_worker,
+            target=_training_process_supervisor,
             args=(job_id, yaml_path, task, config, partition_configs, model_scale),
             daemon=False,
         )
@@ -345,6 +596,7 @@ def stop_training(job_id: str) -> bool:
     thread_to_join = _request_stop(job_id, "Stopped by user")
     if thread_to_join is None:
         return False
+    _terminate_worker_process(job_id, "Stopped by user")
     
     # Wait for thread to finish (with timeout) to ensure proper cleanup
     if thread_to_join and thread_to_join.is_alive():
@@ -443,6 +695,7 @@ def _restart_job(job_id: str, config: dict) -> None:
             # Signal existing thread to stop
             info["stop"] = True
             info["stop_reason"] = "Stopped due to worker restart"
+    _terminate_worker_process(job_id, "Stopped due to worker restart")
     
     # Wait for existing thread to finish (with timeout)
     if existing_thread and existing_thread.is_alive():
@@ -475,9 +728,9 @@ def _restart_job(job_id: str, config: dict) -> None:
 
     if admitted:
         with _lock:
-            _active_jobs[job_id] = {"thread": None, "stop": False, "stop_reason": None}
+            _active_jobs[job_id] = _active_entry()
         t = threading.Thread(
-            target=_training_worker,
+            target=_training_process_supervisor,
             args=(job_id, yaml_arg, task_arg, config, partition_configs_arg, model_scale_arg),
             daemon=False,
         )
@@ -546,8 +799,14 @@ def cleanup_zombie_workers() -> dict[str, str]:
                 continue
             
             thread = info.get("thread")
+            proc = info.get("process")
             if not thread:
                 # No thread but still in active_jobs - zombie entry
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
                 _active_jobs.pop(job_id, None)
                 cleaned[job_id] = "removed_no_thread"
                 continue
@@ -565,6 +824,11 @@ def cleanup_zombie_workers() -> dict[str, str]:
                     cleaned[job_id] = "marked_failed"
                 
                 # Kill orphaned DDP subprocesses
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
                 _kill_ddp_processes(job_id)
                 
                 _active_jobs.pop(job_id, None)
@@ -646,13 +910,18 @@ def get_worker_health() -> dict[str, Any]:
                 continue
             
             thread = info.get("thread")
+            proc = info.get("process")
             is_alive = thread.is_alive() if thread else False
+            proc_returncode = proc.poll() if proc else None
             
             job = job_storage.load_job(job_id)
             
             worker_info = {
                 "job_id": job_id,
                 "thread_alive": is_alive,
+                "process_pid": proc.pid if proc else None,
+                "process_alive": bool(proc and proc_returncode is None),
+                "process_returncode": proc_returncode,
                 "job_status": job.get("status") if job else "unknown",
                 "stop_requested": info.get("stop", False)
             }
@@ -2007,10 +2276,11 @@ def _training_worker(
         except Exception:
             pass
 
-        try:
-            _sync_queue_task_with_job(job_id, admit_pending=True)
-        except Exception:
-            pass
+        if os.environ.get("MD_TRAINING_CHILD") != "1":
+            try:
+                _sync_queue_task_with_job(job_id, admit_pending=True)
+            except Exception:
+                pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2515,3 +2785,35 @@ def _save_best_weight(job_id: str, job_dir: Path, model_name: str = "") -> str |
     )
     
     return weight_id
+
+
+def _run_worker_from_args_file(args_path: str) -> int:
+    """CLI entrypoint used by the isolated training subprocess."""
+    payload = json.loads(Path(args_path).read_text(encoding="utf-8"))
+    job_id = str(payload["job_id"])
+    try:
+        from ..plugins.loader import discover_plugins
+        counts = discover_plugins()
+        job_storage.append_job_log(job_id, "INFO", f"Worker plugin discovery: {counts}")
+    except Exception as exc:
+        job_storage.append_job_log(job_id, "WARNING", f"Worker plugin discovery failed: {exc}")
+    _training_worker(
+        job_id,
+        str(payload.get("yaml_path") or ""),
+        str(payload.get("task") or str(_MODEL_DEFAULTS.get("task", "detect"))),
+        dict(payload.get("config") or {}),
+        list(payload.get("partition_configs") or []),
+        payload.get("model_scale"),
+    )
+    return 0
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) >= 3 and argv[1] == "--worker":
+        return _run_worker_from_args_file(argv[2])
+    print("Usage: python -m app.services.ultra_trainer --worker <worker_args.json>", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(_ORIGINAL_ARGV))

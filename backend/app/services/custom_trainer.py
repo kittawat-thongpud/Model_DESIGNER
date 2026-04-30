@@ -1211,13 +1211,96 @@ class CustomDetectionTrainer(DetectionTrainer):
         # Record weights if enabled
         if self.record_weights and self.epoch % self.weight_interval == 0:
             self._record_weights()
+
+        self._log_ema_nonfinite_diagnostics()
         
         # Call parent save
-        super().save_model()
+        saved = super().save_model()
         
         # Log checkpoint save
         ckpt_file = self.wdir / f"epoch{self.epoch}.pt" if self.epoch else self.wdir / "last.pt"
-        self.log(f"Checkpoint saved: {ckpt_file.name}", "INFO")
+        if saved is False:
+            self.log(f"Checkpoint save skipped: {ckpt_file.name}", "WARNING")
+        else:
+            self.log(f"Checkpoint saved: {ckpt_file.name}", "INFO")
+
+    def _tensor_nonfinite_summary(self, t: torch.Tensor) -> dict[str, Any] | None:
+        if not t.dtype.is_floating_point:
+            return None
+        finite = torch.isfinite(t)
+        bad = int((~finite).sum().item())
+        if bad == 0:
+            return None
+        nan = int(torch.isnan(t).sum().item())
+        posinf = int(torch.isposinf(t).sum().item())
+        neginf = int(torch.isneginf(t).sum().item())
+        summary: dict[str, Any] = {
+            "shape": list(t.shape),
+            "dtype": str(t.dtype),
+            "bad": bad,
+            "nan": nan,
+            "posinf": posinf,
+            "neginf": neginf,
+        }
+        good = t[finite]
+        if good.numel():
+            gf = good.detach().float()
+            summary.update({
+                "finite_min": float(gf.min().item()),
+                "finite_max": float(gf.max().item()),
+                "finite_mean": float(gf.mean().item()),
+            })
+        return summary
+
+    def _log_ema_nonfinite_diagnostics(self, limit: int = 12) -> None:
+        if not self.job_id or not getattr(self, "ema", None) or not getattr(self.ema, "ema", None):
+            return
+
+        try:
+            ema_sd = self.ema.ema.state_dict()
+            model_sd = self.model.state_dict() if hasattr(self, "model") else {}
+
+            issues = []
+            for name, tensor in ema_sd.items():
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                summary = self._tensor_nonfinite_summary(tensor)
+                if summary is None:
+                    continue
+
+                model_summary = None
+                model_tensor = model_sd.get(name)
+                if isinstance(model_tensor, torch.Tensor):
+                    model_summary = self._tensor_nonfinite_summary(model_tensor)
+                summary["model_has_nonfinite"] = model_summary is not None
+                if model_summary is not None:
+                    summary["model_bad"] = {
+                        "bad": model_summary["bad"],
+                        "nan": model_summary["nan"],
+                        "posinf": model_summary["posinf"],
+                        "neginf": model_summary["neginf"],
+                    }
+                issues.append({"name": name, **summary})
+                if len(issues) >= limit:
+                    break
+
+            if not issues:
+                return
+
+            self.log(
+                "EMA non-finite diagnostics before checkpoint save: "
+                + json.dumps(
+                    {
+                        "epoch": int(getattr(self, "epoch", -1)),
+                        "shown": len(issues),
+                        "issues": issues,
+                    },
+                    ensure_ascii=False,
+                ),
+                "ERROR",
+            )
+        except Exception as e:
+            self.log(f"EMA non-finite diagnostic failed: {e}", "WARNING")
     
     def _record_gradients(self) -> None:
         """Record gradient statistics for current epoch."""

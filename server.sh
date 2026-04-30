@@ -55,6 +55,8 @@ _port_pids() {
 }
 
 kill_port() {
+    cleanup_training_workers
+
     local PIDS
     PIDS="$(_port_pids)"
     if [ -n "${PIDS}" ]; then
@@ -68,6 +70,43 @@ kill_port() {
         echo "✅ Port ${PORT} cleared."
     else
         echo "⚠️  Port ${PORT} still in use (pid ${PIDS})."
+    fi
+}
+
+cleanup_training_workers() {
+    local cleaned=0
+    local pid_file pid job_id
+    shopt -s nullglob
+    for pid_file in "${APP_DIR}"/backend/data/jobs/*/worker_process.pid; do
+        pid="$(head -n 1 "${pid_file}" 2>/dev/null | tr -dc '0-9' || true)"
+        if [ -z "${pid}" ]; then
+            rm -f "${pid_file}" "${pid_file%/*}/worker_process.json" 2>/dev/null || true
+            continue
+        fi
+
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            rm -f "${pid_file}" "${pid_file%/*}/worker_process.json" 2>/dev/null || true
+            continue
+        fi
+
+        job_id="$(basename "$(dirname "${pid_file}")")"
+        echo "⚠️  Stale training worker detected (job=${job_id}, pid=${pid}). Killing..."
+        kill -TERM "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+        sleep 1
+        if kill -0 "${pid}" 2>/dev/null; then
+            echo "   Training worker still alive; forcing SIGKILL..."
+            kill -KILL "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+            sleep 1
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            rm -f "${pid_file}" "${pid_file%/*}/worker_process.json" 2>/dev/null || true
+        fi
+        cleaned=$((cleaned + 1))
+    done
+    shopt -u nullglob
+
+    if [ "${cleaned}" -gt 0 ]; then
+        echo "✅ Cleaned ${cleaned} stale training worker(s)."
     fi
 }
 
@@ -145,6 +184,8 @@ _tmux_stop() {
     else
         echo "⚠️  No tmux session '${SESSION}' running."
     fi
+    cleanup_training_workers
+    kill_port
 }
 
 _tmux_restart() {
@@ -153,6 +194,7 @@ _tmux_restart() {
         tmux kill-session -t "${SESSION}"
         sleep 1
     fi
+    cleanup_training_workers
     kill_port
     tmux new-session -d -s "${SESSION}" -x 220 -y 50 "bash -c '${CMD}'"
     sleep 1
@@ -194,6 +236,8 @@ case "${1:-}" in
             echo "🛑 Stopping service '${SERVICE_NAME}'..."
             sudo systemctl stop "${SERVICE_NAME}"
             echo "✅ Service '${SERVICE_NAME}' stopped."
+            cleanup_training_workers
+            kill_port
         else
             _tmux_stop
         fi
