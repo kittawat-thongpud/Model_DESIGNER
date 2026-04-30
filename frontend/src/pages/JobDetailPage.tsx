@@ -43,6 +43,8 @@ const LOG_INTERVAL_OPTIONS = [
   { label: '10s', value: 10000 },
 ];
 
+const LIVE_JOB_STATUSES = new Set(['pending', 'running']);
+
 const StatBadge = ({ label, value, color, subtext }: { label: string, value: string | number, color: string, subtext?: string }) => (
   <div className="bg-slate-900 px-4 py-2 rounded border border-slate-800 min-w-[100px]">
     <span className="text-[10px] text-slate-500 block uppercase tracking-wider">{label}</span>
@@ -196,12 +198,12 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
     return () => clearInterval(id);
   }, [logInterval, refreshLogs]);
 
-  // Auto-enable log refresh when job is running, stop when done
+  // Auto-enable refresh while a job is queued/running, stop only on terminal states.
   useEffect(() => {
-    if (job?.status === 'running') {
+    if (job?.status && LIVE_JOB_STATUSES.has(job.status)) {
       if (logInterval <= 0) setLogInterval(5000);
       if (mainInterval <= 0) setMainInterval(30000);
-    } else if (job && job.status !== 'running') {
+    } else if (job) {
       if (mainInterval > 0) setMainInterval(0);
       if (logInterval > 0) setLogInterval(0);
       setTrainProgress(null);
@@ -211,7 +213,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
   }, [job?.status]);
 
   // SSE — real-time updates for progress, epoch summary, and terminal events
-  const sseUrl = job?.status === 'running' ? `/api/train/${jobId}/stream` : null;
+  const sseUrl = job?.status && LIVE_JOB_STATUSES.has(job.status) ? `/api/train/${jobId}/stream` : null;
   useSSE(sseUrl, (_event, data) => {
     const d = data as Record<string, unknown>;
     if (d.type === 'progress') {
