@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
 
@@ -36,6 +37,13 @@ def _make_gn(channels: int) -> nn.GroupNorm:
     while int(channels) % groups != 0:
         groups -= 1
     return nn.GroupNorm(groups, int(channels), eps=1e-5)
+
+
+def _fp32_context(device: torch.device):
+    """Disable autocast so numerically sensitive sparse blocks stay in FP32."""
+    if device.type in {"cuda", "cpu"}:
+        return torch.autocast(device_type=device.type, enabled=False)
+    return nullcontext()
 
 
 class SGTokenBlock(nn.Module):
@@ -230,50 +238,44 @@ class SGTokenBlock(nn.Module):
         self.last_k = k_actual
         self.last_mode = self.mode
 
-        x_branch = self.pre_norm(x.float()).to(dtype=x.dtype)
-
-        # Projections
-        q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]
-        kk = self.k_proj(x_branch).view(B, C, N)  # [B, C, N]
-        v = self.v_proj(x_branch).view(B, C, N)   # [B, C, N]
-
         gamma = self.gamma.to(dtype=x.dtype)
         self.last_gate = float(gamma.detach().abs().mean().item())
 
-        if self.mode == "dense":
-            # Full self-attention on all tokens (ablation baseline)
-            # Use all positions as "selected"
-            topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+        with _fp32_context(x.device):
+            x_branch = self.pre_norm(x.float())
+
+            # Projections
+            q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]
+            kk = self.k_proj(x_branch).view(B, C, N)  # [B, C, N]
+            v = self.v_proj(x_branch).view(B, C, N)   # [B, C, N]
+
+            if self.mode == "dense":
+                # Full self-attention on all tokens (ablation baseline)
+                topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+                self.last_indices = topk_idx
+                self.last_saliency = self._compute_saliency(x_branch)
+                delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
+                return x + gamma * delta.to(dtype=x.dtype)
+
+            importance = self._compute_saliency(x_branch)
+            self.last_saliency = importance
+
+            if not torch.isfinite(importance).any():
+                importance = torch.ones_like(importance)
+
+            topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
+            topk_idx = torch.clamp(topk_idx, 0, N - 1)
+            topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
             self.last_indices = topk_idx
-            self.last_saliency = self._compute_saliency(x_branch)
-            delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
-            return x + gamma * delta
 
-        # ── topk / hybrid: select salient tokens ───────────────────────────────────
-        importance = self._compute_saliency(x_branch)
-        self.last_saliency = importance
+            delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
 
-        # Guard: if all importance is NaN, fall back to uniform selection
-        if not torch.isfinite(importance).any():
-            importance = torch.ones_like(importance)
+            if self.mode == "hybrid" and self.local_dw is not None:
+                local_delta = self.local_dw(x_branch)
+                local_gamma = self.local_gamma.to(dtype=x.dtype)
+                return x + gamma * delta.to(dtype=x.dtype) + local_gamma * local_delta.to(dtype=x.dtype)
 
-        topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
-
-        # Guard: validate indices are in valid range [0, N)
-        topk_idx = torch.clamp(topk_idx, 0, N - 1)
-        topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
-
-        self.last_indices = topk_idx
-
-        delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
-
-        if self.mode == "hybrid" and self.local_dw is not None:
-            local_delta = self.local_dw(x_branch)
-            local_gamma = self.local_gamma.to(dtype=x.dtype)
-            return x + gamma * delta + local_gamma * local_delta
-
-        # Standard topk mode
-        return x + gamma * delta
+            return x + gamma * delta.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

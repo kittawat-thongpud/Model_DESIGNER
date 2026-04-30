@@ -392,6 +392,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._imgs_per_sec: float | None = None
         self._batch_counter: int = 0
         self._last_batch_time: float = _time.time()
+        self._nonfinite_grad_steps: int = 0
+        self._max_nonfinite_grad_skips: int = 8
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
@@ -652,16 +654,79 @@ class CustomDetectionTrainer(DetectionTrainer):
         except TypeError:
             total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
             if not torch.isfinite(total_norm):
-                raise NaNLossError(f"NaN/Inf gradient norm detected: {float(total_norm)}")
+                self._handle_nonfinite_gradients(f"NaN/Inf gradient norm detected: {float(total_norm)}")
+                return
         except RuntimeError as e:
-            raise NaNLossError(f"NaN/Inf gradient norm detected: {e}") from e
+            self._handle_nonfinite_gradients(f"NaN/Inf gradient norm detected: {e}")
+            return
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
+        self._nonfinite_grad_steps = 0
         self._assert_batchnorm_buffers_finite("before EMA update")
         if self.ema:
             self.ema.update(self.model)
+
+    def _handle_nonfinite_gradients(self, reason: str) -> None:
+        """Log offending gradients and skip a bounded number of bad optimizer steps."""
+        self._nonfinite_grad_steps += 1
+        diagnostics = self._collect_nonfinite_grad_diagnostics(limit=12)
+        if self.job_id:
+            job_storage.append_job_log(
+                self.job_id,
+                "ERROR",
+                reason,
+                {
+                    "type": "nonfinite_gradients",
+                    "skip_count": self._nonfinite_grad_steps,
+                    "max_skip_count": self._max_nonfinite_grad_skips,
+                    "diagnostics": diagnostics,
+                },
+            )
+
+        self.optimizer.zero_grad(set_to_none=True)
+        try:
+            self.scaler.update()
+        except Exception:
+            pass
+
+        if self._nonfinite_grad_steps <= self._max_nonfinite_grad_skips:
+            if self.job_id:
+                job_storage.append_job_log(
+                    self.job_id,
+                    "WARNING",
+                    f"Skipped optimizer step due to non-finite gradients ({self._nonfinite_grad_steps}/{self._max_nonfinite_grad_skips})",
+                )
+            return
+
+        raise NaNLossError(reason)
+
+    def _collect_nonfinite_grad_diagnostics(self, limit: int = 12) -> list[dict[str, Any]]:
+        """Summarize the first parameters whose gradients contain NaN/Inf."""
+        issues: list[dict[str, Any]] = []
+        for name, param in self.model.named_parameters():
+            grad = param.grad
+            if grad is None or not torch.is_tensor(grad):
+                continue
+            summary = self._tensor_nonfinite_summary(grad.detach())
+            if summary is None:
+                continue
+            summary["name"] = name
+            if torch.is_tensor(param):
+                pdata = param.detach()
+                psummary = self._tensor_nonfinite_summary(pdata)
+                if psummary is not None:
+                    summary["param_bad"] = {
+                        "bad": psummary["bad"],
+                        "nan": psummary["nan"],
+                        "posinf": psummary["posinf"],
+                        "neginf": psummary["neginf"],
+                    }
+            issues.append(summary)
+            if len(issues) >= limit:
+                break
+        return issues
 
     def _assert_batchnorm_buffers_finite(self, phase: str) -> None:
         """Fail before EMA/save if BatchNorm running buffers become non-finite."""
