@@ -522,7 +522,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         top_k_anchors = self.anchors[:, topk_ind].view(bs, self.num_queries, -1)
 
         refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
-        enc_bboxes = refer_bbox.sigmoid()
+        enc_bboxes = _safe_unit_interval(refer_bbox.sigmoid(), eps=self.REFINE_EPS)
         if dn_bbox is not None:
             dn_bbox = dn_bbox.clamp(-self.DN_LOGIT_LIMIT, self.DN_LOGIT_LIMIT)
             refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)

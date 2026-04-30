@@ -394,6 +394,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._last_batch_time: float = _time.time()
         self._nonfinite_grad_steps: int = 0
         self._max_nonfinite_grad_skips: int = 8
+        self._target_sanitize_logs: int = 0
+        self._last_train_batch_summary: dict[str, Any] | None = None
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
@@ -422,6 +424,94 @@ class CustomDetectionTrainer(DetectionTrainer):
         # Enable heartbeat logging in CustomValidator.preprocess/postprocess
         v._heartbeat_job_id = getattr(self, "job_id", None)
         return v
+
+    def preprocess_batch(self, batch: dict) -> dict:
+        """Preprocess batch and guard HSG-DETR targets before RT-DETR loss."""
+        batch = super().preprocess_batch(batch)
+        if self._is_hsg_detr_model():
+            batch = self._sanitize_hsg_detr_targets(batch)
+        self._last_train_batch_summary = self._summarize_training_batch(batch)
+        return batch
+
+    def _is_hsg_detr_model(self) -> bool:
+        try:
+            model = unwrap_model(self.model)
+            return any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+        except Exception:
+            return False
+
+    def _sanitize_hsg_detr_targets(self, batch: dict) -> dict:
+        """Drop non-finite boxes and keep xywh targets in a valid numeric range."""
+        bboxes = batch.get("bboxes")
+        cls = batch.get("cls")
+        batch_idx = batch.get("batch_idx")
+        if not torch.is_tensor(bboxes) or bboxes.numel() == 0:
+            return batch
+
+        b = bboxes.float()
+        finite = torch.isfinite(b).all(dim=1)
+        wh = b[:, 2:4]
+        valid_wh = torch.isfinite(wh).all(dim=1) & (wh > 1e-6).all(dim=1)
+        keep = finite & valid_wh
+        dropped = int((~keep).sum().item())
+        clipped = int(((b < 0.0) | (b > 1.0)).any(dim=1).sum().item())
+
+        if not keep.all():
+            batch["bboxes"] = bboxes[keep]
+            if torch.is_tensor(cls) and cls.shape[0] == keep.shape[0]:
+                batch["cls"] = cls[keep]
+            if torch.is_tensor(batch_idx) and batch_idx.shape[0] == keep.shape[0]:
+                batch["batch_idx"] = batch_idx[keep]
+            b = batch["bboxes"].float()
+
+        if b.numel():
+            b = b.clone()
+            b[:, 0:2] = b[:, 0:2].clamp(0.0, 1.0)
+            b[:, 2:4] = b[:, 2:4].clamp(1e-4, 1.0)
+            batch["bboxes"] = b.to(dtype=bboxes.dtype)
+
+        if self.job_id and (dropped or clipped) and self._target_sanitize_logs < 20:
+            self._target_sanitize_logs += 1
+            job_storage.append_job_log(
+                self.job_id,
+                "WARNING",
+                f"HSG-DETR sanitized target boxes: dropped={dropped}, clipped={clipped}",
+                {"type": "target_sanitized", "dropped": dropped, "clipped": clipped},
+            )
+        return batch
+
+    def _summarize_training_batch(self, batch: dict) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        bboxes = batch.get("bboxes")
+        if torch.is_tensor(bboxes):
+            b = bboxes.detach().float()
+            summary["bbox_count"] = int(b.shape[0])
+            if b.numel():
+                finite = torch.isfinite(b)
+                summary["bbox_nonfinite"] = int((~finite).sum().item())
+                summary["bbox_min"] = float(b[finite].min().item()) if finite.any() else None
+                summary["bbox_max"] = float(b[finite].max().item()) if finite.any() else None
+                wh = b[:, 2:4]
+                wh_finite = torch.isfinite(wh)
+                summary["wh_min"] = float(wh[wh_finite].min().item()) if wh_finite.any() else None
+                summary["wh_max"] = float(wh[wh_finite].max().item()) if wh_finite.any() else None
+                invalid_wh = (~torch.isfinite(wh).all(dim=1)) | (wh <= 0).any(dim=1)
+                summary["invalid_wh"] = int(invalid_wh.sum().item())
+                summary["out_of_range_boxes"] = int(((b < 0.0) | (b > 1.0)).any(dim=1).sum().item())
+        cls = batch.get("cls")
+        if torch.is_tensor(cls):
+            c = cls.detach().float()
+            summary["cls_count"] = int(c.numel())
+            if c.numel():
+                finite = torch.isfinite(c)
+                summary["cls_nonfinite"] = int((~finite).sum().item())
+                summary["cls_min"] = float(c[finite].min().item()) if finite.any() else None
+                summary["cls_max"] = float(c[finite].max().item()) if finite.any() else None
+        img = batch.get("img")
+        if torch.is_tensor(img):
+            summary["img_shape"] = list(img.shape)
+            summary["img_finite"] = bool(torch.isfinite(img).all().item())
+        return summary
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """Override Ultralytics default that doubles workers for val.
@@ -910,6 +1000,16 @@ class CustomDetectionTrainer(DetectionTrainer):
         if not torch.isfinite(t).all():
             epoch = int(getattr(self, 'epoch', -1)) + 1 if hasattr(self, 'epoch') else None
             batch_i = getattr(self, 'batch_i', None)
+            loss_value = None
+            if torch.is_tensor(getattr(self, "loss", None)):
+                try:
+                    loss_value = float(self.loss.detach().float().item())
+                except Exception:
+                    loss_value = None
+            try:
+                amp_scale = float(self.scaler.get_scale())
+            except Exception:
+                amp_scale = None
             if self.job_id:
                 job_storage.append_job_log(
                     self.job_id,
@@ -920,6 +1020,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "phase": "train",
                         "epoch": epoch,
                         "batch_i": int(batch_i) if isinstance(batch_i, (int, np.integer)) else batch_i,
+                        "loss": loss_value,
+                        "loss_items": t.detach().float().cpu().tolist(),
+                        "amp_scale": amp_scale,
+                        "batch_summary": getattr(self, "_last_train_batch_summary", None),
                     },
                 )
             raise NaNLossError("NaN/Inf loss detected")
