@@ -652,7 +652,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         finally:
             done.set()
 
-        self._calibrate_amp_scaler_for_hsg_detr()
+        self._disable_amp_for_hsg_detr()
         self.log(
             f"Training setup complete - {self.train_loader.dataset.ni} train images, "
             f"{self.test_loader.dataset.ni} val images",
@@ -660,22 +660,22 @@ class CustomDetectionTrainer(DetectionTrainer):
         )
         return result
 
-    def _calibrate_amp_scaler_for_hsg_detr(self) -> None:
-        """Use a lower AMP initial scale for HSG-DETR to avoid first-batch overflows."""
-        if not getattr(self, "amp", False) or not hasattr(self, "scaler"):
-            return
-
+    def _disable_amp_for_hsg_detr(self) -> None:
+        """Train HSG-DETR in FP32 until the RT-DETR loss path is numerically stable."""
         model = unwrap_model(self.model)
         has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
         if not has_hsg_decoder:
             return
 
-        init_scale = 1024.0
+        if not getattr(self, "amp", False):
+            return
+
+        self.amp = False
         try:
-            self.scaler = torch.amp.GradScaler("cuda", enabled=True, init_scale=init_scale, growth_interval=2000)
+            self.scaler = torch.amp.GradScaler("cuda", enabled=False)
         except TypeError:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=True, init_scale=init_scale, growth_interval=2000)
-        self.log(f"HSG-DETR AMP scaler calibrated: init_scale={init_scale:g}", "INFO")
+            self.scaler = torch.cuda.amp.GradScaler(enabled=False)
+        self.log("HSG-DETR AMP disabled: RT-DETR loss path will run in FP32", "WARNING")
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
