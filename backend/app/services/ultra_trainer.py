@@ -68,7 +68,7 @@ def _normalize_requested_cache(value):
 _TRAINING_REMOTE_FS_WORKERS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_workers", 2))
 _TRAINING_REMOTE_FS_ULTRALYTICS_THREADS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_ultralytics_threads", 1))
 _TRAINING_NAN_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("nan_retries", 3))
-_TRAINING_WORKER_CRASH_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("worker_crash_retries", 2))
+_TRAINING_WORKER_CRASH_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("worker_crash_retries", 5))
 _TRAINING_WORKER_STOP_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("worker_stop_join_timeout_s", 10.0))
 _TRAINING_RESUME_EXISTING_WORKER_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("resume_existing_worker_join_timeout_s", 30.0))
 _TRAINING_CHILD_CLEANUP_WAIT_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("child_cleanup_wait_timeout_s", 3.0))
@@ -174,11 +174,14 @@ def _start_training_subprocess(
     env["YOLO_CLI"] = "0"
     env["MD_JOB_ID"] = job_id
     env["MD_TRAINING_CHILD"] = "1"
+    env["PYTHONFAULTHANDLER"] = "1"
 
     worker_log = job_dir / "worker_process.log"
     log_fh = open(worker_log, "ab", buffering=0)
     cmd = [
         sys.executable,
+        "-X",
+        "faulthandler",
         "-m",
         "app.services.ultra_trainer",
         "--worker",
@@ -235,6 +238,40 @@ def _returncode_message(returncode: int) -> str:
             return "Training worker was killed with SIGKILL (possible OS OOM killer)"
         return f"Training worker exited from signal {sig_name}"
     return f"Training worker exited with code {returncode}"
+
+
+def _returncode_signal_name(returncode: int) -> str | None:
+    if returncode >= 0:
+        return None
+    sig = -returncode
+    try:
+        return signal.Signals(sig).name
+    except Exception:
+        return f"SIG{sig}"
+
+
+def _is_retryable_worker_signal(returncode: int) -> bool:
+    sig_name = _returncode_signal_name(returncode)
+    return sig_name in {"SIGSEGV", "SIGILL", "SIGBUS", "SIGABRT"}
+
+
+def _apply_native_crash_retry_mitigation(config: dict[str, Any], attempt: int) -> dict[str, Any]:
+    """Progressively reduce DataLoader/native IO pressure after fatal worker crashes."""
+    mitigated = dict(config)
+    if attempt >= 1:
+        workers = mitigated.get("workers")
+        try:
+            workers_i = int(workers)
+        except (TypeError, ValueError):
+            workers_i = 8
+        mitigated["workers"] = max(2, min(workers_i, 4))
+    if attempt >= 2:
+        mitigated["cache"] = False
+    if attempt >= 3:
+        mitigated["workers"] = 0
+    if attempt >= 4:
+        mitigated["deterministic"] = False
+    return mitigated
 
 
 def _last_checkpoint_path(job_id: str) -> Path:
@@ -333,9 +370,10 @@ def _training_process_supervisor(
                 message = _returncode_message(returncode)
                 if returncode < 0:
                     last_pt = _last_checkpoint_path(job_id)
-                    if last_pt.exists() and crash_attempt < max_crash_retries:
+                    retryable_signal = _is_retryable_worker_signal(returncode)
+                    if retryable_signal and last_pt.exists() and crash_attempt < max_crash_retries:
                         crash_attempt += 1
-                        config = dict(config)
+                        config = _apply_native_crash_retry_mitigation(config, crash_attempt)
                         config["resume"] = str(last_pt)
                         config.pop("pretrained", None)
                         if job and job.get("status") in ("pending", "running"):
@@ -352,10 +390,41 @@ def _training_process_supervisor(
                             "WARNING",
                             f"{message}; restarting isolated worker from {last_pt} "
                             f"({crash_attempt}/{max_crash_retries})",
-                            {"returncode": returncode, "retry": crash_attempt, "resume": str(last_pt)},
+                            {
+                                "returncode": returncode,
+                                "retry": crash_attempt,
+                                "resume": str(last_pt),
+                                "mitigation": {
+                                    "workers": config.get("workers"),
+                                    "cache": config.get("cache"),
+                                    "deterministic": config.get("deterministic"),
+                                },
+                            },
                         )
                         _close_worker_log_handle(proc)
                         continue
+
+                    if retryable_signal and last_pt.exists():
+                        job_storage.append_job_log(
+                            job_id,
+                            "ERROR",
+                            f"Native training worker crash retries exhausted ({crash_attempt}/{max_crash_retries}).",
+                            {"returncode": returncode, "resume": str(last_pt)},
+                        )
+                    elif not retryable_signal:
+                        job_storage.append_job_log(
+                            job_id,
+                            "ERROR",
+                            f"Training worker received non-retryable signal; not restarting automatically: {message}",
+                            {"returncode": returncode},
+                        )
+                    elif not last_pt.exists():
+                        job_storage.append_job_log(
+                            job_id,
+                            "ERROR",
+                            "Training worker crashed before last.pt existed; cannot resume automatically.",
+                            {"returncode": returncode},
+                        )
 
                     job_storage.append_job_log(
                         job_id,

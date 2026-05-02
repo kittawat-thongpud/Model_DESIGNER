@@ -132,7 +132,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "remote_fs_workers": 2,
             "remote_fs_ultralytics_threads": 1,
             "nan_retries": 3,
-            "worker_crash_retries": 2,
+            "worker_crash_retries": 5,
             "worker_stop_join_timeout_s": 10.0,
             "resume_existing_worker_join_timeout_s": 30.0,
             "child_cleanup_wait_timeout_s": 3.0,
