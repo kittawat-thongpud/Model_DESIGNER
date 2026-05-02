@@ -68,6 +68,7 @@ def _normalize_requested_cache(value):
 _TRAINING_REMOTE_FS_WORKERS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_workers", 2))
 _TRAINING_REMOTE_FS_ULTRALYTICS_THREADS = int(_TRAINING_RUNTIME_DEFAULTS.get("remote_fs_ultralytics_threads", 1))
 _TRAINING_NAN_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("nan_retries", 3))
+_TRAINING_WORKER_CRASH_RETRIES = int(_TRAINING_RUNTIME_DEFAULTS.get("worker_crash_retries", 2))
 _TRAINING_WORKER_STOP_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("worker_stop_join_timeout_s", 10.0))
 _TRAINING_RESUME_EXISTING_WORKER_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("resume_existing_worker_join_timeout_s", 30.0))
 _TRAINING_CHILD_CLEANUP_WAIT_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("child_cleanup_wait_timeout_s", 3.0))
@@ -236,6 +237,21 @@ def _returncode_message(returncode: int) -> str:
     return f"Training worker exited with code {returncode}"
 
 
+def _last_checkpoint_path(job_id: str) -> Path:
+    return JOBS_DIR / job_id / "runs" / "train" / "weights" / "last.pt"
+
+
+def _close_worker_log_handle(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    log_fh = getattr(proc, "_md_log_fh", None)
+    if log_fh is not None:
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+
+
 def _terminate_worker_process(job_id: str, reason: str, timeout: float | None = None) -> None:
     if timeout is None:
         timeout = _TRAINING_WORKER_STOP_JOIN_TIMEOUT_S
@@ -275,64 +291,94 @@ def _training_process_supervisor(
 ) -> None:
     """Parent-side supervisor for the isolated training subprocess."""
     proc: subprocess.Popen | None = None
+    crash_attempt = 0
+    max_crash_retries = int(config.get("worker_crash_retries", _TRAINING_WORKER_CRASH_RETRIES) or 0)
     try:
-        proc = _start_training_subprocess(job_id, yaml_path, task, config, partition_configs, model_scale)
-        with _lock:
-            info = _active_jobs.get(job_id)
-            if info is not None:
-                info["process"] = proc
-
         while True:
+            proc = _start_training_subprocess(job_id, yaml_path, task, config, partition_configs, model_scale)
+            with _lock:
+                info = _active_jobs.get(job_id)
+                if info is not None:
+                    info["process"] = proc
+
+            while True:
+                returncode = proc.poll()
+                if returncode is not None:
+                    break
+                if _should_stop(job_id):
+                    reason = _consume_stop_reason(job_id, "Stopped by user")
+                    _terminate_worker_process(job_id, reason)
+                    break
+                time.sleep(1.0)
+
             returncode = proc.poll()
-            if returncode is not None:
-                break
-            if _should_stop(job_id):
-                reason = _consume_stop_reason(job_id, "Stopped by user")
-                _terminate_worker_process(job_id, reason)
-                break
-            time.sleep(1.0)
+            stop_requested = False
+            with _lock:
+                info = _active_jobs.get(job_id)
+                stop_requested = bool(info and info.get("stop"))
 
-        returncode = proc.poll()
-        stop_requested = False
-        with _lock:
-            info = _active_jobs.get(job_id)
-            stop_requested = bool(info and info.get("stop"))
+            job = job_storage.load_job(job_id)
+            if stop_requested:
+                message = "Stopped by user"
+                if job and job.get("status") not in ("completed", "failed", "stopped"):
+                    job["status"] = "stopped"
+                    job["message"] = message
+                    job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                    job_storage.save_job(job)
+                    _publish(job_id, job)
+                    job_storage.append_job_log(job_id, "WARNING", message)
+                return
 
-        job = job_storage.load_job(job_id)
-        if stop_requested:
-            message = "Stopped by user"
-            if job and job.get("status") not in ("completed", "failed", "stopped"):
-                job["status"] = "stopped"
-                job["message"] = message
-                job["completed_at"] = datetime.utcnow().isoformat() + "Z"
-                job_storage.save_job(job)
-                _publish(job_id, job)
-                job_storage.append_job_log(job_id, "WARNING", message)
-            return
+            if returncode and returncode != 0:
+                message = _returncode_message(returncode)
+                if returncode < 0:
+                    last_pt = _last_checkpoint_path(job_id)
+                    if last_pt.exists() and crash_attempt < max_crash_retries:
+                        crash_attempt += 1
+                        config = dict(config)
+                        config["resume"] = str(last_pt)
+                        config.pop("pretrained", None)
+                        if job and job.get("status") in ("pending", "running"):
+                            job["status"] = "running"
+                            job["message"] = (
+                                f"{message}; restarting from last.pt "
+                                f"({crash_attempt}/{max_crash_retries})"
+                            )
+                            job["config"] = config
+                            job_storage.save_job(job)
+                            _publish(job_id, job)
+                        job_storage.append_job_log(
+                            job_id,
+                            "WARNING",
+                            f"{message}; restarting isolated worker from {last_pt} "
+                            f"({crash_attempt}/{max_crash_retries})",
+                            {"returncode": returncode, "retry": crash_attempt, "resume": str(last_pt)},
+                        )
+                        _close_worker_log_handle(proc)
+                        continue
 
-        if returncode and returncode != 0:
-            message = _returncode_message(returncode)
-            if job and job.get("status") in ("running", "pending"):
+                    job_storage.append_job_log(
+                        job_id,
+                        "ERROR",
+                        "Server survived isolated training worker crash; inspect worker_process.log and kernel logs.",
+                    )
+
+                if job and job.get("status") in ("running", "pending"):
+                    job["status"] = "failed"
+                    job["message"] = message
+                    job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                    job_storage.save_job(job)
+                    _publish(job_id, job)
+                job_storage.append_job_log(job_id, "ERROR", message, {"returncode": returncode})
+            elif job and job.get("status") == "running":
+                message = "Training worker exited without updating terminal job status"
                 job["status"] = "failed"
                 job["message"] = message
                 job["completed_at"] = datetime.utcnow().isoformat() + "Z"
                 job_storage.save_job(job)
                 _publish(job_id, job)
-            job_storage.append_job_log(job_id, "ERROR", message, {"returncode": returncode})
-            if returncode < 0:
-                job_storage.append_job_log(
-                    job_id,
-                    "ERROR",
-                    "Server survived isolated training worker crash; inspect worker_process.log and kernel logs.",
-                )
-        elif job and job.get("status") == "running":
-            message = "Training worker exited without updating terminal job status"
-            job["status"] = "failed"
-            job["message"] = message
-            job["completed_at"] = datetime.utcnow().isoformat() + "Z"
-            job_storage.save_job(job)
-            _publish(job_id, job)
-            job_storage.append_job_log(job_id, "ERROR", message)
+                job_storage.append_job_log(job_id, "ERROR", message)
+            return
 
     except Exception as exc:
         job = job_storage.load_job(job_id)
@@ -353,13 +399,7 @@ def _training_process_supervisor(
             except Exception:
                 pass
         try:
-            if proc is not None:
-                log_fh = getattr(proc, "_md_log_fh", None)
-                if log_fh is not None:
-                    try:
-                        log_fh.close()
-                    except Exception:
-                        pass
+            _close_worker_log_handle(proc)
             _sync_queue_task_with_job(job_id, admit_pending=True)
         except Exception as exc:
             try:
@@ -1515,6 +1555,7 @@ def _training_worker(
         config.pop('use_yolo_pretrained', None)  # handled above, not a YOLO arg
         config.pop('yolov8_backbone', None)      # handled above, not a YOLO arg
         config.pop('nan_retries', None)          # handled above, not a YOLO arg
+        config.pop('worker_crash_retries', None) # handled by parent supervisor
 
         # Build train kwargs (only valid Ultralytics parameters)
         train_kwargs = {k: v for k, v in config.items() if v != ""}
