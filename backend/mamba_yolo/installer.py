@@ -221,7 +221,17 @@ def _do_install() -> None:
 
     _log_line(f"[mamba_yolo] Repo ready at {repo}")
 
-    # ── Step 2: Install selective_scan CUDA extension ──────────────────────
+    # ── Step 2: Install Python dependencies ───────────────────────────────
+    deps = ["einops", "timm"]
+    cmd_deps = [sys.executable, "-m", "pip", "install"] + deps
+    _log_line(f"[mamba_yolo] $ {' '.join(cmd_deps)}")
+    ok = _run_logged(cmd_deps)
+    if not ok:
+        _write_state("failed", "Failed to install Python dependencies (einops, timm).")
+        _log_line("[mamba_yolo] FAILED: could not install einops/timm.")
+        return
+
+    # ── Step 3: Install selective_scan CUDA extension ──────────────────────
     scan_dir = repo / "selective_scan"
     if scan_dir.exists():
         scan_env, cuda_home = _prepare_cuda_env()
@@ -261,16 +271,6 @@ def _do_install() -> None:
     else:
         _write_state("failed", f"selective_scan dir not found at {scan_dir}")
         _log_line(f"[mamba_yolo] FAILED: selective_scan dir not found at {scan_dir}")
-        return
-
-    # ── Step 3: Install Python dependencies ───────────────────────────────
-    deps = ["einops", "timm"]
-    cmd_deps = [sys.executable, "-m", "pip", "install"] + deps
-    _log_line(f"[mamba_yolo] $ {' '.join(cmd_deps)}")
-    ok = _run_logged(cmd_deps)
-    if not ok:
-        _write_state("failed", "Failed to install Python dependencies (einops, timm).")
-        _log_line("[mamba_yolo] FAILED: could not install einops/timm.")
         return
 
     # ── Step 4: Verify ────────────────────────────────────────────────────
