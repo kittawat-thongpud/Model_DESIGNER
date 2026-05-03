@@ -21,6 +21,12 @@ const pct = (v: number | null | undefined) =>
   v != null ? `${(v * 100).toFixed(1)}%` : '—';
 const fmt4 = (v: number | null | undefined) =>
   v != null ? v.toFixed(4) : '—';
+const isFiniteNumber = (v: number | null | undefined): v is number =>
+  typeof v === 'number' && Number.isFinite(v);
+const fmtMs = (v: number | null | undefined) =>
+  isFiniteNumber(v) ? `${v.toFixed(1)} ms` : '—';
+const fmtSeconds = (v: number | null | undefined) =>
+  isFiniteNumber(v) ? `${v.toFixed(0)}s` : '—';
 
 function ConfusionMatrix({ data }: { data: { matrix: number[][]; names: string[] } }) {
   const { matrix, names } = data;
@@ -314,7 +320,7 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                     ].map(([k, v]) => (
                       <div key={k as string} className="flex justify-between text-xs">
                         <span className="text-slate-500">{k}</span>
-                        <span className="font-mono text-slate-300">{(v as number).toFixed(1)} ms</span>
+                        <span className="font-mono text-slate-300">{fmtMs(v as number | null | undefined)}</span>
                       </div>
                     ))}
                   </div>
@@ -330,19 +336,19 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                     </div>
                     <div className="flex justify-between text-xs">
                       <span className="text-slate-500">Duration</span>
-                      <span className="font-mono text-slate-300">{displayResult.elapsed_s.toFixed(0)}s</span>
+                      <span className="font-mono text-slate-300">{fmtSeconds(displayResult.elapsed_s)}</span>
                     </div>
                   </div>
                 </div>
 
                 {/* Per-class mAP bar chart */}
-                {displayResult.per_class.length > 0 && (
+                {(displayResult.per_class ?? []).length > 0 && (
                   <div>
                     <div className="text-xs text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5"><Target size={11} /> Per-Class mAP@0.5</div>
                     <div style={{ height: Math.max(200, displayResult.per_class.length * 24) }}>
                       <ResponsiveContainer width="100%" height="100%">
                         <BarChart
-                          data={displayResult.per_class.map(c => ({
+                          data={(displayResult.per_class ?? []).map(c => ({
                             name: c.class_name.length > 14 ? c.class_name.slice(0, 14) + '…' : c.class_name,
                             ap50: c.ap50 != null ? parseFloat((c.ap50 * 100).toFixed(1)) : 0,
                             precision: c.precision != null ? parseFloat((c.precision * 100).toFixed(1)) : 0,
@@ -390,7 +396,7 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                           </tr>
                         </thead>
                         <tbody>
-                          {[...displayResult.per_class].sort((a, b) => {
+                          {[...(displayResult.per_class ?? [])].sort((a, b) => {
                             const av = sortKey === 'class_name' ? a.class_name : (a[sortKey] ?? -1);
                             const bv = sortKey === 'class_name' ? b.class_name : (b[sortKey] ?? -1);
                             if (typeof av === 'string') return sortAsc ? av.localeCompare(bv as string) : (bv as string).localeCompare(av);
