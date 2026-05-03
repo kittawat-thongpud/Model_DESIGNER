@@ -262,6 +262,11 @@ class CustomValidator(DetectionValidator):
 
 class CustomDetectionTrainer(DetectionTrainer):
     """Custom trainer with enhanced monitoring for Model Designer."""
+
+    HSG_ALPHA_TARGET = 0.05
+    HSG_ALPHA_START_EPOCH = 10
+    HSG_ALPHA_WARMUP_EPOCHS = 80
+    HSG_ALPHA_RESUME_RAMP_EPOCHS = 20
     
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
         """Initialize custom trainer.
@@ -397,14 +402,20 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._target_sanitize_logs: int = 0
         self._last_train_batch_summary: dict[str, Any] | None = None
         self._hsg_alpha_last: float | None = None
+        self._hsg_alpha_resume_base: float | None = None
+        self._hsg_alpha_resume_epoch: int | None = None
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
             trainer._check_nan_loss_items()
             trainer._on_batch_end()
 
+        def _on_train_epoch_start_cb(trainer):
+            trainer._on_train_epoch_start()
+
         # Register batch-end callback (Ultralytics calls with trainer as arg)
         self.add_callback("on_train_batch_end", _on_train_batch_end_cb)
+        self.add_callback("on_train_epoch_start", _on_train_epoch_start_cb)
 
         # Verify job_id is set
         if self.job_id:
@@ -654,6 +665,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             done.set()
 
         self._disable_amp_for_hsg_detr()
+        self._disable_deterministic_for_hsg_detr()
         self.log(
             f"Training setup complete - {self.train_loader.dataset.ni} train images, "
             f"{self.test_loader.dataset.ni} val images",
@@ -677,6 +689,25 @@ class CustomDetectionTrainer(DetectionTrainer):
         except TypeError:
             self.scaler = torch.cuda.amp.GradScaler(enabled=False)
         self.log("HSG-DETR AMP disabled: RT-DETR loss path will run in FP32", "WARNING")
+
+    def _disable_deterministic_for_hsg_detr(self) -> None:
+        """Avoid deterministic CUDA paths that RT-DETR/HSG-DETR cannot fully support."""
+        model = unwrap_model(self.model)
+        has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+        if not has_hsg_decoder:
+            return
+
+        self.args.deterministic = False
+        try:
+            torch.use_deterministic_algorithms(False)
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        self.log("HSG-DETR deterministic CUDA mode disabled for training stability", "WARNING")
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
@@ -742,17 +773,14 @@ class CustomDetectionTrainer(DetectionTrainer):
                 pass
         return DummyPbar()
     
-    def on_train_epoch_start(self):
+    def _on_train_epoch_start(self):
         """Track epoch start time."""
         import time as _time
         self._epoch_start_time = _time.time()
         self._update_hsg_detr_alpha()
-        super_method = getattr(super(), 'on_train_epoch_start', None)
-        if super_method:
-            super_method()
 
     def _update_hsg_detr_alpha(self) -> None:
-        """Warm up RTDETRDecoderSGB saliency selection after classifier stabilizes."""
+        """Warm up RTDETRDecoderSGB saliency selection without resume-time jumps."""
         try:
             model = unwrap_model(self.model)
         except Exception:
@@ -766,19 +794,66 @@ class CustomDetectionTrainer(DetectionTrainer):
             return
 
         epoch = int(getattr(self, "epoch", 0))
-        start_epoch = 10
-        warmup_epochs = 40
-        target_alpha = 0.20
-        progress = max(0.0, min((epoch - start_epoch) / warmup_epochs, 1.0))
-        alpha = target_alpha * progress
+        progress = max(
+            0.0,
+            min(
+                (epoch - self.HSG_ALPHA_START_EPOCH) / self.HSG_ALPHA_WARMUP_EPOCHS,
+                1.0,
+            ),
+        )
+        scheduled_alpha = self.HSG_ALPHA_TARGET * progress
+
+        checkpoint_alpha = 0.0
+        for decoder in decoders:
+            alpha_tensor = getattr(decoder, "alpha", None)
+            if isinstance(alpha_tensor, torch.Tensor):
+                try:
+                    checkpoint_alpha = max(
+                        checkpoint_alpha,
+                        float(alpha_tensor.detach().float().reshape(-1)[0]),
+                    )
+                except Exception:
+                    pass
+
+        if (
+            self._hsg_alpha_resume_base is None
+            and checkpoint_alpha > 0.0
+            and checkpoint_alpha < scheduled_alpha
+        ):
+            self._hsg_alpha_resume_base = checkpoint_alpha
+            self._hsg_alpha_resume_epoch = epoch
+
+        alpha = scheduled_alpha
+        if (
+            self._hsg_alpha_resume_base is not None
+            and self._hsg_alpha_resume_epoch is not None
+            and self._hsg_alpha_resume_base < scheduled_alpha
+        ):
+            resume_progress = max(
+                0.0,
+                min(
+                    (epoch - self._hsg_alpha_resume_epoch)
+                    / self.HSG_ALPHA_RESUME_RAMP_EPOCHS,
+                    1.0,
+                ),
+            )
+            alpha = self._hsg_alpha_resume_base + (
+                scheduled_alpha - self._hsg_alpha_resume_base
+            ) * resume_progress
+
+        alpha = max(0.0, min(float(alpha), float(self.HSG_ALPHA_TARGET)))
 
         for decoder in decoders:
             decoder.set_alpha(alpha)
         self._sync_hsg_detr_alpha_to_ema()
 
-        if self._hsg_alpha_last is None or abs(self._hsg_alpha_last - alpha) >= 0.049:
+        if self._hsg_alpha_last is None or abs(self._hsg_alpha_last - alpha) >= 0.009:
             self._hsg_alpha_last = alpha
-            self.log(f"HSG-DETR query saliency alpha set to {alpha:.3f}", "INFO")
+            self.log(
+                f"HSG-DETR query saliency alpha set to {alpha:.3f} "
+                f"(target={self.HSG_ALPHA_TARGET:.3f})",
+                "INFO",
+            )
 
     def _sync_hsg_detr_alpha_to_ema(self) -> None:
         """Keep the EMA decoder's scheduled alpha identical to the live model."""
@@ -1511,6 +1586,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         if self.record_weights and self.epoch % self.weight_interval == 0:
             self._record_weights()
 
+        self._sync_hsg_detr_alpha_to_ema()
         self._log_ema_nonfinite_diagnostics()
         
         # Call parent save
