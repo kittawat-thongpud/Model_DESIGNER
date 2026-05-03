@@ -1504,16 +1504,17 @@ export default function ModelDesignerPage({ onBack }: Props) {
                   <p className="text-xs text-slate-600 text-center py-8">No models yet</p>
                 ) : models.map(m => (
                   <div key={m.model_id}
+                    onClick={() => loadModel(m.model_id)}
                     className={`flex items-center gap-1 px-3 py-2.5 rounded-lg transition-colors
-                      ${modelId === m.model_id ? 'bg-indigo-600/15 border border-indigo-500/30' : 'bg-slate-800/20 hover:bg-slate-800/50 border border-transparent'}`}>
-                    <button onClick={() => loadModel(m.model_id)} className="flex-1 min-w-0 text-left cursor-pointer">
+                      cursor-pointer ${modelId === m.model_id ? 'bg-indigo-600/15 border border-indigo-500/30' : 'bg-slate-800/20 hover:bg-slate-800/50 border border-transparent'}`}>
+                    <div className="flex-1 min-w-0 text-left">
                       <div className="text-xs text-slate-300 font-medium truncate">{m.name}</div>
                       <div className="flex items-center gap-2 mt-0.5">
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400">{m.task}</span>
                         <span className="text-[10px] text-slate-600">{m.layer_count} layers</span>
                         <span className="text-[10px] text-slate-700 font-mono">{m.model_id.slice(0, 8)}</span>
                       </div>
-                    </button>
+                    </div>
                     {!m.readonly && !m.model_id.startsWith('arch:') && (
                       <button onClick={e => { e.stopPropagation(); removeModel(m.model_id); }}
                         className="shrink-0 p-1 text-slate-600 hover:text-red-400 transition-colors cursor-pointer rounded hover:bg-red-500/10"

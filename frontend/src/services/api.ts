@@ -51,10 +51,12 @@ function del<T>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' });
 }
 
+const modelPath = (id: string) => `/api/models/${encodeURIComponent(id)}`;
+
 export const api = {
   // ── Models (Ultralytics YAML) ──────────────────────────────────────────
   listModels: (includeArch = false) => get<ModelSummary[]>(`/api/models/${includeArch ? '?include_arch=true' : ''}`),
-  loadModel: (id: string) => get<ModelRecord>(`/api/models/${id}`),
+  loadModel: (id: string) => get<ModelRecord>(modelPath(id)),
   importYAML: (yamlContent: string, name: string, task: string) => 
     post<{ model_id: string; name: string; task: string; message: string; graph: any }>('/api/models/import/yaml', { 
       yaml_content: yamlContent, 
@@ -63,9 +65,9 @@ export const api = {
     }),
   saveModel: (body: { name: string; description?: string; task?: string; yaml_def: Record<string, unknown> }, replace = false) =>
     post<{ model_id: string; message: string }>(`/api/models/?replace=${replace}`, body),
-  deleteModel: (id: string) => del<{ message: string }>(`/api/models/${id}`),
-  getModelYaml: (id: string) => get<{ model_id: string; yaml: string }>(`/api/models/${id}/yaml`),
-  validateModel: (id: string, scale?: string) => post<{ valid: boolean; model_id: string; params: number; gradients: number; flops?: number; layers: number; message: string }>(`/api/models/${id}/validate${scale ? `?scale=${scale}` : ''}`, {}),
+  deleteModel: (id: string) => del<{ message: string }>(modelPath(id)),
+  getModelYaml: (id: string) => get<{ model_id: string; yaml: string }>(`${modelPath(id)}/yaml`),
+  validateModel: (id: string, scale?: string) => post<{ valid: boolean; model_id: string; params: number; gradients: number; flops?: number; layers: number; message: string }>(`${modelPath(id)}/validate${scale ? `?scale=${scale}` : ''}`, {}),
   exportModel: (req: ExportRequest) => post<Record<string, unknown>>('/api/models/export', req),
 
   // ── Arch Plugins ───────────────────────────────────────────────────────
