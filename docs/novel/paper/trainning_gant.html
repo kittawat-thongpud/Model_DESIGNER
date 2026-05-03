@@ -1,0 +1,966 @@
+<!DOCTYPE html><html><head>
+      <title>trainning_gant</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/katex.min.css">
+      
+      
+      
+      <script src="https://cdn.jsdelivr.net/npm/mermaid@11.14.0/dist/mermaid.min.js"></script>
+      
+      
+      
+      <style>
+      code[class*=language-],pre[class*=language-]{color:#333;background:0 0;font-family:Consolas,"Liberation Mono",Menlo,Courier,monospace;text-align:left;white-space:pre;word-spacing:normal;word-break:normal;word-wrap:normal;line-height:1.4;-moz-tab-size:8;-o-tab-size:8;tab-size:8;-webkit-hyphens:none;-moz-hyphens:none;-ms-hyphens:none;hyphens:none}pre[class*=language-]{padding:.8em;overflow:auto;border-radius:3px;background:#f5f5f5}:not(pre)>code[class*=language-]{padding:.1em;border-radius:.3em;white-space:normal;background:#f5f5f5}.token.blockquote,.token.comment{color:#969896}.token.cdata{color:#183691}.token.doctype,.token.macro.property,.token.punctuation,.token.variable{color:#333}.token.builtin,.token.important,.token.keyword,.token.operator,.token.rule{color:#a71d5d}.token.attr-value,.token.regex,.token.string,.token.url{color:#183691}.token.atrule,.token.boolean,.token.code,.token.command,.token.constant,.token.entity,.token.number,.token.property,.token.symbol{color:#0086b3}.token.prolog,.token.selector,.token.tag{color:#63a35c}.token.attr-name,.token.class,.token.class-name,.token.function,.token.id,.token.namespace,.token.pseudo-class,.token.pseudo-element,.token.url-reference .token.variable{color:#795da3}.token.entity{cursor:help}.token.title,.token.title .token.punctuation{font-weight:700;color:#1d3e81}.token.list{color:#ed6a43}.token.inserted{background-color:#eaffea;color:#55a532}.token.deleted{background-color:#ffecec;color:#bd2c00}.token.bold{font-weight:700}.token.italic{font-style:italic}.language-json .token.property{color:#183691}.language-markup .token.tag .token.punctuation{color:#333}.language-css .token.function,code.language-css{color:#0086b3}.language-yaml .token.atrule{color:#63a35c}code.language-yaml{color:#183691}.language-ruby .token.function{color:#333}.language-markdown .token.url{color:#795da3}.language-makefile .token.symbol{color:#795da3}.language-makefile .token.variable{color:#183691}.language-makefile .token.builtin{color:#0086b3}.language-bash .token.keyword{color:#0086b3}pre[data-line]{position:relative;padding:1em 0 1em 3em}pre[data-line] .line-highlight-wrapper{position:absolute;top:0;left:0;background-color:transparent;display:block;width:100%}pre[data-line] .line-highlight{position:absolute;left:0;right:0;padding:inherit 0;margin-top:1em;background:hsla(24,20%,50%,.08);background:linear-gradient(to right,hsla(24,20%,50%,.1) 70%,hsla(24,20%,50%,0));pointer-events:none;line-height:inherit;white-space:pre}pre[data-line] .line-highlight:before,pre[data-line] .line-highlight[data-end]:after{content:attr(data-start);position:absolute;top:.4em;left:.6em;min-width:1em;padding:0 .5em;background-color:hsla(24,20%,50%,.4);color:#f4f1ef;font:bold 65%/1.5 sans-serif;text-align:center;vertical-align:.3em;border-radius:999px;text-shadow:none;box-shadow:0 1px #fff}pre[data-line] .line-highlight[data-end]:after{content:attr(data-end);top:auto;bottom:.4em}html body{font-family:'Helvetica Neue',Helvetica,'Segoe UI',Arial,freesans,sans-serif;font-size:16px;line-height:1.6;color:#333;background-color:#fff;overflow:initial;box-sizing:border-box;word-wrap:break-word}html body>:first-child{margin-top:0}html body h1,html body h2,html body h3,html body h4,html body h5,html body h6{line-height:1.2;margin-top:1em;margin-bottom:16px;color:#000}html body h1{font-size:2.25em;font-weight:300;padding-bottom:.3em}html body h2{font-size:1.75em;font-weight:400;padding-bottom:.3em}html body h3{font-size:1.5em;font-weight:500}html body h4{font-size:1.25em;font-weight:600}html body h5{font-size:1.1em;font-weight:600}html body h6{font-size:1em;font-weight:600}html body h1,html body h2,html body h3,html body h4,html body h5{font-weight:600}html body h5{font-size:1em}html body h6{color:#5c5c5c}html body strong{color:#000}html body del{color:#5c5c5c}html body a:not([href]){color:inherit;text-decoration:none}html body a{color:#08c;text-decoration:none}html body a:hover{color:#00a3f5;text-decoration:none}html body img{max-width:100%}html body>p{margin-top:0;margin-bottom:16px;word-wrap:break-word}html body>ol,html body>ul{margin-bottom:16px}html body ol,html body ul{padding-left:2em}html body ol.no-list,html body ul.no-list{padding:0;list-style-type:none}html body ol ol,html body ol ul,html body ul ol,html body ul ul{margin-top:0;margin-bottom:0}html body li{margin-bottom:0}html body li.task-list-item{list-style:none}html body li>p{margin-top:0;margin-bottom:0}html body .task-list-item-checkbox{margin:0 .2em .25em -1.8em;vertical-align:middle}html body .task-list-item-checkbox:hover{cursor:pointer}html body blockquote{margin:16px 0;font-size:inherit;padding:0 15px;color:#5c5c5c;background-color:#f0f0f0;border-left:4px solid #d6d6d6}html body blockquote>:first-child{margin-top:0}html body blockquote>:last-child{margin-bottom:0}html body hr{height:4px;margin:32px 0;background-color:#d6d6d6;border:0 none}html body table{margin:10px 0 15px 0;border-collapse:collapse;border-spacing:0;display:block;width:100%;overflow:auto;word-break:normal;word-break:keep-all}html body table th{font-weight:700;color:#000}html body table td,html body table th{border:1px solid #d6d6d6;padding:6px 13px}html body dl{padding:0}html body dl dt{padding:0;margin-top:16px;font-size:1em;font-style:italic;font-weight:700}html body dl dd{padding:0 16px;margin-bottom:16px}html body code{font-family:Menlo,Monaco,Consolas,'Courier New',monospace;font-size:.85em;color:#000;background-color:#f0f0f0;border-radius:3px;padding:.2em 0}html body code::after,html body code::before{letter-spacing:-.2em;content:'\00a0'}html body pre>code{padding:0;margin:0;word-break:normal;white-space:pre;background:0 0;border:0}html body .highlight{margin-bottom:16px}html body .highlight pre,html body pre{padding:1em;overflow:auto;line-height:1.45;border:#d6d6d6;border-radius:3px}html body .highlight pre{margin-bottom:0;word-break:normal}html body pre code,html body pre tt{display:inline;max-width:initial;padding:0;margin:0;overflow:initial;line-height:inherit;word-wrap:normal;background-color:transparent;border:0}html body pre code:after,html body pre code:before,html body pre tt:after,html body pre tt:before{content:normal}html body blockquote,html body dl,html body ol,html body p,html body pre,html body ul{margin-top:0;margin-bottom:16px}html body kbd{color:#000;border:1px solid #d6d6d6;border-bottom:2px solid #c7c7c7;padding:2px 4px;background-color:#f0f0f0;border-radius:3px}@media print{html body{background-color:#fff}html body h1,html body h2,html body h3,html body h4,html body h5,html body h6{color:#000;page-break-after:avoid}html body blockquote{color:#5c5c5c}html body pre{page-break-inside:avoid}html body table{display:table}html body img{display:block;max-width:100%;max-height:100%}html body code,html body pre{word-wrap:break-word;white-space:pre}}.markdown-preview{width:100%;height:100%;box-sizing:border-box}.markdown-preview ul{list-style:disc}.markdown-preview ul ul{list-style:circle}.markdown-preview ul ul ul{list-style:square}.markdown-preview ol{list-style:decimal}.markdown-preview ol ol,.markdown-preview ul ol{list-style-type:lower-roman}.markdown-preview ol ol ol,.markdown-preview ol ul ol,.markdown-preview ul ol ol,.markdown-preview ul ul ol{list-style-type:lower-alpha}.markdown-preview .newpage,.markdown-preview .pagebreak{page-break-before:always}.markdown-preview pre.line-numbers{position:relative;padding-left:3.8em;counter-reset:linenumber}.markdown-preview pre.line-numbers>code{position:relative}.markdown-preview pre.line-numbers .line-numbers-rows{position:absolute;pointer-events:none;top:1em;font-size:100%;left:0;width:3em;letter-spacing:-1px;border-right:1px solid #999;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none}.markdown-preview pre.line-numbers .line-numbers-rows>span{pointer-events:none;display:block;counter-increment:linenumber}.markdown-preview pre.line-numbers .line-numbers-rows>span:before{content:counter(linenumber);color:#999;display:block;padding-right:.8em;text-align:right}.markdown-preview .mathjax-exps .MathJax_Display{text-align:center!important}.markdown-preview:not([data-for=preview]) .code-chunk .code-chunk-btn-group{display:none}.markdown-preview:not([data-for=preview]) .code-chunk .status{display:none}.markdown-preview:not([data-for=preview]) .code-chunk .output-div{margin-bottom:16px}.markdown-preview .md-toc{padding:0}.markdown-preview .md-toc .md-toc-details{margin:0;padding:0;border:none}.markdown-preview .md-toc summary.md-toc-link-wrapper{cursor:pointer;list-style-position:outside}.markdown-preview .md-toc summary.md-toc-link-wrapper::marker{font-size:.85em}.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link{display:inline;padding:.25rem 0}.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link div,.markdown-preview .md-toc .md-toc-link-wrapper .md-toc-link p{display:inline}.markdown-preview .md-toc .md-toc-link-wrapper.highlighted .md-toc-link{font-weight:800}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='0']{margin-left:12px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='1']{margin-left:28px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='2']{margin-left:44px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='3']{margin-left:60px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='4']{margin-left:76px}.markdown-preview .md-toc .md-toc-link-wrapper[data-level='5']{margin-left:80px}.scrollbar-style::-webkit-scrollbar{width:8px}.scrollbar-style::-webkit-scrollbar-track{border-radius:10px;background-color:transparent}.scrollbar-style::-webkit-scrollbar-thumb{border-radius:5px;background-color:rgba(150,150,150,.66);border:4px solid rgba(150,150,150,.66);background-clip:content-box}html body[for=html-export]:not([data-presentation-mode]){position:relative;width:100%;height:100%;top:0;left:0;margin:0;padding:0;overflow:auto}html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{position:relative;top:0;min-height:100vh}@media screen and (min-width:914px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{padding:2em calc(50% - 457px + 2em)}}@media screen and (max-width:914px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{padding:2em}}@media screen and (max-width:450px){html body[for=html-export]:not([data-presentation-mode]) .markdown-preview{font-size:14px!important;padding:1em}}@media print{html body[for=html-export]:not([data-presentation-mode]) #sidebar-toc-btn{display:none}}html body[for=html-export]:not([data-presentation-mode]) #sidebar-toc-btn{position:fixed;bottom:8px;left:8px;font-size:28px;cursor:pointer;color:inherit;z-index:99;width:32px;text-align:center;opacity:.4}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] #sidebar-toc-btn{opacity:1}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc{position:fixed;top:0;left:0;width:300px;height:100%;padding:32px 0 48px 0;font-size:14px;box-shadow:0 0 4px rgba(150,150,150,.33);box-sizing:border-box;overflow:auto;background-color:inherit}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar{width:8px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar-track{border-radius:10px;background-color:transparent}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc::-webkit-scrollbar-thumb{border-radius:5px;background-color:rgba(150,150,150,.66);border:4px solid rgba(150,150,150,.66);background-clip:content-box}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc a{text-decoration:none}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc{padding:0 16px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-details{margin:0;padding:0;border:none}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link{display:inline;padding:.25rem 0}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link div,html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper .md-toc-link p{display:inline}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper.highlighted .md-toc-link{font-weight:800}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='0']{padding-left:0}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='1']{padding-left:16px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='2']{padding-left:32px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='3']{padding-left:48px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='4']{padding-left:64px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .md-sidebar-toc .md-toc .md-toc-link-wrapper[data-level='5']{padding-left:80px}html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{left:300px;width:calc(100% - 300px);padding:2em calc(50% - 457px - 300px / 2);margin:0;box-sizing:border-box}@media screen and (max-width:1274px){html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{padding:2em}}@media screen and (max-width:450px){html body[for=html-export]:not([data-presentation-mode])[html-show-sidebar-toc] .markdown-preview{width:100%}}html body[for=html-export]:not([data-presentation-mode]):not([html-show-sidebar-toc]) .markdown-preview{left:50%;transform:translateX(-50%)}html body[for=html-export]:not([data-presentation-mode]):not([html-show-sidebar-toc]) .md-sidebar-toc{display:none}
+/* Please visit the URL below for more information: */
+/*   https://shd101wyy.github.io/markdown-preview-enhanced/#/customize-css */
+
+      </style>
+      <script type="text/javascript">
+  document.addEventListener("DOMContentLoaded", function () {
+    // your code here
+  });
+</script>
+    </head>
+    <body for="html-export">
+      <div class="crossnote markdown-preview  ">
+      <div>
+<h1 id="hsg-detr--10-day-training-schedule--gantt-chart">HSG-DETR — 10-Day Training Schedule &amp; Gantt Chart </h1>
+<blockquote>
+<p><strong>Goal</strong>: เทรน <strong>12 models × 5 dataset-variants = 60 fine-tune jobs + 2 HSG-DETR COCO pretrain jobs = 62 jobs</strong> ให้เสร็จภายใน 10 วัน โดยกระจายงานลง 4 เครื่อง: <code>rase4070</code>, <code>ku4070</code>, <code>rtx4090</code>, <code>runpod5090</code> (เช่า)</p>
+</blockquote>
+<hr>
+<h2 id="1-สรุปงาน-scope">1. สรุปงาน (Scope) </h2>
+<h3 id="11-models-ทั้งหมด-12-ตัว">1.1 Models ทั้งหมด 12 ตัว </h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Model</th>
+<th>Scale/Variant</th>
+<th>Pretrain Source</th>
+<th>Params (ประมาณ)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>YOLOv8n</td>
+<td>nano</td>
+<td>COCO (official)</td>
+<td>3.2M</td>
+</tr>
+<tr>
+<td>2</td>
+<td>YOLOv8s</td>
+<td>small</td>
+<td>COCO (official)</td>
+<td>11.2M</td>
+</tr>
+<tr>
+<td>3</td>
+<td>YOLOv10n</td>
+<td>nano</td>
+<td>COCO (official)</td>
+<td>2.3M</td>
+</tr>
+<tr>
+<td>4</td>
+<td>YOLOv10s</td>
+<td>small</td>
+<td>COCO (official)</td>
+<td>7.2M</td>
+</tr>
+<tr>
+<td>5</td>
+<td>YOLOv26n</td>
+<td>nano</td>
+<td>COCO (official)</td>
+<td>3.5M</td>
+</tr>
+<tr>
+<td>6</td>
+<td>YOLOv26s</td>
+<td>small</td>
+<td>COCO (official)</td>
+<td>10.5M</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Mamba-YOLO tiny</td>
+<td>tiny</td>
+<td>COCO (official)</td>
+<td>5.8M</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Mamba-YOLO base</td>
+<td>base</td>
+<td>COCO (official)</td>
+<td>21.6M</td>
+</tr>
+<tr>
+<td>9</td>
+<td>RT-DETR-L</td>
+<td>large</td>
+<td>COCO (official)</td>
+<td>32M</td>
+</tr>
+<tr>
+<td>10</td>
+<td>DINO-R50</td>
+<td>ResNet-50</td>
+<td>COCO (official)</td>
+<td>47M</td>
+</tr>
+<tr>
+<td>11</td>
+<td><strong>HSG-DETR-n</strong></td>
+<td>nano</td>
+<td><strong>ต้อง pretrain บน COCO เอง</strong></td>
+<td>~4M</td>
+</tr>
+<tr>
+<td>12</td>
+<td><strong>HSG-DETR-s</strong></td>
+<td>small</td>
+<td><strong>ต้อง pretrain บน COCO เอง</strong></td>
+<td>~12M</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12-datasets--resolutions-5-variants">1.2 Datasets &amp; Resolutions (5 variants) </h3>
+<table>
+<thead>
+<tr>
+<th>Dataset</th>
+<th>imgsz</th>
+<th>Train images</th>
+<th>Val images</th>
+<th>Relative train cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IDD</td>
+<td><strong>640</strong></td>
+<td>~34,000</td>
+<td>~10,000</td>
+<td>0.5× (base-low)</td>
+</tr>
+<tr>
+<td>IDD</td>
+<td><strong>1280</strong></td>
+<td>~34,000</td>
+<td>~10,000</td>
+<td>1.0× (base)</td>
+</tr>
+<tr>
+<td>KITTI</td>
+<td>1280</td>
+<td>~7,000</td>
+<td>~0</td>
+<td>0.20×</td>
+</tr>
+<tr>
+<td>Cityscapes</td>
+<td>1280</td>
+<td>~3,000</td>
+<td>~500</td>
+<td>0.10×</td>
+</tr>
+<tr>
+<td>BDD100K</td>
+<td>1280</td>
+<td>~70,000</td>
+<td>~10,000</td>
+<td>2.0× (heaviest)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="13-job-breakdown-62-total">1.3 Job Breakdown (62 total) </h3>
+<ul>
+<li><strong>2 pretrain jobs</strong> — HSG-DETR-n/s บน COCO 2017 (300 epochs, เฉพาะ critical path)</li>
+<li><strong>60 fine-tune jobs</strong> — 12 models × 5 dataset-variants (150 epochs, warm-start จาก pretrained COCO)</li>
+</ul>
+<hr>
+<h2 id="2-machine-inventory">2. Machine Inventory </h2>
+<table>
+<thead>
+<tr>
+<th>Machine</th>
+<th>GPU</th>
+<th>VRAM</th>
+<th>RAM</th>
+<th>Throughput*</th>
+<th>10-day budget (wall)</th>
+<th>Budget (4090-eq)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rase4070</code></td>
+<td>RTX 4070</td>
+<td>12 GB</td>
+<td>32 GB</td>
+<td>0.5×</td>
+<td>240 h</td>
+<td>120 h</td>
+</tr>
+<tr>
+<td><code>ku4070</code></td>
+<td>RTX 4070</td>
+<td>12 GB</td>
+<td>32 GB</td>
+<td>0.5×</td>
+<td>240 h</td>
+<td>120 h</td>
+</tr>
+<tr>
+<td><code>rtx4090</code></td>
+<td>RTX 4090</td>
+<td>24 GB</td>
+<td>64 GB</td>
+<td>1.0× (baseline)</td>
+<td>240 h</td>
+<td>240 h</td>
+</tr>
+<tr>
+<td><code>runpod5090</code></td>
+<td>RTX 5090</td>
+<td>32 GB</td>
+<td>(cloud)</td>
+<td>1.3× (est.)</td>
+<td>72 h (rent 3 days)</td>
+<td>94 h</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td><strong>574 h (4090-eq)</strong></td>
+</tr>
+</tbody>
+</table>
+<p>*Throughput relative to RTX 4090 for typical FP16/AMP detection training.</p>
+<p><strong>Total estimated compute needed</strong>: ~155 h on 4090-equivalent (see §4). Budget has ~3.7× safety margin.</p>
+<hr>
+<h2 id="3-per-job-training-time-estimates">3. Per-Job Training Time Estimates </h2>
+<h3 id="31-fine-tune-150-epochs-ampon-warm-start">3.1 Fine-tune (150 epochs, AMP=on, warm-start) </h3>
+<p><strong>Scale-n / tiny models</strong> (e.g., YOLOv8n, HSG-DETR-n, Mamba-YOLO tiny):</p>
+<table>
+<thead>
+<tr>
+<th>Dataset/imgsz</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IDD @ 640</td>
+<td>2.0 h</td>
+<td>2.0 h</td>
+<td>1.0 h</td>
+<td>0.8 h</td>
+</tr>
+<tr>
+<td>IDD @ 1280</td>
+<td>4.0 h</td>
+<td>4.0 h</td>
+<td>2.0 h</td>
+<td>1.5 h</td>
+</tr>
+<tr>
+<td>KITTI @ 1280</td>
+<td>0.8 h</td>
+<td>0.8 h</td>
+<td>0.4 h</td>
+<td>0.3 h</td>
+</tr>
+<tr>
+<td>Cityscapes @ 1280</td>
+<td>0.4 h</td>
+<td>0.4 h</td>
+<td>0.2 h</td>
+<td>0.15 h</td>
+</tr>
+<tr>
+<td>BDD100K @ 1280</td>
+<td>7.0 h</td>
+<td>7.0 h</td>
+<td>3.5 h</td>
+<td>2.7 h</td>
+</tr>
+<tr>
+<td><strong>Per-model total</strong></td>
+<td><strong>14.2 h</strong></td>
+<td><strong>14.2 h</strong></td>
+<td><strong>7.1 h</strong></td>
+<td><strong>5.5 h</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Scale-s / base models</strong> (e.g., YOLOv8s, HSG-DETR-s, Mamba-YOLO base):</p>
+<table>
+<thead>
+<tr>
+<th>Dataset/imgsz</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IDD @ 640</td>
+<td>3.0 h</td>
+<td>3.0 h</td>
+<td>1.5 h</td>
+<td>1.2 h</td>
+</tr>
+<tr>
+<td>IDD @ 1280</td>
+<td>6.0 h</td>
+<td>6.0 h</td>
+<td>3.0 h</td>
+<td>2.3 h</td>
+</tr>
+<tr>
+<td>KITTI @ 1280</td>
+<td>1.2 h</td>
+<td>1.2 h</td>
+<td>0.6 h</td>
+<td>0.5 h</td>
+</tr>
+<tr>
+<td>Cityscapes @ 1280</td>
+<td>0.6 h</td>
+<td>0.6 h</td>
+<td>0.3 h</td>
+<td>0.25 h</td>
+</tr>
+<tr>
+<td>BDD100K @ 1280</td>
+<td>10.0 h</td>
+<td>10.0 h</td>
+<td>5.0 h</td>
+<td>3.8 h</td>
+</tr>
+<tr>
+<td><strong>Per-model total</strong></td>
+<td><strong>20.8 h</strong></td>
+<td><strong>20.8 h</strong></td>
+<td><strong>10.4 h</strong></td>
+<td><strong>8.0 h</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Scale-L models</strong> (RT-DETR-L, DINO-R50):</p>
+<table>
+<thead>
+<tr>
+<th>Dataset/imgsz</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+<th>rase4070 (ถ้า fit)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IDD @ 640</td>
+<td>3.0 h</td>
+<td>2.3 h</td>
+<td>OOM/batch=2 → skip</td>
+</tr>
+<tr>
+<td>IDD @ 1280</td>
+<td>6.0 h</td>
+<td>4.6 h</td>
+<td>OOM → skip</td>
+</tr>
+<tr>
+<td>KITTI @ 1280</td>
+<td>1.2 h</td>
+<td>0.9 h</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Cityscapes @ 1280</td>
+<td>0.6 h</td>
+<td>0.5 h</td>
+<td>—</td>
+</tr>
+<tr>
+<td>BDD100K @ 1280</td>
+<td>10.0 h</td>
+<td>7.7 h</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Per-model total</strong></td>
+<td><strong>20.8 h</strong></td>
+<td><strong>16.0 h</strong></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>หมายเหตุ</strong>: RT-DETR-L และ DINO-R50 <strong>ต้อง</strong> รันบน <code>rtx4090</code> หรือ <code>runpod5090</code> เท่านั้น เพราะ VRAM 12 GB ของ 4070 ไม่พอ (batch ต่ำเกินไปจนมีผลต่อ BatchNorm/matching)</p>
+</blockquote>
+<h3 id="32-hsg-detr-coco-pretrain-300-epochs-critical-path">3.2 HSG-DETR COCO Pretrain (300 epochs, critical path) </h3>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HSG-DETR-n</td>
+<td>12 h</td>
+<td>9 h</td>
+</tr>
+<tr>
+<td>HSG-DETR-s</td>
+<td>18 h</td>
+<td>13 h</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Critical path</strong>: pretrain ต้องเสร็จ <strong>ก่อน</strong> fine-tune HSG-DETR → วางไว้เป็นงานแรกสุด</p>
+<hr>
+<h2 id="4-machine-allocation-strategy">4. Machine Allocation Strategy </h2>
+<h3 id="41-allocation-principle">4.1 Allocation Principle </h3>
+<ol>
+<li><strong>BDD100K (หนักสุด)</strong> → ให้ <code>rtx4090</code> + <code>runpod5090</code> รับ (GPU เร็ว + VRAM เยอะ)</li>
+<li><strong>KITTI / Cityscapes (เบา)</strong> → ให้ <code>rase4070</code>, <code>ku4070</code> เติมช่องว่าง (แต่ละ job &lt;1 h)</li>
+<li><strong>Large models (RT-DETR-L, DINO-R50)</strong> → บังคับ <code>rtx4090</code> / <code>runpod5090</code></li>
+<li><strong>Small/nano models</strong> → กระจายลง 4070 ทั้งคู่</li>
+<li><strong>HSG-DETR pretrain</strong> → parallel บน <code>rtx4090</code> (n) + <code>runpod5090</code> (s) — วันที่ 1</li>
+</ol>
+<h3 id="42-model-to-machine-map">4.2 Model-to-Machine Map </h3>
+<table>
+<thead>
+<tr>
+<th>Machine</th>
+<th>Models (assigned)</th>
+<th>Jobs</th>
+<th>Est. wall-time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rase4070</code></td>
+<td>YOLOv8n, YOLOv10n, YOLOv26n, Mamba-YOLO tiny</td>
+<td>4 × 5 = 20</td>
+<td>~57 h</td>
+</tr>
+<tr>
+<td><code>ku4070</code></td>
+<td>YOLOv8s, YOLOv10s, YOLOv26s, Mamba-YOLO base</td>
+<td>4 × 5 = 20</td>
+<td>~83 h</td>
+</tr>
+<tr>
+<td><code>rtx4090</code></td>
+<td><strong>HSG-DETR-n pretrain</strong>, HSG-DETR-n (5 ft), HSG-DETR-s (5 ft), RT-DETR-L (5 ft)</td>
+<td>1 + 15 = 16</td>
+<td>~12 + 7 + 10 + 21 = ~50 h</td>
+</tr>
+<tr>
+<td><code>runpod5090</code></td>
+<td><strong>HSG-DETR-s pretrain</strong>, DINO-R50 (5 ft)</td>
+<td>1 + 5 = 6</td>
+<td>~13 + 16 = ~29 h</td>
+</tr>
+</tbody>
+</table>
+<p>Total: 62 jobs, ~219 h wall-time distributed.</p>
+<blockquote>
+<p><strong>Load balancing</strong>: <code>ku4070</code> มี 83 h &gt; <code>rase4070</code> 57 h — ถ้าเครื่อง <code>rase4070</code> เสร็จก่อน day 4 สามารถ takeover Mamba-YOLO base ได้</p>
+</blockquote>
+<hr>
+<h2 id="5-gantt-chart-mermaid">5. Gantt Chart (Mermaid) </h2>
+<div class="mermaid">gantt
+    title HSG-DETR 10-Day Training Schedule
+    dateFormat  YYYY-MM-DD
+    axisFormat  D%d
+
+    section Setup (Day 1 AM)
+    Dataset prep (IDD/KITTI/CS/BDD)    :setup1, 2026-05-04, 12h
+    Model config smoke test            :setup2, after setup1, 4h
+
+    section rtx4090 — Heavy/HSG-DETR
+    HSG-DETR-n COCO pretrain (300ep)     :crit, p1, 2026-05-04, 12h
+    HSG-DETR-n ft (IDD640/1280/K/CS/BDD) :h1, after p1, 7h
+    HSG-DETR-s ft (IDD640/1280/K/CS/BDD) :h2, after h1, 10h
+    RT-DETR-L ft (IDD640)                :r1, after h2, 3h
+    RT-DETR-L ft (IDD1280)               :r2, after r1, 6h
+    RT-DETR-L ft (KITTI)                 :r3, after r2, 2h
+    RT-DETR-L ft (Cityscapes)            :r4, after r3, 1h
+    RT-DETR-L ft (BDD100K)               :r5, after r4, 10h
+    Buffer / eval / rerun                :rtx_buf, after r5, 48h
+
+    section runpod5090 — Cloud Heavy
+    HSG-DETR-s COCO pretrain (300ep)     :crit, p2, 2026-05-04, 13h
+    DINO-R50 ft (IDD640)                 :d1, after p2, 3h
+    DINO-R50 ft (IDD1280)                :d2, after d1, 5h
+    DINO-R50 ft (KITTI)                  :d3, after d2, 1h
+    DINO-R50 ft (Cityscapes)             :d4, after d3, 1h
+    DINO-R50 ft (BDD100K)                :d5, after d4, 8h
+    [RunPod returned after Day 3]        :milestone, milestone_rp, after d5, 0
+
+    section rase4070 — Nano models
+    YOLOv8n  (5 datasets)                :y8n, after setup2, 14h
+    YOLOv10n (5 datasets)                :y10n, after y8n, 14h
+    YOLOv26n (5 datasets)                :y26n, after y10n, 14h
+    Mamba-YOLO tiny (5 datasets)         :mt, after y26n, 15h
+    Buffer                               :rase_buf, after mt, 48h
+
+    section ku4070 — Small/base models
+    YOLOv8s  (5 datasets)                :y8s, after setup2, 21h
+    YOLOv10s (5 datasets)                :y10s, after y8s, 21h
+    YOLOv26s (5 datasets)                :y26s, after y10s, 21h
+    Mamba-YOLO base (5 datasets)         :mb, after y26s, 22h
+    Buffer                               :ku_buf, after mb, 24h
+
+    section Day 9-10 Analysis
+    Collect logs (all machines)          :an1, 2026-05-12, 4h
+    Aggregate mAP tables                 :an2, after an1, 4h
+    Occlusion / small-obj eval           :an3, after an2, 8h
+    Edge export (ONNX/TensorRT) + FPS    :an4, after an3, 8h
+    Paper results / figures              :an5, after an4, 24h
+</div><hr>
+<h2 id="6-day-by-day-schedule-table">6. Day-by-Day Schedule Table </h2>
+<h3 id="day-1-setup--critical-path-start">Day 1 (Setup + Critical Path Start) </h3>
+<table>
+<thead>
+<tr>
+<th>Time block</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>00:00–06:00</td>
+<td>Dataset prep + smoke test</td>
+<td>Dataset prep + smoke test</td>
+<td><strong>HSG-DETR-n COCO pretrain</strong></td>
+<td><strong>HSG-DETR-s COCO pretrain</strong></td>
+</tr>
+<tr>
+<td>06:00–24:00</td>
+<td>YOLOv8n: IDD640 → IDD1280 → KITTI</td>
+<td>YOLOv8s: IDD640 → IDD1280 → KITTI</td>
+<td>(pretrain continues, ~12h)</td>
+<td>(pretrain continues, ~13h)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-2">Day 2 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>00:00–12:00</td>
+<td>YOLOv8n: CS → BDD (start)</td>
+<td>YOLOv8s: CS → BDD (start)</td>
+<td><strong>pretrain done</strong> → HSG-DETR-n ft (IDD640, IDD1280)</td>
+<td><strong>pretrain done</strong> → DINO-R50 (IDD640, IDD1280)</td>
+</tr>
+<tr>
+<td>12:00–24:00</td>
+<td>YOLOv8n BDD done → <strong>YOLOv10n start</strong></td>
+<td>YOLOv8s BDD done → <strong>YOLOv10s start</strong></td>
+<td>HSG-DETR-n ft (KITTI, CS, BDD start)</td>
+<td>DINO-R50 (KITTI, CS)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-3">Day 3 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>YOLOv10n (5 datasets)</td>
+<td>YOLOv10s (5 datasets)</td>
+<td>HSG-DETR-n BDD done → <strong>HSG-DETR-s ft</strong> (IDD640, IDD1280)</td>
+<td>DINO-R50 (BDD) running</td>
+</tr>
+<tr>
+<td>end-of-day milestone</td>
+<td>—</td>
+<td>—</td>
+<td>HSG-DETR-n <strong>all 5 done</strong></td>
+<td>DINO-R50 BDD mid-run</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-4">Day 4 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>YOLOv10n done → <strong>YOLOv26n start</strong></td>
+<td>YOLOv10s done → <strong>YOLOv26s start</strong></td>
+<td>HSG-DETR-s ft (KITTI, CS, BDD)</td>
+<td>DINO-R50 BDD done → <strong>release RunPod</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Day 4 end</strong>: RunPod 5090 can be returned (used ~29 h of 72 h rental). ประหยัดค่าเช่า ~60%</p>
+</blockquote>
+<h3 id="day-5">Day 5 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+<th>runpod5090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>YOLOv26n (5 datasets)</td>
+<td>YOLOv26s (5 datasets)</td>
+<td>HSG-DETR-s <strong>all 5 done</strong> → <strong>RT-DETR-L start</strong> (IDD640)</td>
+<td><strong>RETURNED</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-6">Day 6 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>YOLOv26n done → <strong>Mamba-YOLO tiny start</strong></td>
+<td>YOLOv26s done → <strong>Mamba-YOLO base start</strong></td>
+<td>RT-DETR-L (IDD1280, KITTI, CS)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-7">Day 7 </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>Mamba-YOLO tiny (5 datasets)</td>
+<td>Mamba-YOLO base (5 datasets)</td>
+<td>RT-DETR-L (BDD)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-8--all-fine-tunes-done">Day 8 — All fine-tunes done </h3>
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>rase4070</th>
+<th>ku4070</th>
+<th>rtx4090</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all day</td>
+<td>Mamba-YOLO tiny <strong>done</strong> → buffer/re-runs</td>
+<td>Mamba-YOLO base continues (heaviest job on 4070)</td>
+<td>RT-DETR-L <strong>done</strong> → buffer</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-9--analysis--evaluation">Day 9 — Analysis &amp; Evaluation </h3>
+<table>
+<thead>
+<tr>
+<th>All machines</th>
+<th>Activity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>—</td>
+<td><strong>Collect logs from all MCP servers</strong> (ku4070, rase4070, rtx4090)</td>
+</tr>
+<tr>
+<td>rtx4090</td>
+<td>Run occlusion-density stratified eval on val splits</td>
+</tr>
+<tr>
+<td>rtx4090</td>
+<td>Edge deployment: ONNX export → TensorRT FP16 → Jetson FPS benchmark</td>
+</tr>
+<tr>
+<td>any</td>
+<td>Aggregate mAP@0.5, mAP@0.5:0.95 tables (pandas/Excel)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="day-10--paper-results-integration">Day 10 — Paper Results Integration </h3>
+<table>
+<thead>
+<tr>
+<th>Activity</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fill Section VII tables in <code>HSG-DETR-Draft.md</code></td>
+<td>mAP × 12 models × 5 datasets matrix</td>
+</tr>
+<tr>
+<td>Generate comparison figures</td>
+<td><code>imgs/fig_main_results.png</code></td>
+</tr>
+<tr>
+<td>Ablation analysis (HSG-DETR-s vs α/r/placement)</td>
+<td><code>imgs/fig_ablation.png</code></td>
+</tr>
+<tr>
+<td>Draft Discussion/Conclusion updates</td>
+<td><code>HSG-DETR-Draft.md</code> final</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7-critical-path--dependencies">7. Critical Path &amp; Dependencies </h2>
+<pre data-role="codeBlock" data-info="" class="language-text"><code>┌─────────────────────────────────────────────────────────────────────┐
+│  Day 1 AM: Dataset prep + smoke test (MUST complete before any ft)   │
+└─────────────────────────────────────────────────────────────────────┘
+                │                      │
+                ▼                      ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│ Day 1 PM → Day 2:        │  │ Day 1 → Day 2:           │
+│ HSG-DETR-n COCO pretrain │  │ HSG-DETR-s COCO pretrain │
+│ (rtx4090, ~12h)          │  │ (runpod5090, ~13h)       │
+└────────────┬─────────────┘  └────────────┬─────────────┘
+             │                              │
+             ▼                              ▼
+  [HSG-DETR-n ft unlocks]        [HSG-DETR-s ft unlocks]
+             │                              │
+             └──────────┬───────────────────┘
+                        ▼
+        ┌─────────────────────────────────┐
+        │ Day 2-7: 60 fine-tune jobs run   │
+        │ in parallel on 4 machines        │
+        └────────────────┬─────────────────┘
+                         ▼
+        ┌─────────────────────────────────┐
+        │ Day 9-10: eval + paper integration│
+        └─────────────────────────────────┘
+</code></pre><p><strong>Critical path length</strong> = Day 1 setup (6h) + HSG-DETR-s pretrain (13h) + HSG-DETR-s BDD ft (3.8h) + eval (8h) + paper integration (24h) ≈ <strong>55 h critical path</strong> → fits comfortably in 10 days (240 h).</p>
+<hr>
+<h2 id="8-risk--contingency-plan">8. Risk &amp; Contingency Plan </h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Probability</th>
+<th>Impact</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HSG-DETR pretrain ไม่ converge</td>
+<td>Medium</td>
+<td>HIGH (delays 10 ft jobs)</td>
+<td>(1) Run smoke test 10-epoch on Day 0 night. (2) Start <code>rtx4090</code> pretrain 6 h before <code>runpod5090</code> — ให้เห็น curve ก่อน scale up</td>
+</tr>
+<tr>
+<td>RT-DETR-L / DINO-R50 OOM บน 4090</td>
+<td>Low</td>
+<td>Medium</td>
+<td>batch=4 + grad accumulation; ถ้ายัง OOM → ย้ายไป runpod5090 (32GB) → extend runpod rental 1 day</td>
+</tr>
+<tr>
+<td>BDD100K download ช้า</td>
+<td>Medium</td>
+<td>Medium</td>
+<td>Pre-download on Day 0 (before official Day 1) ที่ทุกเครื่อง parallel</td>
+</tr>
+<tr>
+<td>4070 walltime เกิน budget</td>
+<td>Low</td>
+<td>Low</td>
+<td>ตัด duplicate scale (ถ้า YOLOv26 ~ YOLOv8 ผลเท่ากัน ตัด 1) หรือลด epochs จาก 150 → 120</td>
+</tr>
+<tr>
+<td>RunPod instance preempt</td>
+<td>Low</td>
+<td>HIGH</td>
+<td>(1) Save checkpoint ทุก 5 epochs. (2) Auto-resume script. (3) DINO-R50 BDD เป็น job สุดท้าย (resumable)</td>
+</tr>
+<tr>
+<td>Training NaN (จาก bug ที่เคยเจอ)</td>
+<td>Low (patched)</td>
+<td>HIGH</td>
+<td>ใช้ commit ล่าสุด <code>c34a05c</code> ที่มี <code>_finite_or_zero</code> sanitization แล้ว</td>
+</tr>
+<tr>
+<td>Dataset class mismatch (80 vs dataset classes)</td>
+<td>Medium</td>
+<td>Medium</td>
+<td>Standardize ทุก dataset ให้ align กับ 8-class autonomous-driving taxonomy ก่อนเริ่ม</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="9-output-checklist-day-10-end-state">9. Output Checklist (Day 10 end-state) </h2>
+<h3 id="91-training-artifacts">9.1 Training artifacts </h3>
+<ul>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> 62 experiment directories (checkpoints + <code>results.csv</code> + <code>args.yaml</code>)</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> Aggregated <code>combined_results.json</code>: <code>{model, dataset, imgsz, mAP50, mAP50_95, params, flops, fps_4090, fps_5090}</code></li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> Per-machine MCP job logs ส่งออกเป็น <code>training_summary.md</code> (สไตล์เดียวกับไฟล์ที่มีอยู่แล้ว)</li>
+</ul>
+<h3 id="92-paper-ready-deliverables">9.2 Paper-ready deliverables </h3>
+<ul>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong>Table 1</strong> — Main comparison (12 models × 5 datasets, mAP50-95)</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong>Table 2</strong> — Ablation (HSG-DETR-s only: α, r, placement, SGStem/SGDown on/off)</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong>Table 3</strong> — Efficiency (Params, FLOPs, FPS on 4090/5090/Jetson)</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong>Fig. Main results</strong> — bar chart mAP per dataset</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong>Fig. Efficiency</strong> — mAP vs FLOPs Pareto front</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> <strong><a href="http://HSG-DETR-Draft.md">HSG-DETR-Draft.md</a> Section VII</strong> เต็ม</li>
+</ul>
+<h3 id="93-deployment-validation-optional-day-10">9.3 Deployment validation (optional, Day 10) </h3>
+<ul>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> ONNX export × 2 (HSG-DETR-n, HSG-DETR-s)</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> TensorRT FP16 engine × 2</li>
+<li class="task-list-item"><input type="checkbox" class="task-list-item-checkbox"> Jetson FPS measurement @ 1280 (single image, batch=1)</li>
+</ul>
+<hr>
+<h2 id="10-quick-commands-reference">10. Quick Commands (reference) </h2>
+<h3 id="101-start-a-training-job-mcp-convention">10.1 Start a training job (MCP convention) </h3>
+<pre data-role="codeBlock" data-info="bash" class="language-bash bash"><code><span class="token comment"># rtx4090: HSG-DETR-n pretrain on COCO</span>
+python <span class="token parameter variable">-m</span> hsg_detr.train <span class="token punctuation">\</span>
+    <span class="token parameter variable">--cfg</span> backend/hsg_detr/configs/hsg_detr_n.yaml <span class="token punctuation">\</span>
+    <span class="token parameter variable">--data</span> coco.yaml <span class="token punctuation">\</span>
+    <span class="token parameter variable">--imgsz</span> <span class="token number">1280</span> <span class="token parameter variable">--epochs</span> <span class="token number">300</span> <span class="token parameter variable">--batch</span> <span class="token number">16</span> <span class="token punctuation">\</span>
+    <span class="token parameter variable">--device</span> <span class="token number">0</span> <span class="token parameter variable">--name</span> hsg_n_coco_pretrain
+</code></pre><h3 id="102-fine-tune-from-coco-pretrained-checkpoint">10.2 Fine-tune from COCO-pretrained checkpoint </h3>
+<pre data-role="codeBlock" data-info="bash" class="language-bash bash"><code><span class="token comment"># rase4070: YOLOv8n fine-tune on IDD @ 640</span>
+yolo detect train <span class="token assign-left variable">model</span><span class="token operator">=</span>yolov8n.pt <span class="token assign-left variable">data</span><span class="token operator">=</span>idd.yaml <span class="token punctuation">\</span>
+    <span class="token assign-left variable">imgsz</span><span class="token operator">=</span><span class="token number">640</span> <span class="token assign-left variable">epochs</span><span class="token operator">=</span><span class="token number">150</span> <span class="token assign-left variable">batch</span><span class="token operator">=</span><span class="token number">16</span> <span class="token assign-left variable">amp</span><span class="token operator">=</span>true <span class="token punctuation">\</span>
+    <span class="token assign-left variable">project</span><span class="token operator">=</span>runs/idd <span class="token assign-left variable">name</span><span class="token operator">=</span>yolov8n_idd_640
+</code></pre><h3 id="103-monitor-all-machines">10.3 Monitor all machines </h3>
+<pre data-role="codeBlock" data-info="bash" class="language-bash bash"><code><span class="token comment"># from laptop</span>
+python scripts/training_summary.py <span class="token parameter variable">--machines</span> rase4070,ku4070,rtx4090,runpod5090
+</code></pre><hr>
+<h2 id="11-summary">11. Summary </h2>
+<ul>
+<li><strong>Total jobs</strong>: 62 (2 pretrain + 60 fine-tune)</li>
+<li><strong>Total compute needed</strong>: ~155 h on 4090-equivalent</li>
+<li><strong>Total budget available</strong>: ~574 h on 4090-equivalent (3.7× safety margin)</li>
+<li><strong>Critical path</strong>: 55 h (Day 1 AM → Day 10)</li>
+<li><strong>RunPod 5090 rental</strong>: 3 days (Day 1–4, ~29 h actually used)</li>
+<li><strong>Expected completion</strong>: Day 8 for all training; Day 9–10 for eval + paper integration</li>
+</ul>
+<p>กำหนดการนี้มี <strong>slack buffer ~48 h</strong> ต่อเครื่อง → รองรับ re-run ได้ 2–3 jobs ถ้ามี failure โดยไม่กระทบ critical path</p>
+</div>
+      </div>
+      
+      
+    
+    
+    <script type="module">
+// TODO: If ZenUML gets integrated into mermaid in the future,
+//      we can remove the following lines.
+
+
+var MERMAID_CONFIG = ({"startOnLoad":false});
+if (typeof MERMAID_CONFIG !== 'undefined') {
+  MERMAID_CONFIG.startOnLoad = false
+  MERMAID_CONFIG.cloneCssStyles = false
+  MERMAID_CONFIG.theme = "default"
+}
+
+mermaid.initialize(MERMAID_CONFIG || {})
+if (typeof(window['Reveal']) !== 'undefined') {
+  function mermaidRevealHelper(event) {
+    var currentSlide = event.currentSlide
+    var diagrams = currentSlide.querySelectorAll('div.mermaid')
+    for (var i = 0; i < diagrams.length; i++) {
+      var diagram = diagrams[i]
+      if (!diagram.hasAttribute('data-processed')) {
+        mermaid.init(null, diagram, ()=> {
+          Reveal.slide(event.indexh, event.indexv)
+        })
+      }
+    }
+  }
+  Reveal.addEventListener('slidetransitionend', mermaidRevealHelper)
+  Reveal.addEventListener('ready', mermaidRevealHelper)
+  await mermaid.run({
+    nodes: document.querySelectorAll('div.mermaid')
+  })
+} else {
+  await mermaid.run({
+    nodes: document.querySelectorAll('div.mermaid')
+  })
+}
+</script>
+    
+    
+    
+  
+    </body></html>
