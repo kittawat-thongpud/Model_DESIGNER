@@ -81,6 +81,10 @@ export interface ModelRecord {
   yaml_def: ModelYAML;
   created_at: string;
   updated_at: string;
+  readonly?: boolean;
+  arch_plugin?: string;
+  arch_family?: string;
+  scale?: string;
 }
 
 export interface ModelSummary {
@@ -94,6 +98,10 @@ export interface ModelSummary {
   flops?: number;
   created_at: string;
   updated_at: string;
+  readonly?: boolean;
+  arch_plugin?: string;
+  arch_family?: string;
+  scale?: string;
 }
 
 export interface ExportRequest {

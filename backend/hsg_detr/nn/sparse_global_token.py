@@ -143,12 +143,34 @@ class SGTokenBlock(nn.Module):
         self.last_k: int | None = None
         self.last_N: int | None = None
 
+    def __setstate__(self, state: dict) -> None:
+        """Restore runtime-only attrs for checkpoints saved before debug flags existed."""
+        super().__setstate__(state)
+        self._ensure_runtime_attrs()
+
     # ------------------------------------------------------------------ #
     # Debug / introspection
     # ------------------------------------------------------------------ #
 
+    def _ensure_runtime_attrs(self) -> None:
+        """Backfill non-parameter attrs that old pickled checkpoints may lack."""
+        defaults = {
+            "debug_enabled": False,
+            "debug_to_cpu": False,
+            "last_indices": None,
+            "last_saliency": None,
+            "last_gate": None,
+            "last_mode": None,
+            "last_k": None,
+            "last_N": None,
+        }
+        for name, value in defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
     def get_debug_state(self) -> dict:
         """Return non-gradient metadata from the last forward pass."""
+        self._ensure_runtime_attrs()
         return {
             "indices": self.last_indices,
             "saliency": self.last_saliency,
@@ -160,6 +182,7 @@ class SGTokenBlock(nn.Module):
 
     def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
         """Enable or disable detached selector metadata capture."""
+        self._ensure_runtime_attrs()
         self.debug_enabled = bool(enabled)
         self.debug_to_cpu = bool(cpu)
         if not self.debug_enabled:
@@ -172,6 +195,7 @@ class SGTokenBlock(nn.Module):
         saliency: torch.Tensor | None = None,
     ) -> None:
         """Store detached metadata only when debug capture is explicitly enabled."""
+        self._ensure_runtime_attrs()
         if not self.debug_enabled:
             self.last_indices = None
             self.last_saliency = None
@@ -295,6 +319,7 @@ class SGTokenBlock(nn.Module):
     # ------------------------------------------------------------------ #
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_runtime_attrs()
         B, C, H, W = x.shape
         N = int(H) * int(W)
 

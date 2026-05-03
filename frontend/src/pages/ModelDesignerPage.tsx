@@ -776,12 +776,12 @@ export default function ModelDesignerPage({ onBack }: Props) {
   }, [history, historyIdx]);
 
   useEffect(() => {
-    Promise.all([api.listModels(), api.getModuleCatalog()])
+    Promise.all([api.listModels(true), api.getModuleCatalog()])
       .then(([m, c]) => { setModels(m ?? []); setCatalog(c ?? []); })
       .finally(() => setLoading(false));
   }, []);
 
-  const refreshModels = () => api.listModels().then(m => setModels(m ?? [])).catch(() => {});
+  const refreshModels = () => api.listModels(true).then(m => setModels(m ?? [])).catch(() => {});
 
   const removeModel = async (id: string) => {
     try {
@@ -1514,11 +1514,13 @@ export default function ModelDesignerPage({ onBack }: Props) {
                         <span className="text-[10px] text-slate-700 font-mono">{m.model_id.slice(0, 8)}</span>
                       </div>
                     </button>
-                    <button onClick={e => { e.stopPropagation(); removeModel(m.model_id); }}
-                      className="shrink-0 p-1 text-slate-600 hover:text-red-400 transition-colors cursor-pointer rounded hover:bg-red-500/10"
-                      title="Delete model">
-                      <Trash2 size={12} />
-                    </button>
+                    {!m.readonly && !m.model_id.startsWith('arch:') && (
+                      <button onClick={e => { e.stopPropagation(); removeModel(m.model_id); }}
+                        className="shrink-0 p-1 text-slate-600 hover:text-red-400 transition-colors cursor-pointer rounded hover:bg-red-500/10"
+                        title="Delete model">
+                        <Trash2 size={12} />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>

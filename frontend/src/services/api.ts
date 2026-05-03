@@ -53,7 +53,7 @@ function del<T>(path: string): Promise<T> {
 
 export const api = {
   // ── Models (Ultralytics YAML) ──────────────────────────────────────────
-  listModels: () => get<ModelSummary[]>('/api/models/'),
+  listModels: (includeArch = false) => get<ModelSummary[]>(`/api/models/${includeArch ? '?include_arch=true' : ''}`),
   loadModel: (id: string) => get<ModelRecord>(`/api/models/${id}`),
   importYAML: (yamlContent: string, name: string, task: string) => 
     post<{ model_id: string; name: string; task: string; message: string; graph: any }>('/api/models/import/yaml', { 

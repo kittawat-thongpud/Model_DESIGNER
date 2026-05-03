@@ -2,8 +2,10 @@
 Model Controller — CRUD for Ultralytics model YAML definitions.
 """
 from __future__ import annotations
+from datetime import datetime
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
+import yaml
 
 from ..schemas.model import SaveModelRequest, ExportRequest
 from ..services.config_service import get_model_config
@@ -15,6 +17,7 @@ router = APIRouter(prefix="/api/models", tags=["Models"])
 _MODEL_CONFIG = get_model_config()
 _MODEL_DEFAULTS = _MODEL_CONFIG.get("defaults", {})
 _MODEL_VALIDATION = _MODEL_CONFIG.get("validation", {})
+_ARCH_RECORD_TS = "1970-01-01T00:00:00Z"
 
 
 class ImportYAMLRequest(BaseModel):
@@ -46,6 +49,8 @@ def _load_arch_model_record(model_id: str) -> dict | None:
         "arch_family": arch_plugin.family,
         "scale": arch_plugin.scale,
         "readonly": True,
+        "created_at": _ARCH_RECORD_TS,
+        "updated_at": _ARCH_RECORD_TS,
         "yaml_def": yaml_def,
     }
 
@@ -61,9 +66,48 @@ def _load_arch_model_yaml(model_id: str) -> str | None:
     return arch_plugin.yaml_path().read_text(encoding="utf-8")
 
 
+def _list_arch_model_summaries() -> list[dict]:
+    """Return one read-only model summary per concrete arch plugin scale."""
+    from ..plugins.loader import all_arch_plugins
+
+    discover_plugins()
+    now = datetime.utcnow().isoformat() + "Z"
+    summaries: list[dict] = []
+    for arch_plugin in all_arch_plugins():
+        yaml_path = arch_plugin.yaml_path()
+        layer_count = 0
+        try:
+            yaml_def = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            layer_count = len(yaml_def.get("backbone", [])) + len(yaml_def.get("head", []))
+        except Exception:
+            pass
+
+        model_id = f"arch:{arch_plugin.name}"
+        summaries.append({
+            "model_id": model_id,
+            "name": arch_plugin.display_name,
+            "task": arch_plugin.task_type,
+            "layer_count": layer_count,
+            "input_shape": [3, 640, 640],
+            "params": None,
+            "gradients": None,
+            "flops": None,
+            "created_at": now,
+            "updated_at": now,
+            "readonly": True,
+            "arch_plugin": arch_plugin.name,
+            "arch_family": arch_plugin.family,
+            "scale": arch_plugin.scale,
+        })
+    return summaries
+
+
 @router.get("/", summary="List all models")
-async def list_models():
-    return model_storage.list_models()
+async def list_models(include_arch: bool = False):
+    records = model_storage.list_models()
+    if include_arch:
+        records = _list_arch_model_summaries() + records
+    return records
 
 
 @router.get("/{model_id}", summary="Load a model")
