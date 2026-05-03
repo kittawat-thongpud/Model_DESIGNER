@@ -84,6 +84,8 @@ def test_kitti_rebuilds_ultralytics_yolo_layout(tmp_path: Path, monkeypatch):
     plugin.rebuild_index()
 
     assert plugin.is_available()
+    assert plugin.category_id_map[0] == "car"
+    assert plugin._cat_id_to_contiguous()[3] == 3
     splits = plugin.scan_splits()
     assert splits["train"] == {"total": 1, "labeled": 1}
     assert splits["val"] == {"total": 1, "labeled": 1}

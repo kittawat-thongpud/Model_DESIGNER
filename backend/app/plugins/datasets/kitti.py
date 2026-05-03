@@ -219,6 +219,13 @@ class KITTIPlugin(DatasetPlugin):
         return list(_CLASSES)
 
     @property
+    def category_id_map(self) -> dict[int, str]:
+        return {i: name for i, name in enumerate(_CLASSES)}
+
+    def _cat_id_to_contiguous(self) -> dict[int, int]:
+        return {i: i for i in range(len(_CLASSES))}
+
+    @property
     def train_size(self) -> int:
         return len(self._get_index("train"))
 
