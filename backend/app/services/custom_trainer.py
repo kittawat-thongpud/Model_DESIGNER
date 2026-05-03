@@ -396,6 +396,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._max_nonfinite_grad_skips: int = 8
         self._target_sanitize_logs: int = 0
         self._last_train_batch_summary: dict[str, Any] | None = None
+        self._hsg_alpha_last: float | None = None
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
@@ -745,9 +746,38 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Track epoch start time."""
         import time as _time
         self._epoch_start_time = _time.time()
+        self._update_hsg_detr_alpha()
         super_method = getattr(super(), 'on_train_epoch_start', None)
         if super_method:
             super_method()
+
+    def _update_hsg_detr_alpha(self) -> None:
+        """Warm up RTDETRDecoderSGB saliency selection after classifier stabilizes."""
+        try:
+            model = unwrap_model(self.model)
+        except Exception:
+            return
+
+        decoders = [
+            m for m in model.modules()
+            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "set_alpha")
+        ]
+        if not decoders:
+            return
+
+        epoch = int(getattr(self, "epoch", 0))
+        start_epoch = 10
+        warmup_epochs = 40
+        target_alpha = 0.20
+        progress = max(0.0, min((epoch - start_epoch) / warmup_epochs, 1.0))
+        alpha = target_alpha * progress
+
+        for decoder in decoders:
+            decoder.set_alpha(alpha)
+
+        if self._hsg_alpha_last is None or abs(self._hsg_alpha_last - alpha) >= 0.049:
+            self._hsg_alpha_last = alpha
+            self.log(f"HSG-DETR query saliency alpha set to {alpha:.3f}", "INFO")
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""

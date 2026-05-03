@@ -7,9 +7,9 @@ with Ultralytics ``parse_model``.  Supports three ablation modes:
   - ``topk``   : hard top-k sparse attention (O(k²d)) — production
   - ``hybrid`` : dense local + sparse global fusion — accuracy
 
-        Metadata (selected indices, saliency scores, residual scale) are stored as
-instance attributes for debug / visualization without breaking ``parse_model``
-(single tensor return).
+Optional metadata (selected indices, saliency scores, residual scale) can be
+stored as instance attributes for debug / visualization without breaking
+``parse_model`` (single tensor return).
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
-from ultralytics.nn.modules.utils import inverse_sigmoid
 
 
 def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
@@ -71,7 +70,11 @@ class SGTokenBlock(nn.Module):
         c2 (int): Output channels (auto-injected by parse_model from YAML args[0]).
         ratio (float): Fraction of spatial tokens to retain; k = ratio·N (scales with imgsz).
         mode (str): One of ``"dense"``, ``"topk"``, ``"hybrid"``.
+        debug_enabled (bool): Store detached selector metadata during forward.
     """
+
+    VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
+    DENSE_TOKEN_LIMIT: int = 4096
 
     def __init__(
         self,
@@ -79,13 +82,23 @@ class SGTokenBlock(nn.Module):
         c2: int,
         ratio: float = 0.25,
         mode: str = "topk",
+        debug_enabled: bool = False,
     ) -> None:
         super().__init__()
         assert c1 == c2, (
             f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
         )
+        mode = str(mode).lower()
+        if mode not in self.VALID_MODES:
+            raise ValueError(
+                f"Invalid SGTokenBlock mode: {mode}. Expected one of {sorted(self.VALID_MODES)}"
+            )
+        ratio = float(ratio)
+        if not torch.isfinite(torch.tensor(ratio)):
+            raise ValueError(f"Invalid SGTokenBlock ratio: {ratio}")
+
         self.c = c2
-        self.ratio = float(ratio)
+        self.ratio = max(0.0, min(ratio, 1.0))
         self.mode = mode
 
         self.pre_norm = _make_gn(c2)
@@ -120,7 +133,9 @@ class SGTokenBlock(nn.Module):
             self.local_dw = None
             self.local_gamma = None
 
-        # Debug metadata (populated during forward, accessible via get_debug_state)
+        # Debug metadata (populated only when debug is enabled)
+        self.debug_enabled = bool(debug_enabled)
+        self.debug_to_cpu = False
         self.last_indices: torch.Tensor | None = None
         self.last_saliency: torch.Tensor | None = None
         self.last_gate: float | None = None
@@ -143,6 +158,32 @@ class SGTokenBlock(nn.Module):
             "N": self.last_N,
         }
 
+    def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
+        """Enable or disable detached selector metadata capture."""
+        self.debug_enabled = bool(enabled)
+        self.debug_to_cpu = bool(cpu)
+        if not self.debug_enabled:
+            self.last_indices = None
+            self.last_saliency = None
+
+    def _store_debug(
+        self,
+        indices: torch.Tensor | None = None,
+        saliency: torch.Tensor | None = None,
+    ) -> None:
+        """Store detached metadata only when debug capture is explicitly enabled."""
+        if not self.debug_enabled:
+            self.last_indices = None
+            self.last_saliency = None
+            return
+
+        if indices is not None:
+            indices = indices.detach()
+            self.last_indices = indices.cpu() if self.debug_to_cpu else indices
+        if saliency is not None:
+            saliency = saliency.detach()
+            self.last_saliency = saliency.cpu() if self.debug_to_cpu else saliency
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
@@ -157,8 +198,12 @@ class SGTokenBlock(nn.Module):
     def _select_k(self, N: int) -> int:
         """Compute effective k based on mode and constraints."""
         if self.mode == "dense":
+            if int(N) > self.DENSE_TOKEN_LIMIT:
+                raise RuntimeError(
+                    f"Dense SGB too large: N={N}. Use topk/hybrid instead."
+                )
             return int(N)
-        return max(1, min(int(float(self.ratio) * int(N)), int(N)))
+        return max(1, min(int(round(self.ratio * int(N))), int(N)))
 
     def _sparse_attention_delta(
         self,
@@ -176,6 +221,7 @@ class SGTokenBlock(nn.Module):
         """
         B, C, H, W = x.shape
         N = H * W
+        topk_idx = torch.nan_to_num(topk_idx, nan=0).long().clamp(0, N - 1)
         idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
 
         q_sel = torch.gather(q, 2, idx_exp).transpose(1, 2)   # [B, k, C]
@@ -219,8 +265,9 @@ class SGTokenBlock(nn.Module):
         attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
         attended = attended.to(orig_dtype)
 
-        # Scatter back to spatial grid
-        out = v.clone().view(B, C, N)  # [B, C, N]
+        # Scatter sparse context back to a zero canvas. The identity path is
+        # provided by the residual in forward().
+        out = torch.zeros_like(v).view(B, C, N)  # [B, C, N]
 
         # Guard: sanitize attended before scatter to prevent NaN propagation
         attended_clean = torch.nan_to_num(attended.transpose(1, 2), nan=0.0, posinf=0.0, neginf=0.0)
@@ -234,8 +281,14 @@ class SGTokenBlock(nn.Module):
         delta = self.out_proj(out)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
         delta = 6.0 * torch.tanh(delta.float() / 6.0)
-        delta = self.delta_norm(delta).to(orig_dtype)
-        return delta
+        delta = self.delta_norm(delta)
+
+        # GroupNorm can introduce non-zero values at zero-canvas positions, so
+        # mask once more to keep the sparse branch restricted to selected tokens.
+        delta_mask = torch.zeros(B, 1, N, device=delta.device, dtype=delta.dtype)
+        delta_mask.scatter_(2, topk_idx.unsqueeze(1), 1.0)
+        delta = delta * delta_mask.view(B, 1, H, W)
+        return delta.to(orig_dtype)
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -264,13 +317,12 @@ class SGTokenBlock(nn.Module):
             if self.mode == "dense":
                 # Full self-attention on all tokens (ablation baseline)
                 topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-                self.last_indices = topk_idx
-                self.last_saliency = self._compute_saliency(x_branch)
+                saliency = self._compute_saliency(x_branch) if self.debug_enabled else None
+                self._store_debug(topk_idx, saliency)
                 delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
                 return x + gamma * delta.to(dtype=x.dtype)
 
             importance = self._compute_saliency(x_branch)
-            self.last_saliency = importance
 
             if not torch.isfinite(importance).any():
                 importance = torch.ones_like(importance)
@@ -278,7 +330,7 @@ class SGTokenBlock(nn.Module):
             topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
             topk_idx = torch.clamp(topk_idx, 0, N - 1)
             topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
-            self.last_indices = topk_idx
+            self._store_debug(topk_idx, importance)
 
             delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
 
@@ -405,14 +457,17 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     saliency** (L2 activation energy) from the encoder-projected features.
 
     When ``alpha=0`` the behaviour is identical to the base RTDETRDecoder.
-    As ``alpha`` increases, spatially salient tokens receive higher priority
-    during top-k query selection, aligning the decoder's initial queries with
-    the regions the SGB encoder has already identified as important.
+    As the scheduled ``alpha`` buffer increases, spatially salient tokens
+    receive higher priority during hard top-k query selection, aligning the
+    decoder's initial queries with the regions the SGB encoder has already
+    identified as important.
 
-    Args (same as RTDETRDecoder + alpha):
+    Args (same as RTDETRDecoder):
         nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act, eval_idx,
         nd, label_noise_ratio, box_noise_scale, learnt_init_query
-        alpha (float): Cold-start saliency weighting coefficient, bounded by 0.5.
+
+    Saliency weight is a scheduled buffer controlled by ``set_alpha()`` and
+    bounded by ``ALPHA_MAX``.
     """
 
     ALPHA_MAX: float = 0.5  # maximum saliency weighting
@@ -442,7 +497,42 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
         )
-        self.register_buffer("alpha_logit", torch.tensor(-6.0), persistent=True)
+        self.register_buffer("alpha", torch.tensor(0.0), persistent=True)
+
+    def set_alpha(self, value: float) -> None:
+        """Set saliency query-selection strength for external warmup schedules."""
+        value = max(0.0, min(float(value), float(self.ALPHA_MAX)))
+        self.alpha.fill_(value)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Map legacy alpha_logit checkpoints onto the scheduled alpha buffer."""
+        legacy_key = prefix + "alpha_logit"
+        alpha_key = prefix + "alpha"
+        if legacy_key in state_dict:
+            if alpha_key not in state_dict:
+                legacy_alpha = float(self.ALPHA_MAX) * torch.sigmoid(
+                    state_dict[legacy_key].detach().float()
+                )
+                state_dict[alpha_key] = legacy_alpha.reshape_as(self.alpha)
+            del state_dict[legacy_key]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _get_decoder_input(
         self,
@@ -490,7 +580,8 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         energy_range = (energy_max - energy_min).clamp(min=eps)
         energy_norm = ((token_energy - energy_min) / energy_range).clamp(-10.0, 10.0)
 
-        alpha = float(self.ALPHA_MAX) * torch.sigmoid(self.alpha_logit.float())
+        alpha = self.alpha.to(device=features.device, dtype=energy_norm.dtype)
+        alpha = alpha.clamp(0.0, float(self.ALPHA_MAX))
         combined = (cls_score_norm + alpha * energy_norm).clamp(-20.0, 20.0)
         combined = torch.nan_to_num(combined, nan=-1e4, posinf=20.0, neginf=-1e4)
 
@@ -509,7 +600,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
         # ── Remainder identical to base RTDETRDecoder ──────────────────
         batch_ind = (
-            torch.arange(end=bs, dtype=topk_ind.dtype)
+            torch.arange(end=bs, dtype=topk_ind.dtype, device=features.device)
             .unsqueeze(-1)
             .repeat(1, self.num_queries)
             .view(-1)

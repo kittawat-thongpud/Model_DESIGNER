@@ -1065,7 +1065,7 @@ _HSG_DETR_MODULES: list[dict[str, Any]] = [
             "HSG-DETR SGB-guided RT-DETR decoder. Inherits RTDETRDecoder and overrides "
             "query selection to combine classification score with token saliency "
             "(L2 activation energy) from encoder features. "
-            "Saliency weight is set via the ALPHA class constant (default 0.5)."
+            "Saliency weight is controlled by a warmup schedule and bounded by ALPHA_MAX."
         ),
         "args": [
             {"name": "nc", "type": "int", "default": 80,

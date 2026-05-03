@@ -38,6 +38,46 @@ def get_arch_plugin(name: str) -> ModelArchPlugin | None:
     return _arch_plugins.get(name.lower())
 
 
+def resolve_arch_plugin(name_or_family: str, scale: str | None = None) -> ModelArchPlugin | None:
+    """Resolve an arch plugin by exact name or by ``family`` + optional scale.
+
+    UI records often use synthetic IDs like ``arch:mamba_yolo`` while the
+    registry stores concrete scale plugins such as ``mamba_yolo_t``.  This
+    helper keeps that mapping consistent across controllers.
+    """
+    key = str(name_or_family or "").strip().lower()
+    if key.startswith("arch:"):
+        key = key[len("arch:"):]
+    scale_key = str(scale or "").strip().lower() or None
+
+    if scale_key:
+        plugin = _arch_plugins.get(f"{key}_{scale_key}")
+        if plugin is not None:
+            return plugin
+
+    plugin = _arch_plugins.get(key)
+    if plugin is not None:
+        return plugin
+
+    family_matches = [p for p in _arch_plugins.values() if p.family.lower() == key]
+    if not family_matches:
+        return None
+
+    if scale_key:
+        for plugin in family_matches:
+            if (plugin.scale or "").lower() == scale_key:
+                return plugin
+
+    scale_order = {
+        "t": 0, "n": 1, "s": 2, "m": 3, "b": 4, "l": 5, "x": 6,
+        "c": 7, "e": 8,
+    }
+    return sorted(
+        family_matches,
+        key=lambda p: (scale_order.get((p.scale or "").lower(), 99), p.name),
+    )[0]
+
+
 def all_dataset_plugins() -> list[DatasetPlugin]:
     return list(_dataset_plugins.values())
 
@@ -208,4 +248,3 @@ def discover_plugins() -> dict[str, int]:
         "weight_sources": len(_weight_source_plugins),
         "archs": len(_arch_plugins),
     }
-

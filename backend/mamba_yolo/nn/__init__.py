@@ -128,6 +128,14 @@ def _load_mamba_modules() -> dict:
         )
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
         mod.__package__ = _VENDOR_PKG
+        # The vendor file does `from .common_utils_mbyolo import *`, but some
+        # upstream versions define `__all__` without SelectiveScanCore.  That
+        # leaves default args like `SelectiveScan=SelectiveScanCore` unresolved
+        # during module execution.  Seed the namespace from common_utils first
+        # so those definitions are always available.
+        for _name, _value in _common_mod.__dict__.items():
+            if not _name.startswith("__"):
+                mod.__dict__.setdefault(_name, _value)
         sys.modules[yolo_name] = mod
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         # ^ triggers `from .common_utils_mbyolo import *` which resolves

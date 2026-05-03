@@ -9,6 +9,7 @@ from ..schemas.model import SaveModelRequest, ExportRequest
 from ..services.config_service import get_model_config
 from ..services import model_storage
 from ..services.yaml_to_graph import yaml_to_graph
+from ..plugins.loader import discover_plugins, resolve_arch_plugin
 
 router = APIRouter(prefix="/api/models", tags=["Models"])
 _MODEL_CONFIG = get_model_config()
@@ -23,6 +24,43 @@ class ImportYAMLRequest(BaseModel):
     task: str = str(_MODEL_DEFAULTS.get("task", "detect"))
 
 
+def _load_arch_model_record(model_id: str) -> dict | None:
+    """Build a read-only model record for synthetic IDs like ``arch:mamba_yolo``."""
+    if not str(model_id).startswith("arch:"):
+        return None
+    discover_plugins()
+    arch_key = model_id[len("arch:"):]
+    arch_plugin = resolve_arch_plugin(arch_key)
+    if arch_plugin is None:
+        return None
+
+    yaml_path = arch_plugin.yaml_path()
+    yaml_text = yaml_path.read_text(encoding="utf-8")
+    yaml_def = yaml_to_graph(yaml_text)
+    return {
+        "model_id": model_id,
+        "name": arch_plugin.family_display_name,
+        "description": arch_plugin.description,
+        "task": arch_plugin.task_type,
+        "arch_plugin": arch_plugin.name,
+        "arch_family": arch_plugin.family,
+        "scale": arch_plugin.scale,
+        "readonly": True,
+        "yaml_def": yaml_def,
+    }
+
+
+def _load_arch_model_yaml(model_id: str) -> str | None:
+    """Return raw YAML for synthetic arch model IDs."""
+    if not str(model_id).startswith("arch:"):
+        return None
+    discover_plugins()
+    arch_plugin = resolve_arch_plugin(model_id)
+    if arch_plugin is None:
+        return None
+    return arch_plugin.yaml_path().read_text(encoding="utf-8")
+
+
 @router.get("/", summary="List all models")
 async def list_models():
     return model_storage.list_models()
@@ -31,6 +69,8 @@ async def list_models():
 @router.get("/{model_id}", summary="Load a model")
 async def load_model(model_id: str):
     record = model_storage.load_model(model_id)
+    if not record:
+        record = _load_arch_model_record(model_id)
     if not record:
         raise HTTPException(404, f"Model not found: {model_id}")
     return record
@@ -137,6 +177,9 @@ async def get_model_yaml(model_id: str):
     """Return the raw YAML string for a model."""
     p = model_storage.load_model_yaml_path(model_id)
     if not p:
+        arch_yaml = _load_arch_model_yaml(model_id)
+        if arch_yaml is not None:
+            return {"model_id": model_id, "yaml": arch_yaml}
         raise HTTPException(404, f"Model not found: {model_id}")
     return {"model_id": model_id, "yaml": p.read_text()}
 

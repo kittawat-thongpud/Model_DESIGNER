@@ -16,13 +16,56 @@ from ..schemas.weight_schema import (
 )
 from ..services.config_service import get_export_config, get_model_config, get_weights_config
 from ..services import weight_storage, weight_transfer, weight_import, model_storage
-from ..plugins.loader import all_weight_source_plugins
+from ..plugins.loader import all_weight_source_plugins, discover_plugins, resolve_arch_plugin
 from .. import logging_service as logger
 
 router = APIRouter(prefix="/api/weights", tags=["Weights"])
 _EXPORT_DEFAULTS = get_export_config().get("defaults", {})
 _MODEL_DEFAULTS = get_model_config().get("defaults", {})
 _WEIGHTS_VISUALIZATION = get_weights_config().get("visualization", {})
+
+
+def _arch_plugin_from_weight_meta(weight_meta: dict | None):
+    """Resolve the arch plugin needed to unpickle/load a saved weight."""
+    if not weight_meta:
+        return None
+
+    discover_plugins()
+    model_id = str(weight_meta.get("model_id") or "")
+    model_scale = str(weight_meta.get("model_scale") or "").strip().lower() or None
+
+    for key in (
+        weight_meta.get("arch_plugin"),
+        weight_meta.get("model_arch"),
+    ):
+        if key:
+            plugin = resolve_arch_plugin(str(key), model_scale)
+            if plugin:
+                return plugin
+
+    if model_id.startswith("arch:"):
+        return resolve_arch_plugin(model_id, model_scale)
+
+    yaml_path = model_storage.load_model_yaml_path(model_id) if model_id else None
+    if yaml_path:
+        from ..plugins.loader import find_arch_for_yaml
+        return find_arch_for_yaml(str(yaml_path))
+
+    return None
+
+
+def _register_arch_plugin_for_weight(weight_meta: dict | None) -> None:
+    """Register custom modules before YOLO/torch loads a plugin checkpoint."""
+    arch_plugin = _arch_plugin_from_weight_meta(weight_meta)
+    if not arch_plugin:
+        return
+    try:
+        arch_plugin.register_modules()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to register arch plugin '{arch_plugin.name}': {exc}",
+        )
 
 
 @router.post("/create-empty", summary="Create an empty weight from a model")
@@ -95,21 +138,18 @@ async def create_empty_weight(body: CreateEmptyRequest):
 
     # ── Branch B: Arch plugin model ───────────────────────────────────────────
     if body.arch_plugin or (body.model_id and body.model_id.startswith("arch:")):
-        from ..plugins.loader import get_arch_plugin
         from ..utils.yaml_utils import prepare_model_yaml
 
         if body.arch_plugin:
-            arch_plugin = get_arch_plugin(body.arch_plugin.strip().lower())
+            arch_plugin = resolve_arch_plugin(body.arch_plugin.strip().lower(), body.model_scale)
             if not arch_plugin:
                 raise HTTPException(status_code=404, detail=f"Arch plugin not found: {body.arch_plugin!r}")
         else:
             family_key = body.model_id[len("arch:"):]
             scale = (body.model_scale or "").strip().lower()
-            arch_key = f"{family_key}_{scale}" if scale else family_key
-            arch_plugin = get_arch_plugin(arch_key)
-            if arch_plugin is None and scale:
-                arch_plugin = get_arch_plugin(family_key)
+            arch_plugin = resolve_arch_plugin(family_key, scale)
             if arch_plugin is None:
+                arch_key = f"{family_key}_{scale}" if scale else family_key
                 raise HTTPException(status_code=404, detail=f"Arch plugin not found: {arch_key!r}")
 
         preflight_err = arch_plugin.preflight_check()
@@ -324,15 +364,7 @@ async def get_weight_info(weight_id: str):
 
     # Register arch plugin for custom models before loading .pt file
     weight_meta = weight_storage.load_weight_meta(weight_id)
-    model_id = weight_meta.get("model_id") if weight_meta else None
-    if model_id:
-        from ..services import model_storage
-        yaml_path = model_storage.load_model_yaml_path(model_id)
-        if yaml_path:
-            from ..plugins.loader import find_arch_for_yaml
-            arch_plugin = find_arch_for_yaml(str(yaml_path))
-            if arch_plugin:
-                arch_plugin.register_modules()
+    _register_arch_plugin_for_weight(weight_meta)
 
     try:
         from ultralytics import YOLO
@@ -404,9 +436,15 @@ async def rename_weight(weight_id: str, body: dict):
 async def inspect_keys(weight_id: str):
     """Return all state_dict keys grouped by node ID with shapes."""
     try:
+        weight_meta = weight_storage.load_weight_meta(weight_id)
+        _register_arch_plugin_for_weight(weight_meta)
         return weight_transfer.inspect_weight_keys(weight_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Weight '{weight_id}' not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/{weight_id}/extract", summary="Extract partial weights by node IDs")
