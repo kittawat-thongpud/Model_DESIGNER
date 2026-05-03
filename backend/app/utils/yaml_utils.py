@@ -40,12 +40,22 @@ def prepare_model_yaml(
     # 1. Determine Scale
     scales = yaml_data.get("scales", {})
     if scales:
+        # Build case-insensitive lookup (Mamba-YOLO uses T/B/L, YOLO uses n/s/m/l/x)
+        scales_lower = {k.lower(): k for k in scales.keys()}
+        
         if not scale:
             # Default to 'n' or first available
-            scale = "n" if "n" in scales else next(iter(scales))
+            scale = "n" if "n" in scales_lower else next(iter(scales_lower))
+        else:
+            scale = scale.lower()
+        
+        # Lookup original case key
+        original_key = scales_lower.get(scale)
+        if original_key is None:
+            raise ValueError(f"Scale '{scale}' not found in YAML. Available: {list(scales.keys())}")
         
         # Set explicit scale to suppress YOLO warning
-        yaml_data["scales"] = {scale: scales[scale]}
+        yaml_data["scales"] = {original_key: scales[original_key]}
         
         # Remove top-level depth_multiple/width_multiple — they take precedence over
         # scales in Ultralytics parse_model and prevent proper scale application
@@ -53,7 +63,7 @@ def prepare_model_yaml(
         yaml_data.pop("width_multiple", None)
         
         # Get scale params for manual patching
-        depth, width, max_channels = scales[scale]
+        depth, width, max_channels = scales[original_key]
     else:
         # No scales - likely user deleted them or old model
         width = 1.0
