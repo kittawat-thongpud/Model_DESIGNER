@@ -81,8 +81,37 @@ def _find_label_dir() -> Path | None:
     return None
 
 
+def _find_yolo_img_dir(split: str) -> Path | None:
+    for candidate in (_ROOT / "images" / split, DATASETS_DIR / "images" / split):
+        if has_images(candidate):
+            return candidate
+    return None
+
+
+def _find_yolo_label_dir(split: str) -> Path | None:
+    for candidate in (_ROOT / "labels" / split, DATASETS_DIR / "labels" / split):
+        if candidate.exists() and any(candidate.glob("*.txt")):
+            return candidate
+    return None
+
+
 def _has_yolo_ready_layout() -> bool:
-    return has_images(_ROOT / "images" / "train") or has_images(_ROOT / "images" / "val")
+    return _find_yolo_img_dir("train") is not None or _find_yolo_img_dir("val") is not None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def _link_or_copy_fresh(src: Path, dst: Path) -> None:
+    if _same_path(src, dst):
+        return
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    link_or_copy(src, dst)
 
 
 def _read_existing_split_stems(split: str) -> set[str] | None:
@@ -226,10 +255,10 @@ class KITTIPlugin(DatasetPlugin):
             "  training/label_2/*.txt\n"
             "  testing/image_2/*.png (optional)\n\n"
             "Ultralytics layout is also supported:\n"
-            "  images/train/*\n"
-            "  images/val/*\n"
-            "  labels/train/*.txt\n"
-            "  labels/val/*.txt"
+            "  kitti/images/train/* or images/train/*\n"
+            "  kitti/images/val/* or images/val/*\n"
+            "  kitti/labels/train/*.txt or labels/train/*.txt\n"
+            "  kitti/labels/val/*.txt or labels/val/*.txt"
         )
 
     def is_available(self) -> bool:
@@ -327,17 +356,34 @@ class KITTIPlugin(DatasetPlugin):
         split_paths: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
 
         for split in ("train", "val", "test"):
-            img_dir = _ROOT / "images" / split
-            label_dir = _ROOT / "labels" / split
-            for img_path in image_files(img_dir):
-                size = image_size(img_path)
+            img_dir = _find_yolo_img_dir(split)
+            if img_dir is None:
+                continue
+            label_dir = _find_yolo_label_dir(split)
+            dst_img_dir = _ROOT / "images" / split
+            dst_label_dir = _ROOT / "labels" / split
+            dst_img_dir.mkdir(parents=True, exist_ok=True)
+            dst_label_dir.mkdir(parents=True, exist_ok=True)
+
+            for src_img in image_files(img_dir):
+                dst_img = dst_img_dir / src_img.name
+                _link_or_copy_fresh(src_img, dst_img)
+
+                size = image_size(dst_img)
                 if size is None:
                     continue
                 img_w, img_h = size
-                anns = _parse_yolo_label_file(label_dir / f"{img_path.stem}.txt", img_w, img_h)
-                split_paths[split].append(img_path)
+
+                dst_label = dst_label_dir / f"{src_img.stem}.txt"
+                if label_dir is not None:
+                    src_label = label_dir / f"{src_img.stem}.txt"
+                    if src_label.exists():
+                        _link_or_copy_fresh(src_label, dst_label)
+
+                anns = _parse_yolo_label_file(dst_label, img_w, img_h)
+                split_paths[split].append(dst_img)
                 split_indices[split].append({
-                    "file": img_path.name,
+                    "file": dst_img.name,
                     "w": img_w,
                     "h": img_h,
                     "anns": anns,

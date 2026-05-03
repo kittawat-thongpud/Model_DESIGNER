@@ -96,6 +96,36 @@ def test_kitti_rebuilds_ultralytics_yolo_layout(tmp_path: Path, monkeypatch):
     assert torch.isfinite(target["boxes"]).all()
 
 
+def test_kitti_rebuilds_ultralytics_root_extracted_layout(tmp_path: Path, monkeypatch):
+    root = tmp_path / "kitti"
+    monkeypatch.setattr(kitti_mod, "DATASETS_DIR", tmp_path)
+    monkeypatch.setattr(kitti_mod, "_ROOT", root)
+    monkeypatch.setattr(kitti_mod, "_INDEX_DIR", root / "_index")
+
+    _write_image(tmp_path / "images" / "train" / "000001.png", size=(100, 50))
+    _write_image(tmp_path / "images" / "val" / "000002.png", size=(120, 60))
+    (tmp_path / "labels" / "train").mkdir(parents=True)
+    (tmp_path / "labels" / "val").mkdir(parents=True)
+    (tmp_path / "labels" / "train" / "000001.txt").write_text("0 0.500000 0.500000 0.400000 0.400000\n")
+    (tmp_path / "labels" / "val" / "000002.txt").write_text("3 0.250000 0.500000 0.200000 0.500000\n")
+    (tmp_path / "kitti.yaml").write_text("path: kitti\n")
+
+    plugin = kitti_mod.KITTIPlugin()
+    plugin.rebuild_index()
+
+    assert plugin.is_available()
+    assert (root / "images" / "train" / "000001.png").exists()
+    assert (root / "images" / "val" / "000002.png").exists()
+    assert (root / "labels" / "train" / "000001.txt").exists()
+    assert (root / "labels" / "val" / "000002.txt").exists()
+    assert plugin.scan_splits()["train"] == {"total": 1, "labeled": 1}
+    assert plugin.scan_splits()["val"] == {"total": 1, "labeled": 1}
+
+    _, target = plugin.wrap_for_training(plugin.load_train())[0]
+    assert target["labels"].tolist() == [0]
+    assert torch.isfinite(target["boxes"]).all()
+
+
 def test_cityscapes_rebuilds_polygon_boxes(tmp_path: Path, monkeypatch):
     root = tmp_path / "cityscapes"
     monkeypatch.setattr(city_mod, "_ROOT", root)
