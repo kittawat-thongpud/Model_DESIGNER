@@ -847,13 +847,24 @@ class CustomDetectionTrainer(DetectionTrainer):
             decoder.set_alpha(alpha)
         self._sync_hsg_detr_alpha_to_ema()
 
-        if self._hsg_alpha_last is None or abs(self._hsg_alpha_last - alpha) >= 0.009:
-            self._hsg_alpha_last = alpha
-            self.log(
-                f"HSG-DETR query saliency alpha set to {alpha:.3f} "
-                f"(target={self.HSG_ALPHA_TARGET:.3f})",
-                "INFO",
+        self._hsg_alpha_last = alpha
+        resume_text = ""
+        if (
+            self._hsg_alpha_resume_base is not None
+            and self._hsg_alpha_resume_epoch is not None
+            and self._hsg_alpha_resume_base < scheduled_alpha
+        ):
+            resume_text = (
+                f", resume_base={self._hsg_alpha_resume_base:.6f}, "
+                f"resume_epoch={self._hsg_alpha_resume_epoch}"
             )
+        self.log(
+            f"HSG-DETR query saliency alpha set to {alpha:.6f} "
+            f"(target={self.HSG_ALPHA_TARGET:.6f}, "
+            f"scheduled={scheduled_alpha:.6f}, progress={progress:.3f}"
+            f"{resume_text})",
+            "INFO",
+        )
 
     def _sync_hsg_detr_alpha_to_ema(self) -> None:
         """Keep the EMA decoder's scheduled alpha identical to the live model."""
