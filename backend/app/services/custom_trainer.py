@@ -848,6 +848,19 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._sync_hsg_detr_alpha_to_ema()
 
         self._hsg_alpha_last = alpha
+        if epoch <= self.HSG_ALPHA_START_EPOCH:
+            phase_text = (
+                f"hold_until_epoch={self.HSG_ALPHA_START_EPOCH}, "
+                "alpha updates start after this epoch"
+            )
+        elif progress < 1.0:
+            phase_text = (
+                f"warming_up over {self.HSG_ALPHA_WARMUP_EPOCHS} epochs "
+                f"from epoch {self.HSG_ALPHA_START_EPOCH}"
+            )
+        else:
+            phase_text = "target_reached"
+
         resume_text = ""
         if (
             self._hsg_alpha_resume_base is not None
@@ -862,7 +875,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             f"HSG-DETR query saliency alpha set to {alpha:.6f} "
             f"(target={self.HSG_ALPHA_TARGET:.6f}, "
             f"scheduled={scheduled_alpha:.6f}, progress={progress:.3f}"
-            f"{resume_text})",
+            f", phase={phase_text}{resume_text})",
             "INFO",
         )
 
