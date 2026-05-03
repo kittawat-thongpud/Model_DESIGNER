@@ -706,6 +706,7 @@ export interface BenchmarkResult {
   postprocess_ms: number;
   params: number | null;
   flops_gflops: number | null;
+  hsg_decoder_alpha?: Array<{ module: string; alpha: number | null }>;
   conf: number;
   iou: number;
   imgsz: number;

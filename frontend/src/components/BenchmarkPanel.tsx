@@ -27,6 +27,10 @@ const fmtMs = (v: number | null | undefined) =>
   isFiniteNumber(v) ? `${v.toFixed(1)} ms` : '—';
 const fmtSeconds = (v: number | null | undefined) =>
   isFiniteNumber(v) ? `${v.toFixed(0)}s` : '—';
+const fmtAlpha = (items: BenchmarkResult['hsg_decoder_alpha']) => {
+  const value = items?.find(item => isFiniteNumber(item.alpha))?.alpha;
+  return isFiniteNumber(value) ? value.toFixed(3) : '—';
+};
 
 function ConfusionMatrix({ data }: { data: { matrix: number[][]; names: string[] } }) {
   const { matrix, names } = data;
@@ -338,6 +342,12 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                       <span className="text-slate-500">Duration</span>
                       <span className="font-mono text-slate-300">{fmtSeconds(displayResult.elapsed_s)}</span>
                     </div>
+                    {(displayResult.hsg_decoder_alpha?.length ?? 0) > 0 && (
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-500">SGB Alpha</span>
+                        <span className="font-mono text-slate-300">{fmtAlpha(displayResult.hsg_decoder_alpha)}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
 

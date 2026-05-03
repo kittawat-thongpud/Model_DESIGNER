@@ -532,19 +532,23 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     def _ensure_runtime_attrs(self) -> None:
         """Backfill non-parameter buffers that old pickled checkpoints may lack."""
         alpha = getattr(self, "alpha", None)
-        if isinstance(alpha, torch.Tensor):
+        if isinstance(alpha, torch.Tensor) and "alpha" in getattr(self, "_buffers", {}):
             return
 
         legacy_alpha_logit = getattr(self, "alpha_logit", None)
         if isinstance(legacy_alpha_logit, torch.Tensor):
             value = float(self.ALPHA_MAX) * torch.sigmoid(legacy_alpha_logit.detach().float())
             value = value.reshape(())
+        elif isinstance(alpha, torch.Tensor):
+            value = alpha.detach().float().reshape(())
         else:
             value = torch.tensor(0.0)
 
         if "alpha" in getattr(self, "_buffers", {}):
             self._buffers["alpha"] = value
         else:
+            if hasattr(self, "alpha"):
+                delattr(self, "alpha")
             self.register_buffer("alpha", value, persistent=True)
 
     def set_alpha(self, value: float) -> None:

@@ -774,10 +774,36 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for decoder in decoders:
             decoder.set_alpha(alpha)
+        self._sync_hsg_detr_alpha_to_ema()
 
         if self._hsg_alpha_last is None or abs(self._hsg_alpha_last - alpha) >= 0.049:
             self._hsg_alpha_last = alpha
             self.log(f"HSG-DETR query saliency alpha set to {alpha:.3f}", "INFO")
+
+    def _sync_hsg_detr_alpha_to_ema(self) -> None:
+        """Keep the EMA decoder's scheduled alpha identical to the live model."""
+        ema_model = getattr(getattr(self, "ema", None), "ema", None)
+        if ema_model is None:
+            return
+        try:
+            model = unwrap_model(self.model)
+            ema_model = unwrap_model(ema_model)
+        except Exception:
+            return
+
+        model_decoders = [
+            m for m in model.modules()
+            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "alpha")
+        ]
+        ema_decoders = [
+            m for m in ema_model.modules()
+            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "set_alpha")
+        ]
+        for src, dst in zip(model_decoders, ema_decoders):
+            try:
+                dst.set_alpha(float(src.alpha.detach().reshape(-1)[0]))
+            except Exception:
+                pass
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
@@ -805,6 +831,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._assert_batchnorm_buffers_finite("before EMA update")
         if self.ema:
             self.ema.update(self.model)
+            self._sync_hsg_detr_alpha_to_ema()
 
     def _handle_nonfinite_gradients(self, reason: str) -> None:
         """Log offending gradients and skip a bounded number of bad optimizer steps."""

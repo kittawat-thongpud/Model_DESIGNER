@@ -340,6 +340,34 @@ def _update_benchmark_failed(benchmark_id: str, error: str) -> None:
         pass
 
 
+def _collect_hsg_decoder_alpha(model) -> list[dict]:
+    """Collect RTDETRDecoderSGB alpha values from a loaded Ultralytics model."""
+    root = getattr(model, "model", model)
+    modules = getattr(root, "named_modules", None)
+    if not callable(modules):
+        return []
+
+    values: list[dict] = []
+    for name, module in modules():
+        if module.__class__.__name__ != "RTDETRDecoderSGB":
+            continue
+        ensure = getattr(module, "_ensure_runtime_attrs", None)
+        if callable(ensure):
+            try:
+                ensure()
+            except Exception:
+                pass
+        alpha = getattr(module, "alpha", None)
+        if alpha is None:
+            values.append({"module": name, "alpha": None})
+            continue
+        try:
+            values.append({"module": name, "alpha": float(alpha.detach().cpu().reshape(-1)[0])})
+        except Exception:
+            values.append({"module": name, "alpha": None})
+    return values
+
+
 def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> dict:
     """Blocking — runs in threadpool."""
     import sys
@@ -422,6 +450,7 @@ def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> di
             "This weight may have been created with an older version. "
             "Try re-creating the empty weight to regenerate the file."
         )
+    hsg_decoder_alpha = _collect_hsg_decoder_alpha(model)
 
     # Resolve device
     device = req.device
@@ -549,6 +578,7 @@ def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> di
         # Model info
         "params": params,
         "flops_gflops": round(flops_gflops, 3) if flops_gflops else None,
+        "hsg_decoder_alpha": hsg_decoder_alpha,
         # Config
         "conf": req.conf,
         "iou": req.iou,
