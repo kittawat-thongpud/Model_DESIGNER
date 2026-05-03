@@ -524,8 +524,32 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         )
         self.register_buffer("alpha", torch.tensor(0.0), persistent=True)
 
+    def __setstate__(self, state: dict) -> None:
+        """Restore scheduled-alpha buffer for checkpoints saved before it existed."""
+        super().__setstate__(state)
+        self._ensure_runtime_attrs()
+
+    def _ensure_runtime_attrs(self) -> None:
+        """Backfill non-parameter buffers that old pickled checkpoints may lack."""
+        alpha = getattr(self, "alpha", None)
+        if isinstance(alpha, torch.Tensor):
+            return
+
+        legacy_alpha_logit = getattr(self, "alpha_logit", None)
+        if isinstance(legacy_alpha_logit, torch.Tensor):
+            value = float(self.ALPHA_MAX) * torch.sigmoid(legacy_alpha_logit.detach().float())
+            value = value.reshape(())
+        else:
+            value = torch.tensor(0.0)
+
+        if "alpha" in getattr(self, "_buffers", {}):
+            self._buffers["alpha"] = value
+        else:
+            self.register_buffer("alpha", value, persistent=True)
+
     def set_alpha(self, value: float) -> None:
         """Set saliency query-selection strength for external warmup schedules."""
+        self._ensure_runtime_attrs()
         value = max(0.0, min(float(value), float(self.ALPHA_MAX)))
         self.alpha.fill_(value)
 
@@ -573,6 +597,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         activation energy so queries are biased toward spatially salient
         regions identified by the upstream SGB encoder.
         """
+        self._ensure_runtime_attrs()
         bs = feats.shape[0]
         if self.dynamic or self.shapes != shapes:
             self.anchors, self.valid_mask = self._generate_anchors(
@@ -660,6 +685,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
 
     def forward(self, x: list[torch.Tensor], batch: dict | None = None) -> tuple | torch.Tensor:
         """RT-DETR forward with a safer decoder refinement loop for early training."""
+        self._ensure_runtime_attrs()
         from ultralytics.models.utils.ops import get_cdn_group
 
         feats, shapes = self._get_encoder_input(x)

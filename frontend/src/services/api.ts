@@ -271,7 +271,7 @@ export const api = {
   },
   getWeightGroups: (id: string) => get<WeightGroup[]>(`/api/weights/${id}/groups`),
   getWeightGroupsAnnotated: (id: string, modelId?: string) =>
-    get<(WeightGroup & { node_label?: string })[]>(`/api/weights/${id}/groups-annotated${modelId ? `?model_id=${modelId}` : ''}`),
+    get<(WeightGroup & { node_label?: string })[]>(`/api/weights/${id}/groups-annotated${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`),
   autoMapWeights: (targetId: string, sourceId: string) =>
     post<MappingPreview>(`/api/weights/${targetId}/auto-map`, { source_weight_id: sourceId }),
   applyWeightMap: (targetId: string, sourceId: string, mapping: MappingKey[], freezeNodeIds: string[]) =>

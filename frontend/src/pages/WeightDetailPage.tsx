@@ -83,7 +83,7 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
   const [analysis, setAnalysis] = useState<Record<string, unknown>[]>([]);
   const [lineage, setLineage] = useState<WeightRecord[]>([]);
   const [weightKeys, setWeightKeys] = useState<{key: string; node_id: string; shape: number[]; dtype: string; numel: number}[]>([]);
-  const [weightGroups, setWeightGroups] = useState<{prefix: string; module_type: string; param_count: number; keys: {key: string; shape: number[]; dtype: string}[]}[]>([]);
+  const [weightGroups, setWeightGroups] = useState<{prefix: string; module_type: string; node_label?: string; param_count: number; keys: {key: string; shape: number[]; dtype: string}[]}[]>([]);
   const [weightInfo, setWeightInfo] = useState<{params: number; gflops: number | null} | null>(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'metrics' | 'layers' | 'code' | 'benchmark'>('overview');
   const [loading, setLoading] = useState(true);
@@ -133,14 +133,16 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
       }
       // Load model graph for architecture
       if (w.model_id) {
-        api.loadModel(w.model_id).then((m) => setGraph(m as unknown as Record<string, unknown>)).catch(() => {});
+        api.loadModel(w.model_id).then((m) => setGraph(((m.yaml_def as any)?._graph ?? m.yaml_def ?? m) as Record<string, unknown>)).catch(() => {});
       }
       // Load lineage chain
       api.getWeightLineage(w.weight_id).then(setLineage).catch(() => {});
       // Load weight keys for architecture tab
       api.inspectWeightKeys(w.weight_id).then(setWeightKeys).catch(() => {});
-      // Load weight groups (for module_type tags)
-      api.getWeightGroups(w.weight_id).then(setWeightGroups).catch(() => {});
+      // Load annotated weight groups (module tags + YAML/arch layer labels)
+      api.getWeightGroupsAnnotated(w.weight_id, w.model_id)
+        .then(setWeightGroups)
+        .catch(() => api.getWeightGroups(w.weight_id).then(setWeightGroups).catch(() => {}));
       // Load weight info (params + GFLOPs) — lazy, only used in Architecture tab
       api.getWeightInfo(w.weight_id).then(setWeightInfo).catch(() => {});
     }).catch(() => {}).finally(() => setLoading(false));
@@ -446,7 +448,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
             // Fall back to 1-level if all keys share the same top-level prefix
             const getPrefix = (key: string) => {
               const parts = key.split('.');
-              if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+              if (parts[0] === 'model' && parts.length >= 2) return `${parts[0]}.${parts[1]}`;
               return parts[0];
             };
             const nodeMap = new Map<string, {keys: typeof weightKeys; params: number}>();
@@ -461,7 +463,20 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
             const totalP = weightKeys.reduce((s, k) => s + k.numel, 0);
             // Build module_type lookup from groups
             const moduleTypeMap = new Map<string, string>();
-            for (const g of weightGroups) moduleTypeMap.set(g.prefix, g.module_type);
+            const nodeLabelMap = new Map<string, string>();
+            const addGroupAlias = (prefix: string, moduleType: string, label?: string) => {
+              moduleTypeMap.set(prefix, moduleType);
+              if (label) nodeLabelMap.set(prefix, label);
+              if (prefix.startsWith('model.')) {
+                const bare = prefix.slice('model.'.length);
+                moduleTypeMap.set(bare, moduleType);
+                if (label) nodeLabelMap.set(bare, label);
+              } else if (/^\d+$/.test(prefix)) {
+                moduleTypeMap.set(`model.${prefix}`, moduleType);
+                if (label) nodeLabelMap.set(`model.${prefix}`, label);
+              }
+            };
+            for (const g of weightGroups) addGroupAlias(g.prefix, g.module_type, g.node_label);
 
             return (
               <div className="space-y-4">
@@ -501,7 +516,8 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                           ).join(' ');
                           const dtypes = [...new Set(info.keys.map(k => k.dtype.replace('torch.', '')))].join(', ');
                           const pct = totalP > 0 ? (info.params / totalP) * 100 : 0;
-                          const moduleType = moduleTypeMap.get(nodeId.split('.')[0]) ?? '';
+                          const moduleType = moduleTypeMap.get(nodeId) ?? moduleTypeMap.get(nodeId.split('.')[0]) ?? '';
+                          const nodeLabel = nodeLabelMap.get(nodeId) ?? nodeLabelMap.get(nodeId.split('.')[0]) ?? '';
                           return (
                             <tr key={nodeId} className="hover:bg-slate-800/30 transition-colors group">
                               <td className="px-5 py-2.5">
@@ -509,6 +525,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                                   <span className="text-white font-semibold font-mono">{nodeId}</span>
                                   {moduleType && <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-400">{moduleType}</span>}
                                 </div>
+                                {nodeLabel && <div className="mt-1 text-[10px] text-cyan-300/80 font-sans">{nodeLabel}</div>}
                               </td>
                               <td className="px-5 py-2.5 text-slate-400">{info.keys.length}</td>
                               <td className="px-5 py-2.5">

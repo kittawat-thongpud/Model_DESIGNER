@@ -68,6 +68,60 @@ def _register_arch_plugin_for_weight(weight_meta: dict | None) -> None:
         )
 
 
+def _load_model_record_for_annotation(model_id: str) -> dict | None:
+    """Load saved or arch-plugin model metadata for weight group labels."""
+    record = model_storage.load_model(model_id)
+    if record:
+        return record
+    if not str(model_id).startswith("arch:"):
+        return None
+
+    discover_plugins()
+    arch_plugin = resolve_arch_plugin(model_id)
+    if arch_plugin is None:
+        return None
+
+    from ..services.yaml_to_graph import yaml_to_graph
+
+    yaml_text = arch_plugin.yaml_path().read_text(encoding="utf-8")
+    return {
+        "model_id": model_id,
+        "name": arch_plugin.display_name,
+        "task": arch_plugin.task_type,
+        "yaml_def": yaml_to_graph(yaml_text),
+    }
+
+
+def _build_layer_label_map(model_id: str | None) -> dict[str, str]:
+    """Build state_dict-prefix to YAML-module labels for saved and plugin models."""
+    if not model_id:
+        return {}
+
+    try:
+        record = _load_model_record_for_annotation(model_id)
+    except Exception:
+        return {}
+    if not record:
+        return {}
+
+    yaml_def = record.get("yaml_def", {}) or {}
+    label_map: dict[str, str] = {}
+    idx = 0
+    for section in ("backbone", "head"):
+        for layer in yaml_def.get(section, []):
+            module = ""
+            if isinstance(layer, dict):
+                module = str(layer.get("module") or "")
+            elif isinstance(layer, (list, tuple)) and len(layer) >= 3:
+                module = str(layer[2])
+            if module:
+                label_map[str(idx)] = module
+                label_map[f"model.{idx}"] = module
+            idx += 1
+
+    return label_map
+
+
 @router.post("/create-empty", summary="Create an empty weight from a model")
 async def create_empty_weight(body: CreateEmptyRequest):
     """Generate a weight file from a model architecture or official YOLO checkpoint.
@@ -546,23 +600,10 @@ async def get_groups_annotated(weight_id: str, model_id: str | None = None):
         raise HTTPException(status_code=404, detail=f"Weight '{weight_id}' not found")
 
     # Build node label map + SubModel info from model graph
-    label_map: dict[str, str] = {}
+    label_map = _build_layer_label_map(model_id)
     submodel_ids: set[str] = set()
     # Map SubModel node_id → {child_node_id: {"type": ..., "label": ...}}
     submodel_child_info: dict[str, dict[str, dict]] = {}
-    if model_id:
-        try:
-            record = model_storage.load_model(model_id)
-            if record:
-                yaml_def = record.get("yaml_def", {})
-                # Build label map from YAML layers
-                for section in ("backbone", "head"):
-                    for i, layer in enumerate(yaml_def.get(section, [])):
-                        if isinstance(layer, dict):
-                            module = layer.get("module", "")
-                            label_map[f"model.{i}"] = module
-        except Exception:
-            pass  # model not found or corrupt — proceed without labels
 
     # Annotate groups + expand SubModel groups into nested children
     annotated = []
