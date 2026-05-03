@@ -27,7 +27,9 @@ def test_driving_plugins_are_discovered():
         plugin = get_dataset_plugin(name)
         assert plugin is not None
         assert plugin.task_type == "detection"
-        assert plugin.manual_download is True
+    assert get_dataset_plugin("kitti").manual_download is False
+    assert get_dataset_plugin("cityscapes").manual_download is True
+    assert get_dataset_plugin("bdd100k").manual_download is True
 
 
 def test_kitti_rebuilds_yolo_ready_layout(tmp_path: Path, monkeypatch):
@@ -64,6 +66,34 @@ def test_kitti_rebuilds_yolo_ready_layout(tmp_path: Path, monkeypatch):
     _, target = plugin.wrap_for_training(raw)[0]
     assert torch.isfinite(target["boxes"]).all()
     assert int(target["labels"][0]) in range(plugin.num_classes)
+
+
+def test_kitti_rebuilds_ultralytics_yolo_layout(tmp_path: Path, monkeypatch):
+    root = tmp_path / "kitti"
+    monkeypatch.setattr(kitti_mod, "_ROOT", root)
+    monkeypatch.setattr(kitti_mod, "_INDEX_DIR", root / "_index")
+
+    _write_image(root / "images" / "train" / "000001.png", size=(100, 50))
+    _write_image(root / "images" / "val" / "000002.png", size=(120, 60))
+    (root / "labels" / "train").mkdir(parents=True)
+    (root / "labels" / "val").mkdir(parents=True)
+    (root / "labels" / "train" / "000001.txt").write_text("0 0.500000 0.500000 0.400000 0.400000\n")
+    (root / "labels" / "val" / "000002.txt").write_text("3 0.250000 0.500000 0.200000 0.500000\n")
+
+    plugin = kitti_mod.KITTIPlugin()
+    plugin.rebuild_index()
+
+    assert plugin.is_available()
+    splits = plugin.scan_splits()
+    assert splits["train"] == {"total": 1, "labeled": 1}
+    assert splits["val"] == {"total": 1, "labeled": 1}
+    assert (root / "train.txt").exists()
+    assert (root / "val.txt").exists()
+    assert (root / "images" / "train" / "000001.png").exists()
+
+    _, target = plugin.wrap_for_training(plugin.load_train())[0]
+    assert target["labels"].tolist() == [0]
+    assert torch.isfinite(target["boxes"]).all()
 
 
 def test_cityscapes_rebuilds_polygon_boxes(tmp_path: Path, monkeypatch):

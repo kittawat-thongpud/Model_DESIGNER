@@ -1,6 +1,7 @@
 """KITTI Object Detection dataset plugin.
 
-Manual-only plugin for the official KITTI object detection archives:
+Supports the Ultralytics YOLO-ready KITTI package for auto setup, while still
+accepting the official KITTI object detection archive layout:
 ``data_object_image_2.zip`` and ``data_object_label_2.zip``.
 """
 from __future__ import annotations
@@ -31,6 +32,7 @@ from ._driving_common import (
 _ROOT = DATASETS_DIR / "kitti"
 _INDEX_DIR = _ROOT / "_index"
 _INDEX_VERSION = 1
+_KITTI_ZIP = "https://github.com/ultralytics/assets/releases/download/v0.0.0/kitti.zip"
 
 _CLASSES = [
     "car",
@@ -79,6 +81,10 @@ def _find_label_dir() -> Path | None:
     return None
 
 
+def _has_yolo_ready_layout() -> bool:
+    return has_images(_ROOT / "images" / "train") or has_images(_ROOT / "images" / "val")
+
+
 def _read_existing_split_stems(split: str) -> set[str] | None:
     txt = _ROOT / f"{split}.txt"
     if not txt.exists():
@@ -123,6 +129,34 @@ def _parse_label_file(path: Path, img_w: int, img_h: int) -> list[dict]:
         if w <= 0 or h <= 0:
             continue
         anns.append({"bbox": [x1, y1, w, h], "category_id": _CLASS_MAP[cls_name]})
+    return anns
+
+
+def _parse_yolo_label_file(path: Path, img_w: int, img_h: int) -> list[dict]:
+    anns: list[dict] = []
+    if not path.exists():
+        return anns
+    for line in path.read_text().splitlines():
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            cls_id = int(float(parts[0]))
+            cx, cy, bw, bh = (float(v) for v in parts[1:5])
+        except ValueError:
+            continue
+        if cls_id < 0 or cls_id >= len(_CLASSES) or bw <= 0 or bh <= 0:
+            continue
+        x = (cx - bw / 2.0) * img_w
+        y = (cy - bh / 2.0) * img_h
+        w = bw * img_w
+        h = bh * img_h
+        x = max(0.0, min(float(img_w), x))
+        y = max(0.0, min(float(img_h), y))
+        w = max(0.0, min(float(img_w) - x, w))
+        h = max(0.0, min(float(img_h) - y, h))
+        if w > 0 and h > 0:
+            anns.append({"bbox": [x, y, w, h], "category_id": cls_id})
     return anns
 
 
@@ -177,18 +211,25 @@ class KITTIPlugin(DatasetPlugin):
 
     @property
     def manual_download(self) -> bool:
-        return True
+        return False
 
     @property
     def upload_instructions(self) -> str:
         return (
+            "Auto setup downloads the Ultralytics KITTI package.\n\n"
+            "Manual alternative:\n"
             "1. Go to https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=2d\n"
             "2. Download the official object detection image and label archives\n"
             "3. Upload data_object_image_2.zip and data_object_label_2.zip, or place both extracted folders in data/datasets/kitti/\n"
             "\nExpected source layout:\n"
             "  training/image_2/*.png\n"
             "  training/label_2/*.txt\n"
-            "  testing/image_2/*.png (optional)"
+            "  testing/image_2/*.png (optional)\n\n"
+            "Ultralytics layout is also supported:\n"
+            "  images/train/*\n"
+            "  images/val/*\n"
+            "  labels/train/*.txt\n"
+            "  labels/val/*.txt"
         )
 
     def is_available(self) -> bool:
@@ -217,6 +258,10 @@ class KITTIPlugin(DatasetPlugin):
         if _INDEX_DIR.exists():
             shutil.rmtree(_INDEX_DIR)
         _INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+        if _has_yolo_ready_layout():
+            self._rebuild_yolo_ready_index()
+            return
 
         src_train = _find_img_dir("train")
         label_dir = _find_label_dir()
@@ -277,6 +322,36 @@ class KITTIPlugin(DatasetPlugin):
             with self._lock:
                 self._indices[split] = index
 
+    def _rebuild_yolo_ready_index(self) -> None:
+        split_indices: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
+        split_paths: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+
+        for split in ("train", "val", "test"):
+            img_dir = _ROOT / "images" / split
+            label_dir = _ROOT / "labels" / split
+            for img_path in image_files(img_dir):
+                size = image_size(img_path)
+                if size is None:
+                    continue
+                img_w, img_h = size
+                anns = _parse_yolo_label_file(label_dir / f"{img_path.stem}.txt", img_w, img_h)
+                split_paths[split].append(img_path)
+                split_indices[split].append({
+                    "file": img_path.name,
+                    "w": img_w,
+                    "h": img_h,
+                    "anns": anns,
+                })
+
+        for split, index in split_indices.items():
+            index.sort(key=lambda e: e["file"])
+            (_INDEX_DIR / f"{split}_index.json").write_text(
+                json.dumps({"version": _INDEX_VERSION, "images": index}, separators=(",", ":"))
+            )
+            write_split_txt(_ROOT, split, sorted(split_paths[split]))
+            with self._lock:
+                self._indices[split] = index
+
     def scan_splits(self) -> dict[str, dict]:
         return {
             split: {
@@ -287,10 +362,29 @@ class KITTIPlugin(DatasetPlugin):
         }
 
     def download(self, state: dict) -> None:
-        raise NotImplementedError(
-            "KITTI requires manual download from the official KITTI website. "
-            "Please upload the official object detection archives."
+        from app.utils.download import download_and_extract
+
+        state.setdefault("files", {})
+        state["message"] = "Downloading KITTI..."
+        state["progress"] = 0
+
+        download_and_extract(
+            _KITTI_ZIP,
+            str(DATASETS_DIR),
+            state,
+            "KITTI",
+            file_key="kitti.zip",
         )
+
+        state["message"] = "Building KITTI index..."
+        state["progress"] = 90
+        self.rebuild_index()
+
+        if not self.is_available():
+            raise RuntimeError("KITTI download completed, but no train split was detected.")
+
+        state["message"] = "Complete"
+        state["progress"] = 100
 
     def clear_data(self) -> list[str]:
         deleted = []
