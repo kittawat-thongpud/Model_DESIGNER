@@ -368,6 +368,29 @@ def _collect_hsg_decoder_alpha(model) -> list[dict]:
     return values
 
 
+def _isolated_weight_benchmark_error(meta: dict) -> str | None:
+    source_type = str(meta.get("source_type") or "").lower()
+    if source_type not in {"rtdetrv2", "dino"}:
+        return None
+
+    model_name = meta.get("model_name") or meta.get("weight_id") or "this weight"
+    key_count = int(meta.get("key_count") or 0)
+    if key_count <= 0:
+        return (
+            f"{model_name} is an empty {source_type} profile placeholder, not a trained model checkpoint. "
+            "Run training first, then benchmark the produced trained weight."
+        )
+    if source_type == "dino":
+        return (
+            f"{model_name} is a DINO self-supervised backbone checkpoint. "
+            "The detection benchmark endpoint only supports detector checkpoints."
+        )
+    return (
+        f"{model_name} is an RT-DETRv2 upstream checkpoint. "
+        "This benchmark endpoint currently loads Ultralytics-compatible detector checkpoints only."
+    )
+
+
 def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> dict:
     """Blocking — runs in threadpool."""
     import sys
@@ -409,6 +432,9 @@ def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> di
     meta = weight_storage.load_weight_meta(req.weight_id)
     if not meta:
         raise ValueError(f"Weight '{req.weight_id}' not found")
+    isolated_error = _isolated_weight_benchmark_error(meta)
+    if isolated_error:
+        raise ValueError(isolated_error)
 
     pt_path = weight_storage.weight_pt_path(req.weight_id)
     if not pt_path.exists():
