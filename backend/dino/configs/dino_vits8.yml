@@ -7,4 +7,5 @@ upstream_repo: https://github.com/facebookresearch/dino
 arch: vit_small
 patch_size: 8
 hub_model: dino_vits8
+checkpoint_url: https://dl.fbaipublicfiles.com/dino/dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth
 task: self_supervised

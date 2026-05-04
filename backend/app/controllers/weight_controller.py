@@ -127,6 +127,33 @@ def _is_isolated_arch_plugin(arch_plugin) -> bool:
     return getattr(arch_plugin, "family", "") in {"rtdetrv2", "dino"}
 
 
+def _count_tensors(obj) -> tuple[int, int]:
+    """Return (tensor_count, parameter_count) for nested checkpoint-like data."""
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    if torch is not None and isinstance(obj, torch.Tensor):
+        return 1, int(obj.numel())
+    if isinstance(obj, dict):
+        counts = [_count_tensors(v) for v in obj.values()]
+    elif isinstance(obj, (list, tuple)):
+        counts = [_count_tensors(v) for v in obj]
+    else:
+        return 0, 0
+    return sum(c for c, _ in counts), sum(p for _, p in counts)
+
+
+def _load_arch_metadata(arch_plugin) -> dict:
+    try:
+        import yaml as _yaml
+
+        return _yaml.safe_load(arch_plugin.yaml_path().read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
 def _create_isolated_arch_weight(*, arch_plugin, body: CreateEmptyRequest, torch):
     """Create a metadata/checkpoint placeholder for non-Ultralytics arch plugins."""
     _scale_upper = (arch_plugin.scale or "").upper()
@@ -137,46 +164,78 @@ def _create_isolated_arch_weight(*, arch_plugin, body: CreateEmptyRequest, torch
     display_name = body.name.strip() if body.name.strip() else default_name
     model_id_meta = f"arch:{arch_plugin.family}"
 
+    arch_meta = _load_arch_metadata(arch_plugin)
+    checkpoint_url = str(arch_meta.get("checkpoint_url") or "")
+    pretrained_label = "pretrained" if body.use_pretrained else "empty"
+
     weight_id = weight_storage.save_weight_meta(
         model_id=model_id_meta,
         model_name=display_name,
         job_id=None,
-        dataset="(empty)",
+        dataset="COCO (pretrained)" if (body.use_pretrained and arch_plugin.family == "rtdetrv2") else (
+            "ImageNet/DINO (pretrained)" if body.use_pretrained else "(empty)"
+        ),
         epochs_trained=0,
         final_accuracy=None,
         final_loss=None,
         model_scale=arch_plugin.scale,
     )
     pt_path = weight_storage.weight_pt_path(weight_id)
-    ckpt = {
-        "model": {},
-        "epoch": -1,
-        "optimizer": None,
-        "train_args": {
-            "model_arch": arch_plugin.name,
-            "arch_family": arch_plugin.family,
-            "model_scale": arch_plugin.scale,
-        },
-        "source_type": arch_plugin.family,
-        "date": None,
-        "version": None,
+    train_args = {
+        "model_arch": arch_plugin.name,
+        "arch_family": arch_plugin.family,
+        "model_scale": arch_plugin.scale,
+        "checkpoint_url": checkpoint_url or None,
     }
-    torch.save(ckpt, str(pt_path))
+    if body.use_pretrained:
+        if not checkpoint_url:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No pretrained checkpoint URL is registered for {arch_plugin.name}",
+            )
+        try:
+            ckpt = torch.hub.load_state_dict_from_url(
+                checkpoint_url,
+                map_location="cpu",
+                progress=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download pretrained checkpoint for {arch_plugin.name}: {exc}",
+            )
+        torch.save(ckpt, str(pt_path))
+    else:
+        ckpt = {
+            "model": {},
+            "epoch": -1,
+            "optimizer": None,
+            "train_args": train_args,
+            "source_type": arch_plugin.family,
+            "date": None,
+            "version": None,
+        }
+        torch.save(ckpt, str(pt_path))
+
+    key_count, param_count = _count_tensors(ckpt)
 
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
         meta.update(
             {
                 "file_size_bytes": pt_path.stat().st_size,
-                "key_count": 0,
-                "param_count": 0,
+                "key_count": key_count,
+                "param_count": param_count,
                 "arch_plugin": arch_plugin.name,
                 "model_arch": arch_plugin.name,
                 "source_type": arch_plugin.family,
-                "train_args": ckpt["train_args"],
+                "checkpoint_url": checkpoint_url or None,
+                "pretrained": bool(body.use_pretrained),
+                "train_args": train_args,
                 "note": (
                     f"{arch_plugin.family_display_name} trains through an isolated upstream runner; "
-                    "this empty weight is a Model Designer profile placeholder."
+                    f"this is a {pretrained_label} Model Designer profile"
+                    + (" with an upstream checkpoint." if body.use_pretrained else " placeholder.")
                 ),
             }
         )
@@ -189,7 +248,7 @@ def _create_isolated_arch_weight(*, arch_plugin, body: CreateEmptyRequest, torch
         "weight_id": weight_id,
         "model_id": model_id_meta,
         "model_name": display_name,
-        "key_count": 0,
+        "key_count": key_count,
         "file_size_bytes": pt_path.stat().st_size,
     }
 

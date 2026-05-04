@@ -375,7 +375,7 @@ def _isolated_weight_benchmark_error(meta: dict) -> str | None:
 
     model_name = meta.get("model_name") or meta.get("weight_id") or "this weight"
     key_count = int(meta.get("key_count") or 0)
-    if key_count <= 0:
+    if key_count <= 0 or not meta.get("pretrained", False):
         return (
             f"{model_name} is an empty {source_type} profile placeholder, not a trained model checkpoint. "
             "Run training first, then benchmark the produced trained weight."
