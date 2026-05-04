@@ -325,6 +325,75 @@ def _resolve_checkpoint(value: str) -> Path | None:
     return None
 
 
+def _patch_config_imgsz(
+    upstream_config: Path, imgsz_hw: list[int], out_dir: Path
+) -> Path | None:
+    """Patch Resize ops and eval_spatial_size in upstream YAML for a custom imgsz.
+
+    If the image size is the default [640, 640] no patching is needed.
+    Returns the path to the patched YAML, or None if no patching was done.
+    """
+    if imgsz_hw == [640, 640]:
+        return None
+
+    cfg = _load_yaml_with_includes(upstream_config)
+    return _write_patched_yaml(cfg, imgsz_hw, out_dir)
+
+
+def _load_yaml_with_includes(file_path: Path, cfg: dict | None = None) -> dict:
+    """Load a YAML config, recursively resolving ``__include__`` directives."""
+    if cfg is None:
+        cfg = {}
+    with open(file_path) as f:
+        file_cfg = yaml.safe_load(f) or {}
+    for inc in file_cfg.get("__include__", []):
+        inc_path = file_path.parent / inc if not os.path.isabs(inc) else Path(inc)
+        if inc_path.exists():
+            _load_yaml_with_includes(inc_path, cfg)
+    # Merge file_cfg into cfg (file_cfg wins)
+    def _merge(dst: dict, src: dict) -> dict:
+        for k, v in src.items():
+            if k == "__include__":
+                continue
+            if k in dst and isinstance(dst[k], dict) and isinstance(v, dict):
+                _merge(dst[k], v)
+            else:
+                dst[k] = v
+        return dst
+    return _merge(cfg, file_cfg)
+
+
+def _write_patched_yaml(cfg: dict, imgsz_hw: list[int], out_dir: Path) -> Path:
+    """Mutate *cfg* in place and write to ``out_dir/config_patched.yml``."""
+
+    def _patch_transforms(ops: list | None) -> None:
+        if not isinstance(ops, list):
+            return
+        for op in ops:
+            if isinstance(op, dict) and op.get("type") == "Resize":
+                op["size"] = imgsz_hw
+
+    # Patch train/val dataloader transforms
+    for dl_key in ("train_dataloader", "val_dataloader"):
+        dl = cfg.get(dl_key)
+        if not isinstance(dl, dict):
+            continue
+        ds = dl.get("dataset")
+        if not isinstance(ds, dict):
+            continue
+        transforms = ds.get("transforms")
+        if isinstance(transforms, dict):
+            _patch_transforms(transforms.get("ops"))
+
+    cfg["eval_spatial_size"] = imgsz_hw
+
+    patched_path = out_dir / "config_patched.yml"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(patched_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    return patched_path
+
+
 def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
     """Parse RT-DETRv2 subprocess stdout and update job state.
 
@@ -409,6 +478,7 @@ def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
             "ram_gb": state.get("ram_gb"),
             "ram_total_gb": state.get("ram_total_gb"),
             "gpu_mem_gb": round(gpu_mem_mb / 1024, 2) if gpu_mem_mb else None,
+            "gpu_mem_reserved_gb": state.get("gpu_total_gb"),
             "total_elapsed_s": round(elapsed, 1) if elapsed else None,
             "epoch_elapsed_s": epoch_elapsed_s,
             "avg_epoch_s": avg_epoch_s,
@@ -600,6 +670,23 @@ def run_worker(payload: dict[str, Any]) -> None:
     resume_ckpt = _resolve_checkpoint(resume)
     pretrained_ckpt = _resolve_checkpoint(str(config.get("pretrained") or ""))
 
+    # ── Parse imgsz → [h, w] list ────────────────────────────────────────────
+    raw_imgsz = config.get("imgsz", 640)
+    if isinstance(raw_imgsz, (list, tuple)):
+        imgsz_hw = [int(x) for x in raw_imgsz]
+        if len(imgsz_hw) == 1:
+            imgsz_hw = [imgsz_hw[0], imgsz_hw[0]]
+    else:
+        imgsz_hw = [int(raw_imgsz), int(raw_imgsz)]
+    _log(f"Image size (h, w): {imgsz_hw}")
+
+    # ── Patch upstream YAML config to set correct Resize sizes ────────────────
+    # We load the config, patch Resize ops in train/val transforms, set
+    # eval_spatial_size, and write a patched YAML that train.py will use.
+    patched_config = _patch_config_imgsz(upstream_config, imgsz_hw, out_dir)
+    if patched_config is not None:
+        upstream_config = patched_config
+
     updates = [
         f"num_classes={nc}",
         "remap_mscoco_category=False",
@@ -612,6 +699,7 @@ def run_worker(payload: dict[str, Any]) -> None:
         f"val_dataloader.dataset.ann_file='{val_json}'",
         f"val_dataloader.total_batch_size={batch}",
         f"val_dataloader.num_workers={workers}",
+        f"eval_spatial_size={imgsz_hw}",
     ]
 
     cmd = [
@@ -669,10 +757,12 @@ def run_worker(payload: dict[str, Any]) -> None:
     # Detect device and RAM for progress reporting
     _device_str: str | None = None
     _ram_gb: float | None = None
+    _gpu_total_gb: float | None = None
     try:
         import torch as _torch
         if _torch.cuda.is_available():
             _device_str = _torch.cuda.get_device_name(0)
+            _gpu_total_gb = round(_torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 1)
         else:
             _device_str = "cpu"
     except Exception:
@@ -699,6 +789,7 @@ def run_worker(payload: dict[str, Any]) -> None:
         "device": _device_str,
         "ram_gb": _ram_gb,
         "ram_total_gb": _ram_total_gb,
+        "gpu_total_gb": _gpu_total_gb,
         "batch_size": batch,
         "_elapsed_fn": lambda: time.time() - started,
     }
