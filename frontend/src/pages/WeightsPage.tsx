@@ -547,6 +547,31 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                           <p className="text-[10px] text-slate-600">
                             Plugin: <span className="text-violet-400 font-mono">{fam.supported_scales.find(s => s.scale === effScale)?.plugin_name ?? ''}</span>
                           </p>
+                          {(fam.family === 'rtdetrv2' || fam.family === 'dino') && (
+                            <div className="flex items-center justify-between bg-slate-800/60 rounded-lg px-3 py-2.5">
+                              <div>
+                                <div className="text-xs text-white font-medium">Load Pretrained Weights</div>
+                                <div className="text-[10px] text-slate-500 mt-0.5">
+                                  {usePretrained
+                                    ? fam.family === 'dino'
+                                      ? 'Download official DINO pretrained backbone'
+                                      : 'Download official RT-DETRv2 COCO checkpoint'
+                                    : 'Create metadata profile only — no download'}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => setUsePretrained(v => !v)}
+                                className={`w-10 h-5.5 rounded-full relative transition-colors cursor-pointer shrink-0 ml-3 ${
+                                  usePretrained ? 'bg-amber-500' : 'bg-slate-600'
+                                }`}
+                                style={{ minWidth: '2.5rem', height: '1.375rem' }}
+                              >
+                                <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                                  usePretrained ? 'translate-x-5' : 'translate-x-0.5'
+                                }`} />
+                              </button>
+                            </div>
+                          )}
                         </>
                       );
                     })()}
@@ -639,7 +664,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                         const fam = archFamilies.find(f => f.family === pluginFamily);
                         const scaleEntry = fam?.supported_scales.find(s => s.scale === pluginScale);
                         if (scaleEntry) {
-                          await api.createEmptyWeight('', weightName, pluginScale, undefined, false, scaleEntry.plugin_name);
+                          await api.createEmptyWeight('', weightName, pluginScale, undefined, usePretrained, scaleEntry.plugin_name);
                         }
                       } else {
                         await api.createEmptyWeight(selectedModelId, weightName, createScale);

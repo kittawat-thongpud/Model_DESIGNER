@@ -25,11 +25,36 @@ from . import dataset_registry, dataset_yaml, event_bus, job_storage
 
 
 _SCALE_TO_SPEC = {
-    "vits16": {"arch": "vit_small", "patch_size": 16, "label": "ViT-S/16"},
-    "vits8": {"arch": "vit_small", "patch_size": 8, "label": "ViT-S/8"},
-    "vitb16": {"arch": "vit_base", "patch_size": 16, "label": "ViT-B/16"},
-    "vitb8": {"arch": "vit_base", "patch_size": 8, "label": "ViT-B/8"},
-    "resnet50": {"arch": "resnet50", "patch_size": 16, "label": "ResNet-50"},
+    "vits16": {
+        "arch": "vit_small",
+        "patch_size": 16,
+        "label": "ViT-S/16",
+        "checkpoint": "https://dl.fbaipublicfiles.com/dino/dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth",
+    },
+    "vits8": {
+        "arch": "vit_small",
+        "patch_size": 8,
+        "label": "ViT-S/8",
+        "checkpoint": "https://dl.fbaipublicfiles.com/dino/dino_deitsmall8_pretrain/dino_deitsmall8_pretrain.pth",
+    },
+    "vitb16": {
+        "arch": "vit_base",
+        "patch_size": 16,
+        "label": "ViT-B/16",
+        "checkpoint": "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth",
+    },
+    "vitb8": {
+        "arch": "vit_base",
+        "patch_size": 8,
+        "label": "ViT-B/8",
+        "checkpoint": "https://dl.fbaipublicfiles.com/dino/dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth",
+    },
+    "resnet50": {
+        "arch": "resnet50",
+        "patch_size": 16,
+        "label": "ResNet-50",
+        "checkpoint": "https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth",
+    },
 }
 
 
@@ -204,6 +229,19 @@ def _resolve_checkpoint(value: str) -> Path | None:
     return None
 
 
+def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
+    """Convert official DINO backbone weights into a restart checkpoint shape."""
+    import torch
+
+    raw = torch.hub.load_state_dict_from_url(url, map_location="cpu", progress=True)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Unexpected DINO checkpoint type from {url}: {type(raw).__name__}")
+
+    student = {f"module.backbone.{k}": v for k, v in raw.items()}
+    teacher = {f"backbone.{k}": v for k, v in raw.items()}
+    torch.save({"student": student, "teacher": teacher, "epoch": 0}, out_path)
+
+
 def _append_history_from_log(job_id: str, out_dir: Path) -> None:
     log_path = out_dir / "log.txt"
     if not log_path.exists():
@@ -330,6 +368,16 @@ def run_worker(payload: dict[str, Any]) -> None:
     if resume_ckpt is not None:
         shutil.copy2(resume_ckpt, out_dir / "checkpoint.pth")
         job_storage.append_job_log(job_id, "INFO", f"DINO resume checkpoint staged: {resume_ckpt}")
+    elif bool(config.get("use_yolo_pretrained", True)):
+        pretrained_url = str(spec.get("checkpoint") or "")
+        if pretrained_url:
+            staged = out_dir / "checkpoint.pth"
+            _stage_dino_backbone_pretrained(pretrained_url, staged)
+            job_storage.append_job_log(
+                job_id,
+                "INFO",
+                f"DINO official pretrained backbone staged: {pretrained_url}",
+            )
 
     cmd = [
         sys.executable,

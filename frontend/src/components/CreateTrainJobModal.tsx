@@ -715,8 +715,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                           )}
                         </div>
 
-                        {/* Training Mode for Official YOLO */}
-                        {selectedModelId?.startsWith('yolo:') && (
+                        {/* Training Mode for Official YOLO / upstream arch plugins */}
+                        {(selectedModelId?.startsWith('yolo:') || selectedArchFamily?.family === 'rtdetrv2' || selectedArchFamily?.family === 'dino') && (
                           <div className="col-span-2">
                             <label className="block text-xs font-medium text-amber-400 mb-1.5">Training Mode</label>
                             <div className="flex gap-3">
@@ -733,7 +733,13 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                                 />
                                 <div className="flex-1">
                                   <div className="text-sm font-medium text-white">Pretrained (Transfer Learning)</div>
-                                  <div className="text-xs text-slate-400 mt-0.5">Use COCO pretrained weights — faster convergence, better accuracy</div>
+                                  <div className="text-xs text-slate-400 mt-0.5">
+                                    {selectedArchFamily?.family === 'dino'
+                                      ? 'Use official DINO pretrained backbone — faster representation tuning'
+                                      : selectedArchFamily?.family === 'rtdetrv2'
+                                      ? 'Use official RT-DETRv2 COCO checkpoint — faster convergence'
+                                      : 'Use COCO pretrained weights — faster convergence, better accuracy'}
+                                  </div>
                                 </div>
                               </label>
                               <label className={`flex-1 flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all border-2 ${
