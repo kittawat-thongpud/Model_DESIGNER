@@ -340,7 +340,7 @@ def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
     job_storage.append_job_log(job_id, "INFO", text)
 
     # ── Epoch header / batch progress: "Epoch: [N]  [batch/total]" ──────────
-    m = re.match(r"Epoch:\s*\[(\d+)\]\s*\[(\d+)/(\d+)\]", text)
+    m = re.match(r"Epoch:\s*\[(\d+)\]\s*\[\s*(\d+)/(\d+)\]", text)
     if m:
         epoch_0 = int(m.group(1))
         epoch_1 = epoch_0 + 1
