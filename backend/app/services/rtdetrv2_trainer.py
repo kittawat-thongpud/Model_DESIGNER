@@ -105,19 +105,36 @@ def _label_path_for_image(image_path: Path) -> Path:
 
 def _image_size(path: Path) -> tuple[int, int]:
     path = _remap_dataset_path(path)
+    pil_error = None
     try:
         from PIL import Image
 
         with Image.open(path) as im:
             return im.size
-    except Exception:
-        import cv2
+    except Exception as exc:
+        pil_error = exc
 
+    try:
+        import cv2
         im = cv2.imread(str(path))
         if im is None:
-            raise RuntimeError(f"Could not read image size: {path}")
+            exists = path.exists()
+            size = path.stat().st_size if exists else None
+            raise RuntimeError(
+                f"Could not read image size: {path} "
+                f"(exists={exists}, bytes={size}, pil_error={pil_error})"
+            )
         h, w = im.shape[:2]
         return w, h
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        exists = path.exists()
+        size = path.stat().st_size if exists else None
+        raise RuntimeError(
+            f"Could not read image size: {path} "
+            f"(exists={exists}, bytes={size}, pil_error={pil_error}, cv2_error={exc})"
+        )
 
 
 def _normalise_names(names: Any) -> list[str]:
@@ -133,14 +150,19 @@ def _export_split_to_coco(
     *,
     out_json: Path,
     image_root: Path,
-) -> None:
+) -> int:
     images: list[dict[str, Any]] = []
     annotations: list[dict[str, Any]] = []
     ann_id = 1
+    skipped = 0
 
     for img_id, image_path in enumerate(image_paths, start=1):
         image_path = _remap_dataset_path(image_path)
-        width, height = _image_size(image_path)
+        try:
+            width, height = _image_size(image_path)
+        except RuntimeError:
+            skipped += 1
+            continue
         try:
             file_name = str(image_path.relative_to(image_root))
         except ValueError:
@@ -174,6 +196,7 @@ def _export_split_to_coco(
 
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps({"images": images, "annotations": annotations}), encoding="utf-8")
+    return skipped
 
 
 def _prepare_coco_dataset(job_id: str, data_yaml_path: Path, out_dir: Path) -> tuple[Path, Path, Path, int]:
@@ -194,13 +217,22 @@ def _prepare_coco_dataset(job_id: str, data_yaml_path: Path, out_dir: Path) -> t
     train_json = ann_dir / "instances_train.json"
     val_json = ann_dir / "instances_val.json"
 
-    _export_split_to_coco(train_paths, out_json=train_json, image_root=image_root)
-    _export_split_to_coco(val_paths, out_json=val_json, image_root=image_root)
+    skipped_train = _export_split_to_coco(train_paths, out_json=train_json, image_root=image_root)
+    skipped_val = _export_split_to_coco(val_paths, out_json=val_json, image_root=image_root)
 
     for p in (train_json, val_json):
         payload = json.loads(p.read_text(encoding="utf-8"))
+        if not payload.get("images"):
+            raise RuntimeError(f"No readable images exported for RT-DETRv2 from {p}")
         payload["categories"] = categories
         p.write_text(json.dumps(payload), encoding="utf-8")
+
+    if skipped_train or skipped_val:
+        job_storage.append_job_log(
+            job_id,
+            "WARNING",
+            f"RT-DETRv2 COCO export skipped unreadable images: train={skipped_train}, val={skipped_val}",
+        )
 
     job_storage.append_job_log(
         job_id,
