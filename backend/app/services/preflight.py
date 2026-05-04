@@ -141,8 +141,13 @@ def validate_train_request(
         result.fail(f"batch must be a positive integer, got: {batch!r}")
 
     imgsz = config.get("imgsz", 640)
-    if not isinstance(imgsz, int) or imgsz < 32:
-        result.fail(f"imgsz must be >= 32, got: {imgsz!r}")
+    if isinstance(imgsz, list):
+        if len(imgsz) not in (1, 2) or not all(isinstance(v, int) and v >= 32 for v in imgsz):
+            result.fail(f"imgsz list must contain 1 or 2 integers >= 32, got: {imgsz!r}")
+        elif any(v > imgsz_warn_threshold for v in imgsz):
+            result.warn(f"imgsz={imgsz} contains very large values and may cause OOM errors.")
+    elif not isinstance(imgsz, int) or imgsz < 32:
+        result.fail(f"imgsz must be an integer >= 32 or a list of [h, w], got: {imgsz!r}")
     elif imgsz > imgsz_warn_threshold:
         result.warn(f"imgsz={imgsz} is very large and may cause OOM errors.")
 

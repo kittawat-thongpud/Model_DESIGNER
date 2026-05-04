@@ -53,7 +53,7 @@ class TrainConfig(BaseModel):
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data: str = str(_training_default("data", ""))                     # path to data.yaml
-    imgsz: int = int(_training_default("imgsz", 640))
+    imgsz: int | list[int] = _training_default("imgsz", 640)
     batch: int = int(_training_default("batch", 16))
     workers: int = Field(default_factory=_default_train_workers)
     cache: Literal["auto", "ram", "disk", "none"] | bool = Field(default_factory=_default_train_cache)
