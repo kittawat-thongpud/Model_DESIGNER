@@ -61,12 +61,84 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
         return yaml_path
 
     fields = ["path", "train", "val", "test"]
+
+    def _remap_path_obj(p: Path) -> Path:
+        if p.exists():
+            return p
+        parts = p.parts
+        for i, part in enumerate(parts):
+            if part == "datasets" and i + 1 < len(parts):
+                for candidate in (
+                    DATA_DIR / Path(*parts[i:]),
+                    DATA_DIR / "datasets" / Path(*parts[i + 1:]),
+                ):
+                    if candidate.exists():
+                        return candidate
+        for i in range(1, len(parts)):
+            candidate = DATA_DIR / Path(*parts[i:])
+            if candidate.exists():
+                return candidate
+        return p
+
+    def _split_path_for_value(value: str) -> Path:
+        raw = value.split("#", 1)[0].strip()
+        p = Path(raw)
+        if p.is_absolute():
+            return _remap_path_obj(p)
+        root = _remap_path_obj(Path(str(data.get("path") or ".")))
+        return _remap_path_obj(root / p)
+
+    def _txt_has_stale_paths(txt_path: Path) -> bool:
+        if not txt_path.exists() or txt_path.suffix.lower() != ".txt":
+            return False
+        try:
+            for raw in txt_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                p = Path(line)
+                return p.is_absolute() and not p.exists() and _remap_path_obj(p).exists()
+        except Exception:
+            return False
+        return False
+
+    def _remap_txt_file(txt_path: Path) -> tuple[Path, bool]:
+        txt_path = _remap_path_obj(txt_path)
+        if not txt_path.exists() or txt_path.suffix.lower() != ".txt":
+            return txt_path, False
+        changed = False
+        lines_out: list[str] = []
+        try:
+            for raw in txt_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                p = Path(line)
+                remapped = _remap_path_obj(p) if p.is_absolute() else p
+                if str(remapped) != line:
+                    changed = True
+                lines_out.append(str(remapped))
+        except Exception:
+            return txt_path, False
+        if not changed:
+            return txt_path, False
+        tmp_txt = tempfile.NamedTemporaryFile(
+            mode="w", suffix=f"_{txt_path.stem}.txt", delete=False, dir=str(BENCHMARK_DIR)
+        )
+        tmp_txt.write("\n".join(lines_out) + "\n")
+        tmp_txt.flush()
+        tmp_txt.close()
+        return Path(tmp_txt.name), True
+
     needs_fix = False
     for field in fields:
         val = data.get(field)
         if val and isinstance(val, str):
             p = Path(val.split("#")[0].strip())
             if p.is_absolute() and not p.exists():
+                needs_fix = True
+                break
+            if field != "path" and _txt_has_stale_paths(_split_path_for_value(val)):
                 needs_fix = True
                 break
 
@@ -131,18 +203,8 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
             val = val.strip()
             comment = " #" + comment
         p = Path(val)
-        if not p.is_absolute() or p.exists():
-            return val + comment
-        parts = p.parts
-        for i, part in enumerate(parts):
-            if part == "datasets" and i + 1 < len(parts):
-                remapped = DATA_DIR / Path(*parts[i:])
-                return str(remapped) + comment
-        for i in range(1, len(parts)):
-            candidate = DATA_DIR / Path(*parts[i:])
-            if candidate.exists():
-                return str(candidate) + comment
-        return val + comment
+        remapped = _remap_path_obj(p) if p.is_absolute() else p
+        return str(remapped) + comment
 
     new_lines = []
     for line in content.splitlines():
@@ -150,8 +212,13 @@ def _rewrite_yaml_paths(yaml_path: Path) -> Path:
         for field in fields:
             if stripped.startswith(f"{field}:"):
                 after_colon = line.split(":", 1)[1].strip()
-                if after_colon and after_colon[0] == "/":
-                    remapped = _remap(after_colon)
+                if after_colon:
+                    remapped = _remap(after_colon) if after_colon[0] == "/" else after_colon
+                    if field != "path":
+                        txt_path = _split_path_for_value(remapped)
+                        remapped_txt, changed = _remap_txt_file(txt_path)
+                        if changed:
+                            remapped = str(remapped_txt)
                     line = f"{field}: {remapped}"
                 break
         new_lines.append(line)
