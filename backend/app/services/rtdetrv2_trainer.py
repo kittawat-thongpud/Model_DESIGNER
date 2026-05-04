@@ -349,38 +349,78 @@ def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
         total_epochs = state.get("total_epochs", 0)
         state["current_epoch"] = epoch_0
 
-        # Extract loss from same line: "loss: X.XXXX (Y.YYYY)"
-        loss_m = re.search(r"loss:\s*([\d.]+)", text)
-        loss_val = float(loss_m.group(1)) if loss_m else None
+        # Extract per-batch losses:  "loss_bbox: 0.2441 (0.6004)" → use running avg in ()
+        losses: dict[str, Any] = {}
+        for lk in ("loss_bbox", "loss_vfl", "loss_giou"):
+            # Prefer running average in parentheses: "loss_bbox: 0.2441 (0.6004)"
+            lm = re.search(rf"{lk}:\s*[\d.]+\s*\(([\d.]+)\)", text)
+            if not lm:
+                lm = re.search(rf"{lk}:\s*([\d.]+)", text)
+            if lm:
+                key_map = {"loss_bbox": "box", "loss_vfl": "cls", "loss_giou": "dfl"}
+                losses[key_map[lk]] = round(float(lm.group(1)), 4)
 
+        # Extract GPU memory: "max mem: 2296" (MB)
+        mem_m = re.search(r"max mem:\s*(\d+)", text)
+        gpu_mem_mb = int(mem_m.group(1)) if mem_m else None
+
+        # Extract per-batch time: "time: 0.0980"
+        time_m = re.search(r"time:\s*([\d.]+)", text)
+        batch_time_s = float(time_m.group(1)) if time_m else None
+
+        # Compute progress and timing
         pct = round(batch / max(total_batches, 1) * 100, 1)
+        elapsed = state.get("_elapsed_fn", lambda: 0.0)()
+
+        # Speed: images per second = batch_size / batch_time
+        imgs_per_sec = None
+        if batch_time_s and batch_time_s > 0:
+            batch_size = state.get("batch_size", 1)
+            imgs_per_sec = round(batch_size / batch_time_s, 1)
+
+        # Epoch time estimate from batch progress
+        epoch_elapsed_s = None
+        avg_epoch_s = None
+        eta_s = None
+        if batch_time_s and total_batches > 0:
+            epoch_elapsed_s = round(batch * batch_time_s, 1)
+            full_epoch_s = total_batches * batch_time_s
+            if epoch_0 > 0 and elapsed > 0:
+                avg_epoch_s = round(elapsed / epoch_0, 1)
+                eta_s = round(avg_epoch_s * (total_epochs - epoch_1), 0)
+            elif full_epoch_s > 0:
+                avg_epoch_s = round(full_epoch_s, 1)
+                eta_s = round(full_epoch_s * (total_epochs - epoch_0), 0)
+
         _set_job(
             job_id,
             epoch=epoch_1,
             message=f"Epoch {epoch_1}/{total_epochs} [{batch}/{total_batches}]",
         )
-        # Emit train-phase PROGRESS for SSE (rate-limited: only every 100 batches)
-        if batch % 100 == 0:
-            losses: dict[str, Any] = {}
-            # Extract individual losses from the line
-            for lk in ("loss_bbox", "loss_vfl", "loss_giou"):
-                lm = re.search(rf"{lk}:\s*([\d.]+)", text)
-                if lm:
-                    key_map = {"loss_bbox": "box", "loss_vfl": "cls", "loss_giou": "dfl"}
-                    losses[key_map[lk]] = round(float(lm.group(1)), 4)
-            job_storage.append_job_log(
-                job_id,
-                "PROGRESS",
-                f"Epoch {epoch_1}/{total_epochs} | {pct}% | Batch {batch}/{total_batches}",
-                {
-                    "type": "progress",
-                    "phase": "train",
-                    "epoch": f"{epoch_1}/{total_epochs}",
-                    "batch": f"{batch}/{total_batches}",
-                    "percent": pct,
-                    "losses": losses,
-                },
-            )
+        # Emit train-phase PROGRESS for SSE on every print_freq line
+        progress_data: dict[str, Any] = {
+            "type": "progress",
+            "phase": "train",
+            "epoch": f"{epoch_1}/{total_epochs}",
+            "batch": f"{batch}/{total_batches}",
+            "percent": pct,
+            "losses": losses,
+            "device": state.get("device"),
+            "ram_gb": state.get("ram_gb"),
+            "ram_total_gb": state.get("ram_total_gb"),
+            "gpu_mem_gb": round(gpu_mem_mb / 1024, 2) if gpu_mem_mb else None,
+            "total_elapsed_s": round(elapsed, 1) if elapsed else None,
+            "epoch_elapsed_s": epoch_elapsed_s,
+            "avg_epoch_s": avg_epoch_s,
+            "eta_s": eta_s,
+            "imgs_per_sec": imgs_per_sec,
+        }
+        job_storage.append_job_log(
+            job_id,
+            "PROGRESS",
+            f"Epoch {epoch_1}/{total_epochs} | {pct}% | Batch {batch}/{total_batches}",
+            progress_data,
+        )
         return
     # Epoch header without batch (just "Epoch: [N]")
     m2 = re.search(r"Epoch:\s*\[(\d+)\]", text)
@@ -618,6 +658,26 @@ def run_worker(payload: dict[str, Any]) -> None:
         bufsize=1,
     )
 
+    # Detect device and RAM for progress reporting
+    _device_str: str | None = None
+    _ram_gb: float | None = None
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _device_str = _torch.cuda.get_device_name(0)
+        else:
+            _device_str = "cpu"
+    except Exception:
+        pass
+    _ram_total_gb: float | None = None
+    try:
+        import psutil as _ps
+        _mem = _ps.virtual_memory()
+        _ram_gb = round(_mem.used / (1024 ** 3), 1)
+        _ram_total_gb = round(_mem.total / (1024 ** 3), 1)
+    except Exception:
+        pass
+
     # State shared across stdout parsing
     parse_state: dict[str, Any] = {
         "total_epochs": epochs,
@@ -627,6 +687,12 @@ def run_worker(payload: dict[str, Any]) -> None:
         "mAP50": None,
         "mAP50_95": None,
         "_log_txt_offset": 0,  # byte offset into log.txt
+        # Extra state for frontend progress widget
+        "device": _device_str,
+        "ram_gb": _ram_gb,
+        "ram_total_gb": _ram_total_gb,
+        "batch_size": batch,
+        "_elapsed_fn": lambda: time.time() - started,
     }
 
     def _poll_log_txt() -> None:
@@ -705,6 +771,8 @@ def run_worker(payload: dict[str, Any]) -> None:
                 pass
 
             # ── Emit PROGRESS log → log.jsonl → SSE via stream_controller ──
+            _avg_epoch_s = round(elapsed / epoch_1, 1) if epoch_1 > 0 else None
+            _eta_s = round(_avg_epoch_s * (epochs - epoch_1), 0) if _avg_epoch_s else None
             progress_data: dict[str, Any] = {
                 "type": "progress",
                 "phase": "validation_done",
@@ -719,14 +787,13 @@ def run_worker(payload: dict[str, Any]) -> None:
                 },
                 "val_map50": round(map50, 4) if map50 is not None else None,
                 "val_map": round(map50_95, 4) if map50_95 is not None else None,
+                "device": parse_state.get("device"),
+                "ram_gb": parse_state.get("ram_gb"),
+                "ram_total_gb": parse_state.get("ram_total_gb"),
                 "total_elapsed_s": round(elapsed, 1),
+                "avg_epoch_s": _avg_epoch_s,
+                "eta_s": _eta_s,
             }
-            # Compute timing estimates
-            if epoch_1 > 0:
-                avg_epoch_s = elapsed / epoch_1
-                eta_s = avg_epoch_s * (epochs - epoch_1)
-                progress_data["avg_epoch_s"] = round(avg_epoch_s, 1)
-                progress_data["eta_s"] = round(eta_s, 0)
 
             job_storage.append_job_log(
                 job_id,
