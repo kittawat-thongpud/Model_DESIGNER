@@ -504,6 +504,31 @@ def run_worker(payload: dict[str, Any]) -> None:
     except Exception:
         pass
     workers = min(workers, 4)
+
+    # Free GPU memory from any previous training in the parent process
+    # and auto-clamp batch based on available VRAM to prevent OOM.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_vram_gb = (torch.cuda.get_device_properties(0).total_memory
+                           - torch.cuda.memory_reserved(0)) / (1024 ** 3)
+            _log(f"GPU: {torch.cuda.get_device_name(0)}, free VRAM: {free_vram_gb:.1f} GB")
+            # RT-DETRv2 R18 (scale s) needs ~2 GB/batch at 640px
+            # R50/R101 need ~3-4 GB/batch
+            per_batch_gb = {"s": 1.5, "m": 2.5, "l": 3.0, "x": 3.5}.get(model_scale, 2.0)
+            model_overhead_gb = {"s": 2.0, "m": 4.0, "l": 5.0, "x": 6.0}.get(model_scale, 3.0)
+            safe_vram = free_vram_gb - model_overhead_gb - 1.0  # 1 GB safety margin
+            max_batch = max(1, int(safe_vram / per_batch_gb))
+            if batch > max_batch:
+                _log(f"Auto-clamping batch {batch} → {max_batch} (available {free_vram_gb:.1f} GB, "
+                     f"model overhead ~{model_overhead_gb} GB, ~{per_batch_gb} GB/sample)")
+                batch = max_batch
+    except Exception as e:
+        _log(f"GPU memory check skipped: {e}")
+
     epochs = int(config["epochs"] if config.get("epochs") is not None else 100)
     use_amp = bool(config.get("amp", True))
     use_pretrained = bool(config.get("use_yolo_pretrained", True))
