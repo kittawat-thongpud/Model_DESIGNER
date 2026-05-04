@@ -434,6 +434,13 @@ EOF
         # ── Uninstall conflicting packages ───────────────────────────────────
         echo "🧹 Removing existing torch/selective_scan to avoid conflicts..."
         pip uninstall -y torch torchvision torchaudio selective_scan 2>/dev/null || true
+
+        # Remove editable Mamba-YOLO ultralytics (v8.2.29) that shadows pip version
+        # The vendor copy registers itself as 'ultralytics' via pyproject.toml
+        if pip show ultralytics 2>/dev/null | grep -q "vendor/Mamba-YOLO"; then
+            echo "🧹 Removing editable Mamba-YOLO ultralytics (shadows pip version)..."
+            pip uninstall -y ultralytics 2>/dev/null || true
+        fi
         pip cache purge
 
         # ── Install PyTorch with cu128 index ─────────────────────────────────
