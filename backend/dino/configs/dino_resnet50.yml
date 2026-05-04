@@ -1,11 +1,11 @@
-# DINO ResNet-50 metadata for Model Designer plugin discovery.
-# Source: https://github.com/facebookresearch/dino
+# DINO ResNet-50 detector metadata for Model Designer plugin discovery.
+# Source: https://github.com/IDEA-Research/DINO
 
 family: dino
 scale: resnet50
-upstream_repo: https://github.com/facebookresearch/dino
-arch: resnet50
-patch_size: 16
-hub_model: dino_resnet50
-checkpoint_url: https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth
-task: self_supervised
+upstream_repo: https://github.com/IDEA-Research/DINO
+arch: dino_r50_4scale
+config: config/DINO/DINO_4scale.py
+checkpoint_url: https://huggingface.co/wdy413/DINO/resolve/main/checkpoint0011_4scale.pth
+task: object_detection
+benchmark_type: detector

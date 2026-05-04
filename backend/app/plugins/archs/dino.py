@@ -1,8 +1,8 @@
-"""Official facebookresearch/DINO architecture plugin.
+"""DINO architecture plugins.
 
-The upstream repo trains self-supervised visual backbones from ImageFolder
-data. This plugin is intentionally isolated from Ultralytics parser patches and
-from the Mamba-YOLO vendored RT-DETR code.
+``dino_resnet50`` is the IDEA-Research/DINO detector (DETR with denoising
+anchors) and supports COCO mAP benchmarking.  The ViT variants remain
+facebookresearch/DINO self-supervised backbones.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ _DINO_SCALES = {
     "vits8": ("ViT-S/8", "vit_small", 8, "dino_vits8.yml"),
     "vitb16": ("ViT-B/16", "vit_base", 16, "dino_vitb16.yml"),
     "vitb8": ("ViT-B/8", "vit_base", 8, "dino_vitb8.yml"),
-    "resnet50": ("ResNet-50", "resnet50", 16, "dino_resnet50.yml"),
+    "resnet50": ("R50-4scale", "dino_detector", 4, "dino_resnet50.yml"),
 }
 
 
@@ -53,17 +53,27 @@ class DINOPlugin(ModelArchPlugin):
     @property
     def scale_label(self) -> str:
         label, arch, patch_size, _ = _DINO_SCALES[self._scale]
+        if self._scale == "resnet50":
+            return "ResNet-50 4-scale detector"
         if arch.startswith("vit_"):
             return f"{label} ({arch}, patch {patch_size})"
         return label
 
     @property
     def task_type(self) -> str:
+        if self._scale == "resnet50":
+            return "detect"
         return "classify"
 
     @property
     def description(self) -> str:
         label, arch, patch_size, _ = _DINO_SCALES[self._scale]
+        if self._scale == "resnet50":
+            return (
+                "Official IDEA-Research/DINO object detector "
+                "(DETR with Improved DeNoising Anchor Boxes), ResNet-50 4-scale. "
+                "Supports COCO mAP, per-class metrics, and confusion matrix benchmarking."
+            )
         return (
             "Official facebookresearch/DINO self-supervised backbone training. "
             f"Variant: {label}, upstream arch={arch}, patch_size={patch_size}. "
@@ -83,7 +93,15 @@ class DINOPlugin(ModelArchPlugin):
         except ImportError as exc:
             return f"DINO dependency missing: {exc}"
         if not torch.cuda.is_available():
-            return "DINO upstream trainer requires CUDA; CPU training is not supported by facebookresearch/dino."
+            return "DINO upstream trainer requires CUDA."
+        if self._scale == "resnet50":
+            try:
+                import torch  # noqa: F401
+                from dino.detector_installer import ensure_installed
+
+                ensure_installed(build_ops=True)
+            except Exception as exc:
+                return f"DINO detector preflight failed: {exc}"
         return None
 
     def register_modules(self) -> None:
