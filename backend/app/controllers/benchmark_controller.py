@@ -5,6 +5,7 @@ confusion matrix, per-class mAP, latency, params, FLOPs.
 from __future__ import annotations
 import asyncio
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -370,25 +371,160 @@ def _collect_hsg_decoder_alpha(model) -> list[dict]:
 
 def _isolated_weight_benchmark_error(meta: dict) -> str | None:
     source_type = str(meta.get("source_type") or "").lower()
-    if source_type not in {"rtdetrv2", "dino"}:
+    if source_type not in {"dino"}:
         return None
 
     model_name = meta.get("model_name") or meta.get("weight_id") or "this weight"
-    key_count = int(meta.get("key_count") or 0)
-    if key_count <= 0 or not meta.get("pretrained", False):
-        return (
-            f"{model_name} is an empty {source_type} profile placeholder, not a trained model checkpoint. "
-            "Run training first, then benchmark the produced trained weight."
-        )
-    if source_type == "dino":
-        return (
-            f"{model_name} is a DINO self-supervised backbone checkpoint. "
-            "The detection benchmark endpoint only supports detector checkpoints."
-        )
     return (
-        f"{model_name} is an RT-DETRv2 upstream checkpoint. "
-        "This benchmark endpoint currently loads Ultralytics-compatible detector checkpoints only."
+        f"{model_name} is a DINO self-supervised backbone checkpoint. "
+        "The detection benchmark endpoint only supports detector checkpoints."
     )
+
+
+def _scale_from_rtdetrv2_meta(meta: dict) -> str:
+    scale = str(meta.get("model_scale") or "").strip().lower()
+    if scale in {"s", "m", "l", "x"}:
+        return scale
+    arch = str(meta.get("arch_plugin") or meta.get("model_arch") or "").lower()
+    if arch.startswith("rtdetrv2_"):
+        scale = arch.rsplit("_", 1)[-1]
+        if scale in {"s", "m", "l", "x"}:
+            return scale
+    return "s"
+
+
+def _parse_rtdetrv2_coco_stats(output: str) -> dict[str, float | None]:
+    values: list[float] = []
+    for line in output.splitlines():
+        if "Average Precision" in line or "Average Recall" in line:
+            try:
+                values.append(float(line.rsplit("=", 1)[-1].strip()))
+            except ValueError:
+                pass
+    return {
+        "mAP50_95": values[0] if len(values) > 0 else None,
+        "mAP50": values[1] if len(values) > 1 else None,
+        "mAP75": values[2] if len(values) > 2 else None,
+        "recall": values[8] if len(values) > 8 else None,
+    }
+
+
+def _run_rtdetrv2_benchmark(
+    req: BenchmarkRequest,
+    benchmark_id: str,
+    meta: dict,
+    pt_path: Path,
+    data_yaml: Path,
+) -> dict:
+    """Run upstream RT-DETRv2 validation and return a Model Designer benchmark record."""
+    import os
+    import subprocess
+    import sys
+    import yaml as _yaml
+    from ..services.rtdetrv2_trainer import _prepare_coco_dataset, _SCALE_TO_CONFIG
+    from rtdetrv2.installer import ensure_installed
+
+    scale = _scale_from_rtdetrv2_meta(meta)
+    spec = _SCALE_TO_CONFIG.get(scale) or _SCALE_TO_CONFIG["s"]
+    root = ensure_installed()
+    upstream_config = root / spec["config"]
+    if not upstream_config.exists():
+        raise ValueError(f"RT-DETRv2 upstream config not found: {upstream_config}")
+
+    out_dir = BENCHMARK_DIR / benchmark_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = out_dir / "rtdetrv2_dataset"
+    image_root, train_json, val_json, nc = _prepare_coco_dataset(
+        benchmark_id,
+        data_yaml,
+        export_dir,
+    )
+
+    workers = 0
+    batch = max(1, int(req.batch or 1))
+    device = req.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
+    if isinstance(device, str) and device.isdigit():
+        device = f"cuda:{device}"
+    updates = [
+        f"num_classes={nc}",
+        "remap_mscoco_category=False",
+        f"val_dataloader.dataset.img_folder='{image_root}'",
+        f"val_dataloader.dataset.ann_file='{val_json}'",
+        f"val_dataloader.total_batch_size={batch}",
+        f"val_dataloader.num_workers={workers}",
+        f"train_dataloader.dataset.img_folder='{image_root}'",
+        f"train_dataloader.dataset.ann_file='{train_json}'",
+        f"train_dataloader.total_batch_size={batch}",
+        f"train_dataloader.num_workers={workers}",
+    ]
+
+    cmd = [
+        sys.executable,
+        "tools/train.py",
+        "-c",
+        str(upstream_config),
+        "--test-only",
+        "--resume",
+        str(pt_path),
+        "--output-dir",
+        str(out_dir / "run"),
+        "-u",
+        *updates,
+    ]
+    if device:
+        cmd.extend(["--device", str(device)])
+
+    env = os.environ.copy()
+    backend_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join([str(root), backend_root, env.get("PYTHONPATH", "")])
+    env["PYTHONFAULTHANDLER"] = "1"
+
+    t0 = time.time()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    elapsed_s = time.time() - t0
+    (out_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+    if proc.returncode != 0:
+        raise ValueError(f"RT-DETRv2 benchmark failed with exit code {proc.returncode}: {(proc.stdout or '')[-2000:]}")
+
+    stats = _parse_rtdetrv2_coco_stats(proc.stdout or "")
+    result = {
+        "benchmark_id": benchmark_id,
+        "weight_id": req.weight_id,
+        "dataset": req.dataset,
+        "split": req.split,
+        "status": "completed",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "elapsed_s": round(elapsed_s, 1),
+        "mAP50": round(stats["mAP50"], 4) if stats["mAP50"] is not None else None,
+        "mAP50_95": round(stats["mAP50_95"], 4) if stats["mAP50_95"] is not None else None,
+        "mAP75": round(stats["mAP75"], 4) if stats["mAP75"] is not None else None,
+        "precision": None,
+        "recall": round(stats["recall"], 4) if stats["recall"] is not None else None,
+        "fitness": None,
+        "per_class": [],
+        "confusion_matrix": None,
+        "preprocess_ms": None,
+        "inference_ms": None,
+        "postprocess_ms": None,
+        "params": meta.get("param_count"),
+        "flops_gflops": None,
+        "hsg_decoder_alpha": [],
+        "conf": req.conf,
+        "iou": req.iou,
+        "imgsz": req.imgsz,
+        "source_type": "rtdetrv2",
+        "stdout_log": str(out_dir / "stdout.log"),
+    }
+    (BENCHMARK_DIR / f"{benchmark_id}.json").write_text(json.dumps(result, indent=2))
+    return result
 
 
 def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> dict:
@@ -449,6 +585,14 @@ def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> di
         )
     # Rewrite absolute paths in data.yaml that may point to another machine
     data_yaml = _rewrite_yaml_paths(data_yaml)
+
+    if str(meta.get("source_type") or "").lower() == "rtdetrv2":
+        if int(meta.get("key_count") or 0) <= 0:
+            raise ValueError(
+                f"{meta.get('model_name') or req.weight_id} is an empty RT-DETRv2 profile placeholder, "
+                "not a trained/pretrained checkpoint. Create it with pretrained enabled or run training first."
+            )
+        return _run_rtdetrv2_benchmark(req, benchmark_id, meta, pt_path, data_yaml)
 
     # Delete stale .cache files — they embed absolute paths from the machine that
     # built them, so they will be invalid on a different machine.  Ultralytics
