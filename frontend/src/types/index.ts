@@ -116,7 +116,7 @@ export interface ExportRequest {
 
 export interface TrainConfig {
   data: string;
-  imgsz: number;
+  imgsz: number | number[];
   batch: number;
   workers: number;
   cache: 'auto' | 'ram' | 'disk' | 'none' | boolean;

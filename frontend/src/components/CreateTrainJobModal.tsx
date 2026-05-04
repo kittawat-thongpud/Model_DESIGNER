@@ -965,7 +965,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                           <h4 className="text-sm font-semibold text-white border-b border-slate-800 pb-2">Training Params</h4>
                           <NumberInput label="Epochs" value={config.epochs} onChange={v => updateConfig('epochs', v)} />
                           <NumberInput label="Batch Size" value={config.batch} onChange={v => updateConfig('batch', v)} />
-                          <NumberInput label="Image Size" value={config.imgsz} onChange={v => updateConfig('imgsz', v)} />
+                          <ImgszInput value={config.imgsz} onChange={v => updateConfig('imgsz', v)} />
                           <NumberInput label="Workers" value={config.workers} onChange={v => updateConfig('workers', v)} />
                           <div>
                             <label className="block text-xs font-medium text-slate-400 mb-1">Dataset Cache</label>
@@ -1299,6 +1299,56 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
 }
 
 // ─── Reusable Inputs ─────────────────────────────────────────────────────────
+
+function ImgszInput({ value, onChange }: { value: number | number[]; onChange: (v: number | number[]) => void }) {
+  const textValue = Array.isArray(value) ? value.join(', ') : String(value);
+  const [raw, setRaw] = useState(textValue);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setRaw(Array.isArray(value) ? value.join(', ') : String(value));
+  }, [value]);
+
+  const commit = (input: string) => {
+    const trimmed = input.trim();
+    // Single number: "640"
+    if (/^\d+$/.test(trimmed)) {
+      const n = parseInt(trimmed, 10);
+      if (n >= 32) { setError(''); onChange(n); return; }
+    }
+    // List format: "320, 1024" or "[320, 1024]"
+    const cleaned = trimmed.replace(/^\[|\]$/g, '');
+    const parts = cleaned.split(/[,\s]+/).filter(Boolean);
+    if (parts.length >= 1 && parts.length <= 2 && parts.every(p => /^\d+$/.test(p))) {
+      const nums = parts.map(p => parseInt(p, 10));
+      if (nums.every(n => n >= 32)) {
+        setError('');
+        onChange(nums.length === 1 ? nums[0] : nums);
+        return;
+      }
+    }
+    setError('e.g. 640 or 320, 1024');
+  };
+
+  return (
+    <div>
+      <label className="block text-xs font-medium text-slate-400 mb-1">Image Size</label>
+      <input
+        type="text"
+        value={raw}
+        onChange={e => setRaw(e.target.value)}
+        onBlur={() => commit(raw)}
+        onKeyDown={e => { if (e.key === 'Enter') commit(raw); }}
+        placeholder="640 or 320, 1024"
+        className={`w-full bg-slate-800 border rounded-lg px-3 py-2 text-sm text-white focus:outline-none ${
+          error ? 'border-red-500 focus:border-red-400' : 'border-slate-700 focus:border-emerald-500'
+        }`}
+      />
+      {error && <p className="text-xs text-red-400 mt-0.5">{error}</p>}
+      <p className="text-xs text-slate-500 mt-0.5">Single int or [h, w] for rectangular</p>
+    </div>
+  );
+}
 
 function NumberInput({ label, value, onChange, step = 1, min, max }: { label: string; value: number; onChange: (v: number) => void; step?: number; min?: number; max?: number }) {
   return (
