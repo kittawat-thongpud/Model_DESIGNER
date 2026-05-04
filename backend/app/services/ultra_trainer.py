@@ -1376,6 +1376,15 @@ def _training_worker(
             # yolov8_backbone warm-start is opt-in — only when user explicitly selects it in UI
             # (no auto-inject from pretrain_key() anymore)
 
+            # If the arch plugin has a pretrain_key (e.g. "rtdetr-l") and the user
+            # wants pretrained weights, route through the yolo_model path so the
+            # official .pt file is downloaded and loaded automatically.
+            _pk = arch_plugin.pretrain_key()
+            if _pk and config.get("use_yolo_pretrained", True) and not config.get("yolo_model"):
+                config["yolo_model"] = _pk
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Injecting pretrained model key from arch plugin: {_pk}")
+
         # Auto-detect arch plugin from yaml path if not set via model_arch key
         if arch_plugin is None and original_yaml_path:
             from ..plugins.loader import find_arch_for_yaml

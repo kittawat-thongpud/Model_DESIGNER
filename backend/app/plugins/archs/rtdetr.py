@@ -94,7 +94,9 @@ class RTDETRPlugin(ModelArchPlugin):
         pass
 
     def pretrain_key(self) -> str | None:
-        return None
+        # Map to Ultralytics pretrained catalog keys (rtdetr-l, rtdetr-x)
+        _KEY_MAP = {"l": "rtdetr-l", "x": "rtdetr-x"}
+        return _KEY_MAP.get(self._scale)
 
 
 # ── Auto-register all available scale variants ───────────────────────────────

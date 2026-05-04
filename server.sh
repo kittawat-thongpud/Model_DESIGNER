@@ -404,10 +404,82 @@ EOF
         echo "   Start in tmux mode with: ./server.sh start"
         ;;
 
+    # ── setup ─────────────────────────────────────────────────────────────────
+    setup)
+        echo "🔧 Setting up Python venv with PyTorch cu128..."
+
+        # ── Detect CUDA_HOME ─────────────────────────────────────────────────
+        if [ -z "${CUDA_HOME:-}" ]; then
+            if [ -d "/usr/local/cuda-12.8" ]; then
+                export CUDA_HOME="/usr/local/cuda-12.8"
+            elif [ -d "/usr/local/cuda" ]; then
+                export CUDA_HOME="/usr/local/cuda"
+            fi
+        fi
+        export PATH="${CUDA_HOME}/bin:${PATH}"
+        export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+        echo "   CUDA_HOME: ${CUDA_HOME:-<not set>}"
+        if command -v nvcc &>/dev/null; then
+            echo "   nvcc: $(nvcc --version | grep release | awk '{print $6}')"
+        fi
+
+        # ── Create venv if missing ──────────────────────────────────────────
+        if [ ! -d "${APP_DIR}/venv" ]; then
+            echo "📦 Creating Python virtual environment..."
+            python3 -m venv "${APP_DIR}/venv"
+        fi
+        source "${APP_DIR}/venv/bin/activate"
+        pip install --upgrade pip
+
+        # ── Uninstall conflicting packages ───────────────────────────────────
+        echo "🧹 Removing existing torch/selective_scan to avoid conflicts..."
+        pip uninstall -y torch torchvision torchaudio selective_scan 2>/dev/null || true
+        pip cache purge
+
+        # ── Install PyTorch with cu128 index ─────────────────────────────────
+        echo "📦 Installing PyTorch (cu128)..."
+        pip install -r "${APP_DIR}/requirements-torch-cu128.txt" \
+            --index-url https://download.pytorch.org/whl/cu128
+
+        # ── Install remaining dependencies ───────────────────────────────────
+        echo "📦 Installing requirements.txt..."
+        pip install -r "${APP_DIR}/requirements.txt"
+
+        # ── Verify torch + CUDA ──────────────────────────────────────────────
+        echo ""
+        echo "── Verifying PyTorch CUDA ──────────────────────────────────────────────"
+        python3 - <<'PY'
+import torch, os
+print(f"  torch:          {torch.__version__}")
+print(f"  torch cuda:     {torch.version.cuda}")
+print(f"  CUDA_HOME:      {os.environ.get('CUDA_HOME', '<not set>')}")
+print(f"  cuda available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"  GPU:            {torch.cuda.get_device_name(0)}")
+PY
+
+        # ── Install selective_scan (CUDA extension) ──────────────────────────
+        echo ""
+        echo "📦 Installing selective_scan (CUDA extension, no build isolation)..."
+        pip install selective_scan==0.0.2 \
+            --no-build-isolation \
+            --no-deps \
+            --no-cache-dir || echo "⚠️  selective_scan install failed (optional for non-Mamba models)"
+
+        # ── Build frontend ────────────────────────────────────────────────────
+        _build_frontend || echo "⚠️  Frontend build failed (server can still run without it)"
+
+        echo ""
+        echo "✅ Setup complete."
+        echo "   Activate with: source ${APP_DIR}/venv/bin/activate"
+        echo "   Start server:  ./server.sh start"
+        ;;
+
     # ── help ──────────────────────────────────────────────────────────────────
     *)
         echo "Usage: ./server.sh <command>"
         echo ""
+        echo "  setup             create venv + install PyTorch cu128 + dependencies"
         echo "  start             start server  (service if installed, else tmux)"
         echo "  stop              stop server"
         echo "  restart           restart server"
