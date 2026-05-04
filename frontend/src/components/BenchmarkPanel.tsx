@@ -31,6 +31,10 @@ const fmtAlpha = (items: BenchmarkResult['hsg_decoder_alpha']) => {
   const value = items?.find(item => isFiniteNumber(item.alpha))?.alpha;
   return isFiniteNumber(value) ? value.toFixed(3) : '—';
 };
+const fmtNum = (v: number | null | undefined, decimals = 2) =>
+  isFiniteNumber(v) ? v.toFixed(decimals) : '—';
+const fmtInt = (v: number | null | undefined) =>
+  isFiniteNumber(v) ? v.toLocaleString() : '—';
 
 function ConfusionMatrix({ data }: { data: { matrix: number[][]; names: string[] } }) {
   const { matrix, names } = data;
@@ -151,6 +155,7 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
   };
 
   const displayResult = activeResult;
+  const isBackboneBenchmark = displayResult?.benchmark_type === 'backbone' || displayResult?.source_type === 'dino';
 
   const panelBody = (
     <>
@@ -270,7 +275,9 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                       <div className="text-[10px] text-slate-500">{new Date(h.timestamp).toLocaleDateString()}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="font-mono text-emerald-400">{pct(h.mAP50)}</span>
+                      <span className="font-mono text-emerald-400">
+                        {h.benchmark_type === 'backbone' || h.source_type === 'dino' ? fmtMs(h.inference_ms) : pct(h.mAP50)}
+                      </span>
                       <button
                         onClick={ev => { ev.stopPropagation(); handleDelete(h.benchmark_id); }}
                         className="text-slate-600 hover:text-red-400 cursor-pointer"
@@ -304,12 +311,25 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
               <>
                 {/* Overall metrics */}
                 <div>
-                  <div className="text-xs text-slate-500 uppercase tracking-wider mb-2">Overall — {displayResult.dataset}/{displayResult.split}</div>
+                  <div className="text-xs text-slate-500 uppercase tracking-wider mb-2">
+                    {isBackboneBenchmark ? 'Backbone' : 'Overall'} — {displayResult.dataset}/{displayResult.split}
+                  </div>
                   <div className="grid grid-cols-4 gap-2">
-                    <MetricBadge label="mAP@0.5" value={pct(displayResult.mAP50)} color="text-emerald-400" />
-                    <MetricBadge label="mAP@0.5:0.95" value={pct(displayResult.mAP50_95)} color="text-sky-400" />
-                    <MetricBadge label="Precision" value={pct(displayResult.precision)} color="text-violet-400" />
-                    <MetricBadge label="Recall" value={pct(displayResult.recall)} color="text-rose-400" />
+                    {isBackboneBenchmark ? (
+                      <>
+                        <MetricBadge label="Feature Dim" value={fmtInt(displayResult.feature_dim ?? displayResult.backbone_metrics?.feature_dim)} color="text-emerald-400" />
+                        <MetricBadge label="Emb Norm" value={fmtNum(displayResult.embedding_norm ?? displayResult.backbone_metrics?.embedding_norm, 2)} color="text-sky-400" />
+                        <MetricBadge label="Output Std" value={fmtNum(displayResult.output_std ?? displayResult.backbone_metrics?.output_std, 4)} color="text-violet-400" />
+                        <MetricBadge label="Matched Keys" value={fmtInt(displayResult.matched_keys ?? displayResult.backbone_metrics?.matched_keys)} color="text-rose-400" />
+                      </>
+                    ) : (
+                      <>
+                        <MetricBadge label="mAP@0.5" value={pct(displayResult.mAP50)} color="text-emerald-400" />
+                        <MetricBadge label="mAP@0.5:0.95" value={pct(displayResult.mAP50_95)} color="text-sky-400" />
+                        <MetricBadge label="Precision" value={pct(displayResult.precision)} color="text-violet-400" />
+                        <MetricBadge label="Recall" value={pct(displayResult.recall)} color="text-rose-400" />
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -347,6 +367,18 @@ export default function BenchmarkPanel({ weightId, onClose, inline = false }: Pr
                         <span className="text-slate-500">SGB Alpha</span>
                         <span className="font-mono text-slate-300">{fmtAlpha(displayResult.hsg_decoder_alpha)}</span>
                       </div>
+                    )}
+                    {isBackboneBenchmark && (
+                      <>
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-500">Output Shape</span>
+                          <span className="font-mono text-slate-300">{(displayResult.output_shape ?? displayResult.backbone_metrics?.output_shape)?.join(' x ') || '—'}</span>
+                        </div>
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-500">Loaded State</span>
+                          <span className="font-mono text-slate-300">{displayResult.loaded_state ?? displayResult.backbone_metrics?.loaded_state ?? '—'}</span>
+                        </div>
+                      </>
                     )}
                   </div>
                 </div>

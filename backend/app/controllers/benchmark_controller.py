@@ -567,14 +567,34 @@ def sync():
 
 with torch.no_grad():
     for _ in range(5):
-        _ = model(x)
+        y = model(x)
     sync()
     n = 30
     t0 = time.perf_counter()
     for _ in range(n):
-        _ = model(x)
+        y = model(x)
     sync()
     t1 = time.perf_counter()
+
+if isinstance(y, (list, tuple)):
+    y0 = y[0]
+elif isinstance(y, dict):
+    y0 = next((v for v in y.values() if torch.is_tensor(v)), None)
+else:
+    y0 = y
+if torch.is_tensor(y0):
+    yd = y0.detach().float()
+    output_shape = list(yd.shape)
+    feature_dim = int(yd.shape[-1]) if yd.ndim > 0 else 1
+    output_mean = float(yd.mean().item())
+    output_std = float(yd.std(unbiased=False).item())
+    embedding_norm = float(yd.flatten(1).norm(dim=1).mean().item()) if yd.ndim > 1 else float(yd.norm().item())
+else:
+    output_shape = None
+    feature_dim = None
+    output_mean = None
+    output_std = None
+    embedding_norm = None
 
 params = sum(p.numel() for p in model.parameters())
 print(json.dumps({
@@ -583,6 +603,11 @@ print(json.dumps({
     "flops_gflops": flops_g,
     "loaded_state": best_name,
     "matched_keys": best_matches,
+    "output_shape": output_shape,
+    "feature_dim": feature_dim,
+    "output_mean": output_mean,
+    "output_std": output_std,
+    "embedding_norm": embedding_norm,
 }))
 """
     proc = subprocess.run(
@@ -673,9 +698,9 @@ def _run_dino_benchmark(
         "fitness": None,
         "per_class": [],
         "confusion_matrix": None,
-        "preprocess_ms": None,
+        "preprocess_ms": 0.0,
         "inference_ms": round(runtime.get("inference_ms"), 2) if runtime.get("inference_ms") is not None else None,
-        "postprocess_ms": None,
+        "postprocess_ms": 0.0,
         "params": int(runtime.get("params") or meta.get("param_count") or 0) or None,
         "flops_gflops": round(float(runtime["flops_gflops"]), 3) if runtime.get("flops_gflops") is not None else None,
         "hsg_decoder_alpha": [],
@@ -686,6 +711,20 @@ def _run_dino_benchmark(
         "benchmark_type": "backbone",
         "loaded_state": runtime.get("loaded_state"),
         "matched_keys": runtime.get("matched_keys"),
+        "feature_dim": runtime.get("feature_dim"),
+        "output_shape": runtime.get("output_shape"),
+        "embedding_norm": round(float(runtime["embedding_norm"]), 4) if runtime.get("embedding_norm") is not None else None,
+        "output_mean": round(float(runtime["output_mean"]), 6) if runtime.get("output_mean") is not None else None,
+        "output_std": round(float(runtime["output_std"]), 6) if runtime.get("output_std") is not None else None,
+        "backbone_metrics": {
+            "feature_dim": runtime.get("feature_dim"),
+            "output_shape": runtime.get("output_shape"),
+            "embedding_norm": round(float(runtime["embedding_norm"]), 4) if runtime.get("embedding_norm") is not None else None,
+            "output_mean": round(float(runtime["output_mean"]), 6) if runtime.get("output_mean") is not None else None,
+            "output_std": round(float(runtime["output_std"]), 6) if runtime.get("output_std") is not None else None,
+            "matched_keys": runtime.get("matched_keys"),
+            "loaded_state": runtime.get("loaded_state"),
+        },
     }
     (BENCHMARK_DIR / f"{benchmark_id}.json").write_text(json.dumps(result, indent=2))
     return result
