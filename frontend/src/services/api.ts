@@ -404,9 +404,63 @@ export const api = {
     a.click();
     document.body.removeChild(a);
   },
+  // ── Chunked upload helpers ────────────────────────────────────────────────
+  _CHUNK_SIZE: 20 * 1024 * 1024, // 20 MB per chunk
+
+  _chunkedUpload: async (
+    file: File,
+    onProgress?: (pct: number) => void,
+  ): Promise<string> => {
+    const chunkSize = api._CHUNK_SIZE;
+    const totalChunks = Math.ceil(file.size / chunkSize);
+
+    // 1. Init
+    const initFd = new FormData();
+    initFd.append('filename', file.name);
+    initFd.append('total_chunks', String(totalChunks));
+    initFd.append('total_size', String(file.size));
+    const initRes = await fetch('/api/packages/upload/init', { method: 'POST', body: initFd });
+    if (!initRes.ok) throw new Error(`Upload init failed: HTTP ${initRes.status}`);
+    const { upload_id } = await initRes.json();
+
+    // 2. Upload chunks
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * chunkSize;
+      const blob = file.slice(start, start + chunkSize);
+      const chunkFd = new FormData();
+      chunkFd.append('index', String(i));
+      chunkFd.append('data', blob, `chunk_${i}`);
+      const chunkRes = await fetch(`/api/packages/upload/${upload_id}/chunk`, { method: 'POST', body: chunkFd });
+      if (!chunkRes.ok) throw new Error(`Chunk ${i}/${totalChunks} upload failed: HTTP ${chunkRes.status}`);
+      if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
+    }
+
+    // 3. Finalize
+    const finRes = await fetch(`/api/packages/upload/${upload_id}/finalize`, { method: 'POST' });
+    if (!finRes.ok) throw new Error(`Upload finalize failed: HTTP ${finRes.status}`);
+
+    return upload_id;
+  },
+
   peekPackage: async (
     file: File,
+    onProgress?: (pct: number) => void,
   ): Promise<{ version: string; weights: { id: string; model_name: string; dataset: string; epochs_trained: number }[]; jobs: string[] }> => {
+    // Use chunked upload for files > 20 MB
+    if (file.size > api._CHUNK_SIZE) {
+      const uploadId = await api._chunkedUpload(file, onProgress);
+      const fd = new FormData();
+      fd.append('upload_id', uploadId);
+      const res = await fetch('/api/packages/peek', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const result = await res.json();
+      result._upload_id = uploadId; // pass through for import step
+      return result;
+    }
+    // Small file: direct upload
     const formData = new FormData();
     formData.append('file', file);
     const res = await fetch('/api/packages/peek', { method: 'POST', body: formData });
@@ -420,9 +474,19 @@ export const api = {
     file: File,
     renameMap: Record<string, string> = {},
     includeJobs = false,
+    uploadId?: string,
   ): Promise<{ weights_imported: { old_id: string; new_id: string; name: string }[]; jobs_imported: { old_id: string; new_id: string }[]; errors: string[] }> => {
     const formData = new FormData();
-    formData.append('file', file);
+    if (uploadId) {
+      // Reuse already-uploaded file from chunked upload
+      formData.append('upload_id', uploadId);
+    } else if (file.size > api._CHUNK_SIZE) {
+      // Large file without prior upload — do chunked upload now
+      const uid = await api._chunkedUpload(file);
+      formData.append('upload_id', uid);
+    } else {
+      formData.append('file', file);
+    }
     formData.append('rename_map', JSON.stringify(renameMap));
     formData.append('include_jobs', String(includeJobs));
     const res = await fetch('/api/packages/import', { method: 'POST', body: formData });

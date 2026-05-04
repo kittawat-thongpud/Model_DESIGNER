@@ -34,6 +34,8 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [uploadId, setUploadId] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const handleFile = async (f: File) => {
@@ -45,7 +47,11 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
     setError(null);
     setPeeking(true);
     try {
-      const info = await api.peekPackage(f);
+      setUploadPct(0);
+      const info = await api.peekPackage(f, (pct) => setUploadPct(pct)) as any;
+      setUploadPct(null);
+      // Store upload_id if chunked upload was used
+      if (info._upload_id) setUploadId(info._upload_id);
       setWeights(info.weights);
       setJobCount(info.jobs.length);
       // initialise name map with original names
@@ -79,7 +85,7 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
           renameMap[w.id] = names[w.id].trim();
         }
       }
-      const res = await api.importPackage(file, renameMap, includeJobs);
+      const res = await api.importPackage(file, renameMap, includeJobs, uploadId || undefined);
       setResult(res);
       setStep('done');
     } catch (err) {
@@ -129,7 +135,14 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
               {peeking ? (
                 <div className="flex flex-col items-center gap-2">
                   <Loader2 size={28} className="text-indigo-400 animate-spin" />
-                  <p className="text-slate-400 text-sm">Reading package…</p>
+                  <p className="text-slate-400 text-sm">
+                    {uploadPct !== null && uploadPct < 100 ? `Uploading… ${uploadPct}%` : 'Reading package…'}
+                  </p>
+                  {uploadPct !== null && (
+                    <div className="w-48 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                      <div className="h-full bg-indigo-500 transition-all duration-300 rounded-full" style={{ width: `${uploadPct}%` }} />
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-2">
