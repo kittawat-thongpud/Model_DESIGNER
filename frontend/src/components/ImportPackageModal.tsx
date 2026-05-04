@@ -46,8 +46,11 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
     setFile(f);
     setError(null);
     setPeeking(true);
+    const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+    const useChunked = f.size > api._CHUNK_SIZE;
+    console.log(`[ImportPackage] file=${f.name} size=${sizeMB}MB chunked=${useChunked}`);
     try {
-      setUploadPct(0);
+      setUploadPct(useChunked ? 0 : null);
       const info = await api.peekPackage(f, (pct) => setUploadPct(pct)) as any;
       setUploadPct(null);
       // Store upload_id if chunked upload was used
@@ -60,8 +63,14 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
       setNames(m);
       setStep('rename');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to read package');
+      console.error('[ImportPackage] peek failed:', err);
+      const msg = err instanceof Error ? err.message : 'Failed to read package';
+      const hint = msg.includes('Failed to fetch')
+        ? ` (file ${sizeMB} MB — may exceed proxy upload limit, try Tailscale direct connection)`
+        : '';
+      setError(msg + hint);
     } finally {
+      setUploadPct(null);
       setPeeking(false);
     }
   };
@@ -85,11 +94,18 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
           renameMap[w.id] = names[w.id].trim();
         }
       }
+      console.log(`[ImportPackage] importing uploadId=${uploadId || 'direct'}`);
       const res = await api.importPackage(file, renameMap, includeJobs, uploadId || undefined);
       setResult(res);
       setStep('done');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Import failed');
+      console.error('[ImportPackage] import failed:', err);
+      const msg = err instanceof Error ? err.message : 'Import failed';
+      const sizeMB = file ? (file.size / 1024 / 1024).toFixed(1) : '?';
+      const hint = msg.includes('Failed to fetch')
+        ? ` (file ${sizeMB} MB — may exceed proxy upload limit)`
+        : '';
+      setError(msg + hint);
     } finally {
       setLoading(false);
     }
