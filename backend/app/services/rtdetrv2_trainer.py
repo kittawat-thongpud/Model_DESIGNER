@@ -315,18 +315,74 @@ def _resolve_checkpoint(value: str) -> Path | None:
     return None
 
 
-def _append_output_log(job_id: str, line: str) -> None:
+def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
+    """Parse RT-DETRv2 subprocess stdout and update job state.
+
+    Recognised patterns from ``det_engine.py`` / ``det_solver.py``:
+    - ``Epoch: [N]``  → training epoch started
+    - ``Averaged stats: ...loss: X.XXXX ...``  → train / test loss
+    - ``best_stat: {...}``  → best eval metric so far
+    - ``Average Precision  (AP) @[ IoU=0.50:0.95 ...`` → COCO eval mAP
+    """
     text = line.strip()
     if not text:
         return
     job_storage.append_job_log(job_id, "INFO", text)
-    m = re.search(r"(?:epoch|Epoch)\D+(\d+)", text)
+
+    # ── Epoch header: "Epoch: [N]" ──────────────────────────────────────────
+    m = re.search(r"Epoch:\s*\[(\d+)\]", text)
     if m:
-        try:
-            epoch = int(m.group(1))
-            _set_job(job_id, epoch=epoch, message=f"Training epoch {epoch}")
-        except Exception:
-            pass
+        epoch = int(m.group(1))
+        total_epochs = state.get("total_epochs", 0)
+        state["current_epoch"] = epoch
+        _set_job(
+            job_id,
+            epoch=epoch,
+            message=f"Training epoch {epoch}/{total_epochs}",
+        )
+        return
+
+    # ── Averaged stats (train or test) ──────────────────────────────────────
+    if "Averaged stats:" in text:
+        # Extract loss value:  "loss: 1.2345 (2.3456)"
+        loss_m = re.search(r"loss:\s*([\d.]+)", text)
+        if loss_m:
+            loss_val = float(loss_m.group(1))
+            # Determine if this is train or test stats
+            if "Test:" in text or state.get("_last_header") == "test":
+                state["val_loss"] = loss_val
+                state["_last_header"] = None
+            else:
+                state["train_loss"] = loss_val
+                # After train averaged stats, next eval block is test
+                state["_last_header"] = "test"
+        return
+
+    # Detect "Test:" header (precedes eval averaged stats)
+    if text.startswith("Test:"):
+        state["_last_header"] = "test"
+        return
+
+    # ── COCO AP line: " Average Precision  (AP) @[ IoU=0.50:0.95 ..." ──────
+    ap_m = re.search(
+        r"Average Precision\s+\(AP\)\s+@\[\s*IoU=0\.50:0\.95.*?=\s*([\d.]+)",
+        text,
+    )
+    if ap_m:
+        state["mAP50_95"] = float(ap_m.group(1))
+        return
+    ap50_m = re.search(
+        r"Average Precision\s+\(AP\)\s+@\[\s*IoU=0\.50\s.*?=\s*([\d.]+)",
+        text,
+    )
+    if ap50_m:
+        state["mAP50"] = float(ap50_m.group(1))
+        return
+
+    # ── best_stat line ──────────────────────────────────────────────────────
+    if text.startswith("best_stat:"):
+        state["_last_header"] = None  # reset
+        return
 
 
 def run_worker(payload: dict[str, Any]) -> None:
@@ -390,6 +446,16 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     batch = int(config["batch"] if config.get("batch") is not None else config.get("batch_size", 16))
     workers = int(config["workers"] if config.get("workers") is not None else 4)
+    # Clamp workers: RT-DETRv2 runs as a nested subprocess where high num_workers
+    # can exhaust /dev/shm (RuntimeError: received 0 items of ancdata).
+    try:
+        shm = shutil.disk_usage("/dev/shm")
+        if shm.total < 2 * 1024 ** 3:  # < 2 GB shared memory
+            workers = 0
+            _log(f"Small /dev/shm ({shm.total // (1024**2)} MB) — setting num_workers=0")
+    except Exception:
+        pass
+    workers = min(workers, 4)
     epochs = int(config["epochs"] if config.get("epochs") is not None else 100)
     use_amp = bool(config.get("amp", True))
     use_pretrained = bool(config.get("use_yolo_pretrained", True))
@@ -442,6 +508,7 @@ def run_worker(payload: dict[str, Any]) -> None:
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env["MD_JOB_ID"] = job_id
     env["PYTHONFAULTHANDLER"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"  # force line-buffered stdout for real-time log parsing
 
     job_storage.append_job_log(
         job_id,
@@ -451,6 +518,7 @@ def run_worker(payload: dict[str, Any]) -> None:
     )
 
     started = time.time()
+    log_txt = out_dir / "log.txt"
     proc = subprocess.Popen(
         cmd,
         cwd=str(root),
@@ -460,22 +528,119 @@ def run_worker(payload: dict[str, Any]) -> None:
         text=True,
         bufsize=1,
     )
+
+    # State shared across stdout parsing
+    parse_state: dict[str, Any] = {
+        "total_epochs": epochs,
+        "current_epoch": 0,
+        "train_loss": None,
+        "val_loss": None,
+        "mAP50": None,
+        "mAP50_95": None,
+        "_log_txt_offset": 0,  # byte offset into log.txt
+    }
+
+    def _poll_log_txt() -> None:
+        """Read new lines from upstream log.txt and push epoch history."""
+        if not log_txt.exists():
+            return
+        try:
+            with log_txt.open("r", encoding="utf-8") as f:
+                f.seek(parse_state["_log_txt_offset"])
+                new_lines = f.readlines()
+                parse_state["_log_txt_offset"] = f.tell()
+        except Exception:
+            return
+        for raw in new_lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            epoch = entry.get("epoch", parse_state["current_epoch"])
+            elapsed = time.time() - started
+
+            # Build history record compatible with Model Designer
+            history_entry: dict[str, Any] = {
+                "epoch": epoch,
+                "timestamp": time.time(),
+                "total_elapsed_s": elapsed,
+            }
+            # Map RT-DETRv2 keys → Model Designer keys
+            if "train_loss" in entry:
+                history_entry["box_loss"] = entry.get("train_loss", 0)
+            for k, v in entry.items():
+                if k.startswith("train_"):
+                    history_entry[k] = v
+                elif k.startswith("test_"):
+                    history_entry[k] = v
+
+            # Extract COCO eval AP from test_stats (list of 12 values)
+            test_coco = entry.get("test_coco_eval_bbox")
+            if isinstance(test_coco, list) and len(test_coco) >= 2:
+                history_entry["mAP50_95"] = test_coco[0]
+                history_entry["mAP50"] = test_coco[1]
+                parse_state["mAP50_95"] = test_coco[0]
+                parse_state["mAP50"] = test_coco[1]
+
+            # Write to extended_metrics.jsonl for compatibility
+            metrics_path = (JOBS_DIR / job_id / "runs" / "train")
+            metrics_path.mkdir(parents=True, exist_ok=True)
+            try:
+                with (metrics_path / "extended_metrics.jsonl").open("a") as mf:
+                    mf.write(json.dumps(history_entry) + "\n")
+            except Exception:
+                pass
+
+            # Update job with latest metrics
+            updates: dict[str, Any] = {
+                "epoch": epoch,
+                "message": f"Epoch {epoch}/{epochs}",
+            }
+            if parse_state.get("mAP50_95") is not None:
+                updates["best_mAP50_95"] = parse_state["mAP50_95"]
+            if parse_state.get("mAP50") is not None:
+                updates["best_mAP50"] = parse_state["mAP50"]
+            _set_job(job_id, **updates)
+
     for line in proc.stdout or []:
-        _append_output_log(job_id, line)
+        _append_output_log(job_id, line, parse_state)
+        # Periodically check log.txt for detailed metrics
+        _poll_log_txt()
+
+    # Final poll after process ends
+    _poll_log_txt()
+
     returncode = proc.wait()
+    elapsed = time.time() - started
+
     if returncode != 0:
+        _set_job(
+            job_id,
+            status="failed",
+            message=f"RT-DETRv2 training failed (exit code {returncode})",
+            completed_at=datetime.utcnow().isoformat() + "Z",
+        )
         raise RuntimeError(f"RT-DETRv2 training failed with exit code {returncode}")
 
     weight_id = _save_weight(job_id, out_dir)
+    final_msg = f"Training complete ({elapsed:.0f}s)"
+    if parse_state.get("mAP50_95") is not None:
+        final_msg += f" — mAP50-95: {parse_state['mAP50_95']:.4f}"
+
     _set_job(
         job_id,
         status="completed",
-        message="Training complete",
+        message=final_msg,
         weight_id=weight_id,
         completed_at=datetime.utcnow().isoformat() + "Z",
+        best_mAP50_95=parse_state.get("mAP50_95"),
+        best_mAP50=parse_state.get("mAP50"),
     )
     job_storage.append_job_log(
         job_id,
         "INFO",
-        f"RT-DETRv2 training completed in {time.time() - started:.1f}s. Weight: {weight_id}",
+        f"RT-DETRv2 training completed in {elapsed:.1f}s. Weight: {weight_id}",
     )
