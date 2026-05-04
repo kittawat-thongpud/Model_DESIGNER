@@ -506,26 +506,42 @@ def run_worker(payload: dict[str, Any]) -> None:
     workers = min(workers, 4)
 
     # Free GPU memory from any previous training in the parent process
-    # and auto-clamp batch based on available VRAM to prevent OOM.
+    # and auto-clamp batch based on *system-wide* available VRAM to prevent OOM.
     try:
         import torch
         if torch.cuda.is_available():
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-            free_vram_gb = (torch.cuda.get_device_properties(0).total_memory
-                           - torch.cuda.memory_reserved(0)) / (1024 ** 3)
-            _log(f"GPU: {torch.cuda.get_device_name(0)}, free VRAM: {free_vram_gb:.1f} GB")
+            # mem_get_info returns (free, total) system-wide — accounts for ALL processes
+            mem_free, mem_total = torch.cuda.mem_get_info(0)
+            free_vram_gb = mem_free / (1024 ** 3)
+            total_vram_gb = mem_total / (1024 ** 3)
+            used_vram_gb = total_vram_gb - free_vram_gb
+            _log(f"GPU: {torch.cuda.get_device_name(0)}, "
+                 f"VRAM: {free_vram_gb:.1f} GB free / {total_vram_gb:.1f} GB total "
+                 f"({used_vram_gb:.1f} GB used by other processes)")
             # RT-DETRv2 overhead: model + EMA copy + optimizer states + gradients
             # R18 ~ 5 GB, R50 ~ 8 GB, R101 ~ 10 GB (at 640px with AMP)
             per_batch_gb = {"s": 0.8, "m": 1.2, "l": 1.5, "x": 2.0}.get(model_scale, 1.0)
             model_overhead_gb = {"s": 5.0, "m": 8.0, "l": 10.0, "x": 12.0}.get(model_scale, 6.0)
             safe_vram = free_vram_gb - model_overhead_gb - 1.5  # 1.5 GB safety margin
+            if free_vram_gb < model_overhead_gb + per_batch_gb:
+                msg = (f"Insufficient GPU memory for RT-DETRv2 scale={model_scale}: "
+                       f"need ~{model_overhead_gb + per_batch_gb:.0f} GB but only "
+                       f"{free_vram_gb:.1f} GB free. "
+                       f"Stop other training jobs first or use a smaller scale.")
+                _log(msg)
+                _set_job(job_id, status="failed", message=msg,
+                         completed_at=datetime.utcnow().isoformat() + "Z")
+                raise RuntimeError(msg)
             max_batch = max(1, int(safe_vram / per_batch_gb))
             if batch > max_batch:
                 _log(f"Auto-clamping batch {batch} → {max_batch} (available {free_vram_gb:.1f} GB, "
                      f"model overhead ~{model_overhead_gb} GB, ~{per_batch_gb} GB/sample)")
                 batch = max_batch
+    except RuntimeError:
+        raise
     except Exception as e:
         _log(f"GPU memory check skipped: {e}")
 

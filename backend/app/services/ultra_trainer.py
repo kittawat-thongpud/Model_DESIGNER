@@ -947,9 +947,96 @@ def cleanup_stale_jobs() -> None:
     for status in ("running", "pending"):
         for job in job_storage.list_jobs(status=status):
             job_id = str(job["job_id"])
+            # Kill orphan worker processes before marking as stopped
+            _kill_orphan_worker_tree(job_id)
             _finalize_existing_queue_task(job, "Cancelled due to server restart", admit_pending=False)
             _mark_job_stopped(job_id, "Stopped due to server restart", admit_pending=False)
     _reconcile_training_queue_with_admission(admit_pending=False)
+
+
+def _kill_orphan_worker_tree(job_id: str) -> None:
+    """Kill a stale worker process and all its children using stored PID/pgid files.
+
+    Called during server restart to clean up processes from a previous server
+    instance that are still holding GPU memory.
+    """
+    meta_path = _worker_meta_path(job_id)
+    pid_path = _worker_pid_path(job_id)
+    pid: int | None = None
+    pgid: int | None = None
+
+    # Read stored process metadata
+    try:
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            pid = int(meta.get("pid", 0)) or None
+            pgid = int(meta.get("pgid", 0)) or None
+        elif pid_path.exists():
+            pid = int(pid_path.read_text().strip())
+    except Exception:
+        pass
+
+    if not pid:
+        return
+
+    killed: list[int] = []
+
+    # Strategy 1: kill entire process group (catches DDP children)
+    if pgid and pgid > 1:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            killed.append(pgid)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Strategy 2: kill process tree using psutil (catches children in other groups)
+    try:
+        import psutil
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                    killed.append(child.pid)
+                except (psutil.NoSuchProcess, PermissionError):
+                    pass
+            try:
+                parent.kill()
+                killed.append(pid)
+            except (psutil.NoSuchProcess, PermissionError):
+                pass
+            psutil.wait_procs(children + [parent], timeout=3)
+        except psutil.NoSuchProcess:
+            pass
+    except ImportError:
+        # No psutil — just try to kill the main PID
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if killed:
+        try:
+            job_storage.append_job_log(
+                job_id, "WARNING",
+                f"Killed {len(killed)} orphan worker process(es) on server restart: {killed}",
+            )
+        except Exception:
+            pass
+
+    # Clean up PID files
+    for p in (pid_path, meta_path):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def cleanup_zombie_workers() -> dict[str, str]:
@@ -1009,33 +1096,44 @@ def cleanup_zombie_workers() -> dict[str, str]:
 def _kill_ddp_processes(job_id: str) -> None:
     """Kill orphaned DDP/torchrun subprocesses for a job.
     
-    Uses psutil if available, falls back to pkill command.
+    Matches DDP patterns AND ultra_trainer --worker processes that reference
+    this specific job_id.  Uses psutil if available, falls back to pkill.
     """
+    # Also try to kill the whole process group via stored metadata
+    _kill_orphan_worker_tree(job_id)
+
     killed = []
+    _ddp_patterns = [
+        'torchrun', 'torch.distributed.run', 'multiprocessing.spawn',
+    ]
+    # Job-specific pattern: worker_args.json path contains the job_id
+    _job_pattern = job_id
+
     try:
         import psutil
         current_pid = os.getpid()
         for proc in psutil.process_iter(['pid', 'ppid', 'name', 'cmdline']):
             try:
                 info = proc.info
-                # Look for torchrun, torch.distributed.run, or python training processes
                 cmdline = ' '.join(info.get('cmdline', [])) if info.get('cmdline') else ''
                 name = info.get('name', '')
-                if any(x in cmdline or x in name for x in ['torchrun', 'torch.distributed.run', 'multiprocessing.spawn']):
-                    # Check if orphaned (parent is init or parent is this process but thread is dead)
-                    ppid = info.get('ppid', 0)
-                    pid = info.get('pid', 0)
-                    if pid != current_pid and pid != os.getppid():
-                        try:
-                            proc.terminate()
-                            proc.wait(timeout=2)
-                            killed.append(pid)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
-                            proc.wait(timeout=1)
-                            killed.append(pid)
-                        except (psutil.NoSuchProcess, PermissionError):
-                            pass
+                pid = info.get('pid', 0)
+                if pid == current_pid or pid == os.getppid():
+                    continue
+                # Match DDP patterns OR worker processes for this specific job
+                is_ddp = any(x in cmdline or x in name for x in _ddp_patterns)
+                is_job_worker = (_job_pattern in cmdline and 'ultra_trainer' in cmdline)
+                if is_ddp or is_job_worker:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                        killed.append(pid)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                        killed.append(pid)
+                    except (psutil.NoSuchProcess, PermissionError):
+                        pass
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
     except ImportError:
@@ -1043,11 +1141,10 @@ def _kill_ddp_processes(job_id: str) -> None:
     
     # Fallback: use pkill for remaining processes
     try:
-        import subprocess
-        # Kill torchrun processes
-        subprocess.run(['pkill', '-9', '-f', 'torchrun'], capture_output=True)
-        subprocess.run(['pkill', '-9', '-f', 'torch.distributed.run'], capture_output=True)
-        subprocess.run(['pkill', '-9', '-f', 'generate_ddp_file'], capture_output=True)
+        import subprocess as _sp
+        _sp.run(['pkill', '-9', '-f', 'torchrun'], capture_output=True)
+        _sp.run(['pkill', '-9', '-f', 'torch.distributed.run'], capture_output=True)
+        _sp.run(['pkill', '-9', '-f', 'generate_ddp_file'], capture_output=True)
     except Exception:
         pass
     
