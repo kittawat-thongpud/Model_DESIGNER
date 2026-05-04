@@ -460,6 +460,9 @@ def _scale_from_rtdetrv2_meta(meta: dict) -> str:
     return "s"
 
 
+_RTDETRV2_FLOPS_G = {"s": 60.0, "m": 100.0, "l": 136.0, "x": 259.0}
+
+
 def _parse_rtdetrv2_coco_stats(output: str) -> dict[str, float | None]:
     values: list[float] = []
     for line in output.splitlines():
@@ -552,6 +555,83 @@ def _load_rtdetrv2_per_class(eval_path: Path, data_yaml: Path) -> tuple[list[dic
         })
     mean_precision = sum(precisions_for_mean) / len(precisions_for_mean) if precisions_for_mean else None
     return per_class, mean_precision
+
+
+def _profile_rtdetrv2_runtime(
+    *,
+    root: Path,
+    upstream_config: Path,
+    pt_path: Path,
+    device: str,
+    imgsz: int,
+    env: dict,
+) -> dict[str, float | None]:
+    """Measure pure forward/postprocess latency in a clean upstream subprocess."""
+    import subprocess
+    import sys
+
+    script = r"""
+import json
+import sys
+import time
+import torch
+from src.core import YAMLConfig
+
+config, ckpt_path, device, imgsz_s = sys.argv[1:5]
+imgsz = int(imgsz_s)
+cfg = YAMLConfig(config)
+model = cfg.model
+postprocessor = cfg.postprocessor
+state = torch.load(ckpt_path, map_location="cpu")
+if isinstance(state, dict):
+    if "ema" in state and isinstance(state["ema"], dict) and "module" in state["ema"]:
+        state = state["ema"]["module"]
+    elif "model" in state:
+        state = state["model"]
+if isinstance(state, dict):
+    model.load_state_dict(state, strict=False)
+model = model.to(device).eval()
+try:
+    postprocessor = postprocessor.to(device).eval()
+except Exception:
+    pass
+x = torch.rand(1, 3, imgsz, imgsz, device=device)
+sizes = torch.tensor([[imgsz, imgsz]], device=device)
+with torch.no_grad():
+    for _ in range(3):
+        y = model(x)
+        _ = postprocessor(y, sizes)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    n = 20
+    t0 = time.perf_counter()
+    for _ in range(n):
+        y = model(x)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    for _ in range(n):
+        _ = postprocessor(y, sizes)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t2 = time.perf_counter()
+params = sum(p.numel() for p in model.parameters())
+print(json.dumps({"inference_ms": (t1 - t0) * 1000.0 / n, "postprocess_ms": (t2 - t1) * 1000.0 / n, "params": params}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(upstream_config), str(pt_path), str(device), str(imgsz)],
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return {"inference_ms": None, "postprocess_ms": None, "params": None}
+    try:
+        return json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return {"inference_ms": None, "postprocess_ms": None, "params": None}
 
 
 def _run_rtdetrv2_benchmark(
@@ -655,7 +735,15 @@ def _run_rtdetrv2_benchmark(
 
     stats = _parse_rtdetrv2_coco_stats(proc.stdout or "")
     per_class, mean_precision = _load_rtdetrv2_per_class(out_dir / "run" / "eval.pth", data_yaml)
-    inference_ms = _parse_rtdetrv2_latency(proc.stdout or "")
+    eval_iter_ms = _parse_rtdetrv2_latency(proc.stdout or "")
+    runtime = _profile_rtdetrv2_runtime(
+        root=root,
+        upstream_config=upstream_config,
+        pt_path=pt_path,
+        device=device,
+        imgsz=req.imgsz,
+        env=env,
+    )
     result = {
         "benchmark_id": benchmark_id,
         "weight_id": req.weight_id,
@@ -674,10 +762,11 @@ def _run_rtdetrv2_benchmark(
         "per_class": per_class,
         "confusion_matrix": None,
         "preprocess_ms": None,
-        "inference_ms": round(inference_ms, 2) if inference_ms is not None else None,
-        "postprocess_ms": None,
-        "params": meta.get("param_count"),
-        "flops_gflops": None,
+        "inference_ms": round(runtime.get("inference_ms"), 2) if runtime.get("inference_ms") is not None else None,
+        "postprocess_ms": round(runtime.get("postprocess_ms"), 2) if runtime.get("postprocess_ms") is not None else None,
+        "eval_iter_ms": round(eval_iter_ms, 2) if eval_iter_ms is not None else None,
+        "params": int(runtime.get("params") or meta.get("param_count") or 0) or None,
+        "flops_gflops": _RTDETRV2_FLOPS_G.get(scale),
         "hsg_decoder_alpha": [],
         "conf": req.conf,
         "iou": req.iou,
