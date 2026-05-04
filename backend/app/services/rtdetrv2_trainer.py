@@ -509,9 +509,17 @@ def run_worker(payload: dict[str, Any]) -> None:
     if not upstream_config.exists():
         raise RuntimeError(f"RT-DETRv2 upstream config not found: {upstream_config}")
 
-    data_arg = str(config.get("data") or "")
+    # Resolve dataset name — on resume, config["data"] may already be a data.yaml
+    # path from the previous run; prefer config["dataset_name"] in that case.
+    data_arg = str(config.get("dataset_name") or config.get("data") or "")
     if not dataset_registry.is_image_dataset(data_arg):
-        raise RuntimeError(f"RT-DETRv2 requires a registered image dataset, got: {data_arg!r}")
+        # Might be a data.yaml path — try to resolve dataset_name from job record
+        job_rec = job_storage.load_job(job_id)
+        ds_name = str((job_rec or {}).get("dataset_name") or "")
+        if ds_name and dataset_registry.is_image_dataset(ds_name):
+            data_arg = ds_name
+        else:
+            raise RuntimeError(f"RT-DETRv2 requires a registered image dataset, got: {data_arg!r}")
 
     data_yaml_path = job_dir / "data.yaml"
     dataset_yaml.write_data_yaml(
