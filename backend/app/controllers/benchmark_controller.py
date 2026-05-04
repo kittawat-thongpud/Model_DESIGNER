@@ -501,6 +501,21 @@ def _run_rtdetrv2_benchmark(
     out_dir = BENCHMARK_DIR / benchmark_id
     out_dir.mkdir(parents=True, exist_ok=True)
     export_dir = out_dir / "rtdetrv2_dataset"
+    # Upstream RT-DETR's config instantiates train/val dataloaders even for
+    # --test-only.  For benchmarking, avoid scanning/exporting the full train
+    # split when the requested split is val/test; point both dataloaders at the
+    # selected split.  This mirrors Ultralytics model.val(split=...) behavior.
+    try:
+        data_for_split = _yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+        selected = data_for_split.get(req.split) or data_for_split.get("val") or data_for_split.get("train")
+        if selected is not None:
+            data_for_split["train"] = selected
+            data_for_split["val"] = selected
+            bench_yaml = out_dir / "data_selected_split.yaml"
+            bench_yaml.write_text(_yaml.safe_dump(data_for_split, sort_keys=False), encoding="utf-8")
+            data_yaml = bench_yaml
+    except Exception:
+        pass
     image_root, train_json, val_json, nc = _prepare_coco_dataset(
         benchmark_id,
         data_yaml,
