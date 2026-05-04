@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 from ..config import DATASETS_DIR, JOBS_DIR, WEIGHTS_DIR
-from ..constants import train_channel
+from ..constants import job_channel, train_channel
 from . import dataset_registry, dataset_yaml, event_bus, job_storage
 
 
@@ -46,7 +46,17 @@ _SCALE_TO_CONFIG = {
 
 
 def _publish(job_id: str, job: dict) -> None:
+    """Publish to both train_channel (SSE progress) and job_channel (status)."""
     event_bus.publish_sync(train_channel(job_id), {"type": "status", **job})
+    event_bus.publish_sync(job_channel(job_id), {
+        "type": "job_update",
+        "job_id": job_id,
+        "status": job.get("status", "running"),
+        "epoch": job.get("epoch", 0),
+        "total_epochs": job.get("total_epochs", 0),
+        "message": job.get("message", ""),
+        "best_fitness": job.get("best_fitness"),
+    })
 
 
 def _set_job(job_id: str, **updates: Any) -> dict | None:
@@ -329,17 +339,54 @@ def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
         return
     job_storage.append_job_log(job_id, "INFO", text)
 
-    # ── Epoch header: "Epoch: [N]" ──────────────────────────────────────────
-    m = re.search(r"Epoch:\s*\[(\d+)\]", text)
+    # ── Epoch header / batch progress: "Epoch: [N]  [batch/total]" ──────────
+    m = re.match(r"Epoch:\s*\[(\d+)\]\s*\[(\d+)/(\d+)\]", text)
     if m:
-        epoch = int(m.group(1))
+        epoch_0 = int(m.group(1))
+        epoch_1 = epoch_0 + 1
+        batch = int(m.group(2))
+        total_batches = int(m.group(3))
         total_epochs = state.get("total_epochs", 0)
-        state["current_epoch"] = epoch
+        state["current_epoch"] = epoch_0
+
+        # Extract loss from same line: "loss: X.XXXX (Y.YYYY)"
+        loss_m = re.search(r"loss:\s*([\d.]+)", text)
+        loss_val = float(loss_m.group(1)) if loss_m else None
+
+        pct = round(batch / max(total_batches, 1) * 100, 1)
         _set_job(
             job_id,
-            epoch=epoch,
-            message=f"Training epoch {epoch}/{total_epochs}",
+            epoch=epoch_1,
+            message=f"Epoch {epoch_1}/{total_epochs} [{batch}/{total_batches}]",
         )
+        # Emit train-phase PROGRESS for SSE (rate-limited: only every 100 batches)
+        if batch % 100 == 0:
+            losses: dict[str, Any] = {}
+            # Extract individual losses from the line
+            for lk in ("loss_bbox", "loss_vfl", "loss_giou"):
+                lm = re.search(rf"{lk}:\s*([\d.]+)", text)
+                if lm:
+                    key_map = {"loss_bbox": "box", "loss_vfl": "cls", "loss_giou": "dfl"}
+                    losses[key_map[lk]] = round(float(lm.group(1)), 4)
+            job_storage.append_job_log(
+                job_id,
+                "PROGRESS",
+                f"Epoch {epoch_1}/{total_epochs} | {pct}% | Batch {batch}/{total_batches}",
+                {
+                    "type": "progress",
+                    "phase": "train",
+                    "epoch": f"{epoch_1}/{total_epochs}",
+                    "batch": f"{batch}/{total_batches}",
+                    "percent": pct,
+                    "losses": losses,
+                },
+            )
+        return
+    # Epoch header without batch (just "Epoch: [N]")
+    m2 = re.search(r"Epoch:\s*\[(\d+)\]", text)
+    if m2:
+        epoch_0 = int(m2.group(1))
+        state["current_epoch"] = epoch_0
         return
 
     # ── Averaged stats (train or test) ──────────────────────────────────────
@@ -403,6 +450,7 @@ def run_worker(payload: dict[str, Any]) -> None:
         status="running",
         started_at=datetime.utcnow().isoformat() + "Z",
         message="Preparing RT-DETRv2 training...",
+        total_epochs=int(config.get("epochs") or 100),
     )
 
     def _log(msg: str) -> None:
@@ -541,7 +589,13 @@ def run_worker(payload: dict[str, Any]) -> None:
     }
 
     def _poll_log_txt() -> None:
-        """Read new lines from upstream log.txt and push epoch history."""
+        """Read new lines from upstream log.txt and push epoch history.
+
+        Writes to ``<job_dir>/extended_metrics.jsonl`` using the same field
+        names that ``job_storage.get_job_history()`` expects, and emits
+        ``PROGRESS`` log entries so ``stream_controller`` can relay them
+        to the frontend via SSE.
+        """
         if not log_txt.exists():
             return
         try:
@@ -560,44 +614,106 @@ def run_worker(payload: dict[str, Any]) -> None:
             except json.JSONDecodeError:
                 continue
             epoch = entry.get("epoch", parse_state["current_epoch"])
+            # RT-DETRv2 uses 0-based epochs; Model Designer uses 1-based
+            epoch_1 = epoch + 1
             elapsed = time.time() - started
 
-            # Build history record compatible with Model Designer
-            history_entry: dict[str, Any] = {
-                "epoch": epoch,
-                "timestamp": time.time(),
-                "total_elapsed_s": elapsed,
-            }
-            # Map RT-DETRv2 keys → Model Designer keys
-            if "train_loss" in entry:
-                history_entry["box_loss"] = entry.get("train_loss", 0)
-            for k, v in entry.items():
-                if k.startswith("train_"):
-                    history_entry[k] = v
-                elif k.startswith("test_"):
-                    history_entry[k] = v
-
-            # Extract COCO eval AP from test_stats (list of 12 values)
+            # ── Extract COCO eval AP (list of 12 standard COCO metrics) ──
             test_coco = entry.get("test_coco_eval_bbox")
+            map50_95 = None
+            map50 = None
             if isinstance(test_coco, list) and len(test_coco) >= 2:
-                history_entry["mAP50_95"] = test_coco[0]
-                history_entry["mAP50"] = test_coco[1]
-                parse_state["mAP50_95"] = test_coco[0]
-                parse_state["mAP50"] = test_coco[1]
+                map50_95 = float(test_coco[0])
+                map50 = float(test_coco[1])
+                parse_state["mAP50_95"] = map50_95
+                parse_state["mAP50"] = map50
 
-            # Write to extended_metrics.jsonl for compatibility
-            metrics_path = (JOBS_DIR / job_id / "runs" / "train")
-            metrics_path.mkdir(parents=True, exist_ok=True)
+            # ── Build extended_metrics.jsonl entry ──────────────────────
+            # Field names MUST match what job_storage.get_job_history() reads:
+            #   train_box_loss, train_cls_loss, train_dfl_loss,
+            #   map50, map (=mAP50-95), map75, precision, recall, lr, etc.
+            train_loss = entry.get("train_loss")
+            train_loss_vfl = entry.get("train_loss_vfl")
+            train_loss_bbox = entry.get("train_loss_bbox")
+            train_loss_giou = entry.get("train_loss_giou")
+
+            epoch_data: dict[str, Any] = {
+                "epoch": epoch_1,
+                "timestamp": time.time(),
+                # Training losses — map RT-DETRv2 → Ultralytics-style names
+                "train_box_loss": train_loss_bbox or train_loss,
+                "train_cls_loss": train_loss_vfl,
+                "train_dfl_loss": train_loss_giou,
+                # Validation metrics (COCO AP)
+                "map50": map50,
+                "map": map50_95,  # job_storage maps "map" → mAP50_95
+                # Learning rate
+                "lr": entry.get("train_lr"),
+                # Validation time
+                "val_time_s": None,
+            }
+            # Remove None values
+            epoch_data = {k: v for k, v in epoch_data.items() if v is not None}
+
+            # Write to <job_dir>/extended_metrics.jsonl (same location as Ultralytics)
+            ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
             try:
-                with (metrics_path / "extended_metrics.jsonl").open("a") as mf:
-                    mf.write(json.dumps(history_entry) + "\n")
+                with ext_metrics_path.open("a") as mf:
+                    mf.write(json.dumps(epoch_data) + "\n")
             except Exception:
                 pass
 
-            # Update job with latest metrics
+            # ── Emit PROGRESS log → log.jsonl → SSE via stream_controller ──
+            progress_data: dict[str, Any] = {
+                "type": "progress",
+                "phase": "validation_done",
+                "epoch": f"{epoch_1}/{epochs}",
+                "total_epochs": epochs,
+                "batch": "0/0",
+                "percent": 100,
+                "losses": {
+                    "box": round(train_loss_bbox, 4) if train_loss_bbox else None,
+                    "cls": round(train_loss_vfl, 4) if train_loss_vfl else None,
+                    "dfl": round(train_loss_giou, 4) if train_loss_giou else None,
+                },
+                "val_map50": round(map50, 4) if map50 is not None else None,
+                "val_map": round(map50_95, 4) if map50_95 is not None else None,
+                "total_elapsed_s": round(elapsed, 1),
+            }
+            # Compute timing estimates
+            if epoch_1 > 0:
+                avg_epoch_s = elapsed / epoch_1
+                eta_s = avg_epoch_s * (epochs - epoch_1)
+                progress_data["avg_epoch_s"] = round(avg_epoch_s, 1)
+                progress_data["eta_s"] = round(eta_s, 0)
+
+            job_storage.append_job_log(
+                job_id,
+                "PROGRESS",
+                f"Epoch {epoch_1}/{epochs}"
+                + (f" | mAP50={map50:.4f}" if map50 is not None else "")
+                + (f" | mAP50-95={map50_95:.4f}" if map50_95 is not None else ""),
+                progress_data,
+            )
+
+            # Also publish epoch event to train_channel for real-time chart update
+            epoch_event: dict[str, Any] = {
+                "type": "epoch",
+                "epoch": epoch_1,
+                "box_loss": train_loss_bbox or train_loss or 0,
+                "cls_loss": train_loss_vfl or 0,
+                "dfl_loss": train_loss_giou or 0,
+                "mAP50": map50,
+                "mAP50_95": map50_95,
+                "lr": entry.get("train_lr", 0),
+                "epoch_time": 0,
+            }
+            event_bus.publish_sync(train_channel(job_id), epoch_event)
+
+            # ── Update job record ──────────────────────────────────────
             updates: dict[str, Any] = {
-                "epoch": epoch,
-                "message": f"Epoch {epoch}/{epochs}",
+                "epoch": epoch_1,
+                "message": f"Epoch {epoch_1}/{epochs}",
             }
             if parse_state.get("mAP50_95") is not None:
                 updates["best_mAP50_95"] = parse_state["mAP50_95"]
