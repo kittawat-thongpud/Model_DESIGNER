@@ -437,15 +437,8 @@ def _collect_hsg_decoder_alpha(model) -> list[dict]:
 
 
 def _isolated_weight_benchmark_error(meta: dict) -> str | None:
-    source_type = str(meta.get("source_type") or "").lower()
-    if source_type not in {"dino"}:
-        return None
-
-    model_name = meta.get("model_name") or meta.get("weight_id") or "this weight"
-    return (
-        f"{model_name} is a DINO self-supervised backbone checkpoint. "
-        "The detection benchmark endpoint only supports detector checkpoints."
-    )
+    """Return a blocking reason for isolated checkpoints unsupported here."""
+    return None
 
 
 def _scale_from_rtdetrv2_meta(meta: dict) -> str:
@@ -461,6 +454,241 @@ def _scale_from_rtdetrv2_meta(meta: dict) -> str:
 
 
 _RTDETRV2_FLOPS_G = {"s": 60.0, "m": 100.0, "l": 136.0, "x": 259.0}
+
+
+def _scale_from_dino_meta(meta: dict) -> str:
+    scale = str(meta.get("model_scale") or "").strip().lower()
+    if scale in {"vits16", "vits8", "vitb16", "vitb8", "resnet50"}:
+        return scale
+    arch = str(meta.get("arch_plugin") or meta.get("model_arch") or "").lower()
+    if arch.startswith("dino_"):
+        scale = arch.split("dino_", 1)[1]
+        if scale in {"vits16", "vits8", "vitb16", "vitb8", "resnet50"}:
+            return scale
+    model_name = str(meta.get("model_name") or "").lower()
+    for candidate in ("vits16", "vits8", "vitb16", "vitb8", "resnet50"):
+        if candidate in model_name:
+            return candidate
+    return "vits16"
+
+
+def _profile_dino_runtime(
+    *,
+    root: Path,
+    scale: str,
+    pt_path: Path,
+    device: str,
+    imgsz: int,
+    env: dict,
+) -> dict[str, float | int | None | str]:
+    """Measure DINO backbone forward latency/params/FLOPs in a clean subprocess."""
+    import subprocess
+    import sys
+
+    script = r"""
+import json
+import sys
+import time
+
+import torch
+
+scale, ckpt_path, device, imgsz_s = sys.argv[1:5]
+imgsz = int(imgsz_s)
+
+if scale == "resnet50":
+    import torchvision.models as tv_models
+    model = tv_models.resnet50(weights=None)
+    model.fc = torch.nn.Identity()
+else:
+    import vision_transformer as vits
+    arch, patch = {
+        "vits16": ("vit_small", 16),
+        "vits8": ("vit_small", 8),
+        "vitb16": ("vit_base", 16),
+        "vitb8": ("vit_base", 8),
+    }.get(scale, ("vit_small", 16))
+    model = vits.__dict__[arch](patch_size=patch, num_classes=0)
+
+raw = torch.load(ckpt_path, map_location="cpu")
+states = []
+if isinstance(raw, dict):
+    for key in ("teacher", "student", "model", "state_dict"):
+        val = raw.get(key)
+        if isinstance(val, dict):
+            states.append((key, val))
+states.append(("root", raw if isinstance(raw, dict) else {}))
+
+def strip_state(sd):
+    out = {}
+    for k, v in sd.items():
+        if not torch.is_tensor(v):
+            continue
+        nk = str(k)
+        for prefix in (
+            "module.backbone.",
+            "backbone.",
+            "module.encoder_q.",
+            "encoder_q.",
+            "module.",
+        ):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix):]
+                break
+        out[nk] = v
+    return out
+
+model_keys = set(model.state_dict().keys())
+best_name, best_state, best_matches = None, {}, -1
+for name, sd in states:
+    stripped = strip_state(sd)
+    matches = sum(1 for k in stripped if k in model_keys)
+    if matches > best_matches:
+        best_name, best_state, best_matches = name, stripped, matches
+
+if best_state:
+    model.load_state_dict(best_state, strict=False)
+
+flops_g = None
+try:
+    model.eval()
+    with torch.no_grad(), torch.profiler.profile(with_flops=True, activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        _ = model(torch.rand(1, 3, imgsz, imgsz))
+    total_flops = sum((getattr(evt, "flops", 0) or 0) for evt in prof.key_averages())
+    flops_g = total_flops / 1e9 if total_flops else None
+except Exception:
+    flops_g = None
+
+model = model.to(device).eval()
+x = torch.rand(1, 3, imgsz, imgsz, device=device)
+
+def sync():
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
+
+with torch.no_grad():
+    for _ in range(5):
+        _ = model(x)
+    sync()
+    n = 30
+    t0 = time.perf_counter()
+    for _ in range(n):
+        _ = model(x)
+    sync()
+    t1 = time.perf_counter()
+
+params = sum(p.numel() for p in model.parameters())
+print(json.dumps({
+    "inference_ms": (t1 - t0) * 1000.0 / n,
+    "params": params,
+    "flops_gflops": flops_g,
+    "loaded_state": best_name,
+    "matched_keys": best_matches,
+}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, scale, str(pt_path), str(device), str(imgsz)],
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return {
+            "inference_ms": None,
+            "params": None,
+            "flops_gflops": None,
+            "error": (proc.stdout or "")[-2000:],
+        }
+    try:
+        return json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return {
+            "inference_ms": None,
+            "params": None,
+            "flops_gflops": None,
+            "error": (proc.stdout or "")[-2000:],
+        }
+
+
+def _run_dino_benchmark(
+    req: BenchmarkRequest,
+    benchmark_id: str,
+    meta: dict,
+    pt_path: Path,
+) -> dict:
+    """Benchmark a DINO self-supervised backbone checkpoint.
+
+    DINO checkpoints are feature extractors rather than object detectors, so
+    this path reports model/runtime information and leaves detection metrics
+    empty instead of forcing the checkpoint through Ultralytics val().
+    """
+    import os
+    import torch
+    from dino.installer import ensure_installed
+
+    if int(meta.get("key_count") or 0) <= 0:
+        raise ValueError(
+            f"{meta.get('model_name') or req.weight_id} is an empty DINO profile placeholder, "
+            "not a trained/pretrained checkpoint. Create it with pretrained enabled or run training first."
+        )
+
+    root = ensure_installed()
+    scale = _scale_from_dino_meta(meta)
+    device = req.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, str) and device.isdigit():
+        device = f"cuda:{device}"
+
+    env = os.environ.copy()
+    backend_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join([str(root), backend_root, env.get("PYTHONPATH", "")])
+    env["PYTHONFAULTHANDLER"] = "1"
+
+    t0 = time.time()
+    runtime = _profile_dino_runtime(
+        root=root,
+        scale=scale,
+        pt_path=pt_path,
+        device=device,
+        imgsz=req.imgsz,
+        env=env,
+    )
+    elapsed_s = time.time() - t0
+    if runtime.get("error") and runtime.get("inference_ms") is None:
+        raise ValueError(f"DINO benchmark failed: {runtime['error']}")
+
+    result = {
+        "benchmark_id": benchmark_id,
+        "weight_id": req.weight_id,
+        "dataset": req.dataset,
+        "split": req.split,
+        "status": "completed",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "elapsed_s": round(elapsed_s, 1),
+        "mAP50": None,
+        "mAP50_95": None,
+        "precision": None,
+        "recall": None,
+        "fitness": None,
+        "per_class": [],
+        "confusion_matrix": None,
+        "preprocess_ms": None,
+        "inference_ms": round(runtime.get("inference_ms"), 2) if runtime.get("inference_ms") is not None else None,
+        "postprocess_ms": None,
+        "params": int(runtime.get("params") or meta.get("param_count") or 0) or None,
+        "flops_gflops": round(float(runtime["flops_gflops"]), 3) if runtime.get("flops_gflops") is not None else None,
+        "hsg_decoder_alpha": [],
+        "conf": req.conf,
+        "iou": req.iou,
+        "imgsz": req.imgsz,
+        "source_type": "dino",
+        "benchmark_type": "backbone",
+        "loaded_state": runtime.get("loaded_state"),
+        "matched_keys": runtime.get("matched_keys"),
+    }
+    (BENCHMARK_DIR / f"{benchmark_id}.json").write_text(json.dumps(result, indent=2))
+    return result
 
 
 def _parse_rtdetrv2_coco_stats(output: str) -> dict[str, float | None]:
@@ -826,6 +1054,9 @@ def _run_benchmark(req: BenchmarkRequest, benchmark_id: str | None = None) -> di
     pt_path = weight_storage.weight_pt_path(req.weight_id)
     if not pt_path.exists():
         raise ValueError(f"Weight file missing: {req.weight_id}")
+
+    if str(meta.get("source_type") or "").lower() == "dino":
+        return _run_dino_benchmark(req, benchmark_id, meta, pt_path)
 
     # Resolve dataset yaml — try multiple locations in priority order
     data_yaml = _resolve_dataset_yaml(req.dataset, meta)
