@@ -122,6 +122,78 @@ def _build_layer_label_map(model_id: str | None) -> dict[str, str]:
     return label_map
 
 
+def _is_isolated_arch_plugin(arch_plugin) -> bool:
+    """Arch families that train through their own upstream runner, not YOLO YAML."""
+    return getattr(arch_plugin, "family", "") in {"rtdetrv2", "dino"}
+
+
+def _create_isolated_arch_weight(*, arch_plugin, body: CreateEmptyRequest, torch):
+    """Create a metadata/checkpoint placeholder for non-Ultralytics arch plugins."""
+    _scale_upper = (arch_plugin.scale or "").upper()
+    default_name = (
+        f"{arch_plugin.family_display_name} {_scale_upper}"
+        if _scale_upper else arch_plugin.family_display_name
+    )
+    display_name = body.name.strip() if body.name.strip() else default_name
+    model_id_meta = f"arch:{arch_plugin.family}"
+
+    weight_id = weight_storage.save_weight_meta(
+        model_id=model_id_meta,
+        model_name=display_name,
+        job_id=None,
+        dataset="(empty)",
+        epochs_trained=0,
+        final_accuracy=None,
+        final_loss=None,
+        model_scale=arch_plugin.scale,
+    )
+    pt_path = weight_storage.weight_pt_path(weight_id)
+    ckpt = {
+        "model": {},
+        "epoch": -1,
+        "optimizer": None,
+        "train_args": {
+            "model_arch": arch_plugin.name,
+            "arch_family": arch_plugin.family,
+            "model_scale": arch_plugin.scale,
+        },
+        "source_type": arch_plugin.family,
+        "date": None,
+        "version": None,
+    }
+    torch.save(ckpt, str(pt_path))
+
+    meta = weight_storage.load_weight_meta(weight_id)
+    if meta:
+        meta.update(
+            {
+                "file_size_bytes": pt_path.stat().st_size,
+                "key_count": 0,
+                "param_count": 0,
+                "arch_plugin": arch_plugin.name,
+                "model_arch": arch_plugin.name,
+                "source_type": arch_plugin.family,
+                "train_args": ckpt["train_args"],
+                "note": (
+                    f"{arch_plugin.family_display_name} trains through an isolated upstream runner; "
+                    "this empty weight is a Model Designer profile placeholder."
+                ),
+            }
+        )
+        weight_storage._store.save(weight_id, meta)
+
+    logger.log("system", "INFO", "Isolated arch plugin weight profile created", {
+        "weight_id": weight_id, "arch_plugin": arch_plugin.name,
+    })
+    return {
+        "weight_id": weight_id,
+        "model_id": model_id_meta,
+        "model_name": display_name,
+        "key_count": 0,
+        "file_size_bytes": pt_path.stat().st_size,
+    }
+
+
 @router.post("/create-empty", summary="Create an empty weight from a model")
 async def create_empty_weight(body: CreateEmptyRequest):
     """Generate a weight file from a model architecture or official YOLO checkpoint.
@@ -210,6 +282,9 @@ async def create_empty_weight(body: CreateEmptyRequest):
         preflight_err = arch_plugin.preflight_check()
         if preflight_err:
             raise HTTPException(status_code=400, detail=preflight_err)
+
+        if _is_isolated_arch_plugin(arch_plugin):
+            return _create_isolated_arch_weight(arch_plugin=arch_plugin, body=body, torch=torch)
 
         arch_plugin.register_modules()
         yaml_path = arch_plugin.yaml_path()
@@ -420,6 +495,13 @@ async def get_weight_info(weight_id: str):
     # Register arch plugin for custom models before loading .pt file
     weight_meta = weight_storage.load_weight_meta(weight_id)
     _register_arch_plugin_for_weight(weight_meta)
+    if weight_meta and weight_meta.get("source_type") in {"rtdetrv2", "dino"}:
+        return {
+            "params": weight_meta.get("param_count", 0),
+            "gflops": None,
+            "source_type": weight_meta.get("source_type"),
+            "note": weight_meta.get("note") or "This isolated upstream checkpoint is not loadable via Ultralytics YOLO info.",
+        }
 
     try:
         from ultralytics import YOLO
