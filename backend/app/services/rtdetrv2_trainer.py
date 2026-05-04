@@ -63,20 +63,33 @@ def _read_data_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+def _remap_dataset_path(path: Path) -> Path:
+    """Map stale absolute /.../datasets/<name>/... paths to this workspace."""
+    if path.exists():
+        return path
+    parts = list(path.parts)
+    for i, part in enumerate(parts):
+        if part == "datasets" and i + 1 < len(parts):
+            candidate = DATASETS_DIR / Path(*parts[i + 1:])
+            if candidate.exists():
+                return candidate
+    return path
+
+
 def _resolve_split_paths(data: dict[str, Any], split: str) -> list[Path]:
-    root = Path(str(data.get("path") or "."))
+    root = _remap_dataset_path(Path(str(data.get("path") or ".")))
     raw = data.get(split) or data.get("train")
     if raw is None:
         return []
     raw_path = Path(str(raw))
     if raw_path.suffix == ".txt":
-        txt = raw_path if raw_path.is_absolute() else root / raw_path
+        txt = _remap_dataset_path(raw_path if raw_path.is_absolute() else root / raw_path)
         return [
-            Path(line.strip())
+            _remap_dataset_path(Path(line.strip()))
             for line in txt.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-    base = raw_path if raw_path.is_absolute() else root / raw_path
+    base = _remap_dataset_path(raw_path if raw_path.is_absolute() else root / raw_path)
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
     return sorted(p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts)
 
@@ -86,11 +99,12 @@ def _label_path_for_image(image_path: Path) -> Path:
     for i, part in enumerate(parts):
         if part == "images":
             parts[i] = "labels"
-            return Path(*parts).with_suffix(".txt")
-    return image_path.parent.parent / "labels" / image_path.parent.name / f"{image_path.stem}.txt"
+            return _remap_dataset_path(Path(*parts).with_suffix(".txt"))
+    return _remap_dataset_path(image_path.parent.parent / "labels" / image_path.parent.name / f"{image_path.stem}.txt")
 
 
 def _image_size(path: Path) -> tuple[int, int]:
+    path = _remap_dataset_path(path)
     try:
         from PIL import Image
 
@@ -125,6 +139,7 @@ def _export_split_to_coco(
     ann_id = 1
 
     for img_id, image_path in enumerate(image_paths, start=1):
+        image_path = _remap_dataset_path(image_path)
         width, height = _image_size(image_path)
         try:
             file_name = str(image_path.relative_to(image_root))
@@ -165,7 +180,7 @@ def _prepare_coco_dataset(job_id: str, data_yaml_path: Path, out_dir: Path) -> t
     data = _read_data_yaml(data_yaml_path)
     names = _normalise_names(data.get("names"))
     nc = int(data.get("nc") or len(names) or 1)
-    image_root = Path(str(data.get("path") or DATASETS_DIR)).resolve()
+    image_root = _remap_dataset_path(Path(str(data.get("path") or DATASETS_DIR))).resolve()
     categories = [{"id": i, "name": names[i] if i < len(names) else f"class{i}"} for i in range(nc)]
 
     train_paths = _resolve_split_paths(data, "train")
