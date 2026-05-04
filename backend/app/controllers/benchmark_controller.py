@@ -476,6 +476,84 @@ def _parse_rtdetrv2_coco_stats(output: str) -> dict[str, float | None]:
     }
 
 
+def _parse_rtdetrv2_latency(output: str) -> float | None:
+    matches = re.findall(r"Total time: .*?\(([-+]?\d*\.?\d+)\s+s\s*/\s+it\)", output)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1]) * 1000.0
+    except ValueError:
+        return None
+
+
+def _load_rtdetrv2_per_class(eval_path: Path, data_yaml: Path) -> tuple[list[dict], float | None]:
+    if not eval_path.exists():
+        return [], None
+    try:
+        import torch
+        import yaml as _yaml
+        import numpy as _np
+
+        eval_data = torch.load(eval_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return [], None
+
+    precision = eval_data.get("precision")
+    recall = eval_data.get("recall")
+    if precision is None:
+        return [], None
+
+    try:
+        names_raw = (_yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}).get("names") or {}
+        if isinstance(names_raw, list):
+            names = {i: str(n) for i, n in enumerate(names_raw)}
+        else:
+            names = {int(k): str(v) for k, v in names_raw.items()}
+    except Exception:
+        names = {}
+
+    p = _np.asarray(precision)
+    r = _np.asarray(recall) if recall is not None else None
+    # precision shape: [TxRxKxAxM], recall shape: [TxKxAxM]
+    if p.ndim != 5:
+        return [], None
+    area_idx = 0
+    maxdet_idx = p.shape[4] - 1
+    ap_all = p[:, :, :, area_idx, maxdet_idx]
+    ap50_all = p[0, :, :, area_idx, maxdet_idx]
+    class_count = ap_all.shape[2]
+    per_class: list[dict] = []
+    precisions_for_mean: list[float] = []
+    for cls_id in range(class_count):
+        ap_vals = ap_all[:, :, cls_id]
+        ap_vals = ap_vals[ap_vals > -1]
+        ap50_vals = ap50_all[:, cls_id]
+        ap50_vals = ap50_vals[ap50_vals > -1]
+        ap = float(ap_vals.mean()) if ap_vals.size else None
+        ap50 = float(ap50_vals.mean()) if ap50_vals.size else None
+        rec = None
+        if r is not None and r.ndim == 4 and cls_id < r.shape[1]:
+            r_vals = r[:, cls_id, area_idx, maxdet_idx]
+            r_vals = r_vals[r_vals > -1]
+            rec = float(r_vals.mean()) if r_vals.size else None
+        # COCO eval does not expose final per-class precision directly in the
+        # same way Ultralytics does; this is mean precision over IoU/recall.
+        prec = ap
+        if prec is not None:
+            precisions_for_mean.append(prec)
+        per_class.append({
+            "class_id": cls_id,
+            "class_name": names.get(cls_id, str(cls_id)),
+            "ap50": round(ap50, 4) if ap50 is not None else None,
+            "ap50_95": round(ap, 4) if ap is not None else None,
+            "precision": round(prec, 4) if prec is not None else None,
+            "recall": round(rec, 4) if rec is not None else None,
+            "f1": None,
+        })
+    mean_precision = sum(precisions_for_mean) / len(precisions_for_mean) if precisions_for_mean else None
+    return per_class, mean_precision
+
+
 def _run_rtdetrv2_benchmark(
     req: BenchmarkRequest,
     benchmark_id: str,
@@ -576,6 +654,8 @@ def _run_rtdetrv2_benchmark(
         raise ValueError(f"RT-DETRv2 benchmark failed with exit code {proc.returncode}: {(proc.stdout or '')[-2000:]}")
 
     stats = _parse_rtdetrv2_coco_stats(proc.stdout or "")
+    per_class, mean_precision = _load_rtdetrv2_per_class(out_dir / "run" / "eval.pth", data_yaml)
+    inference_ms = _parse_rtdetrv2_latency(proc.stdout or "")
     result = {
         "benchmark_id": benchmark_id,
         "weight_id": req.weight_id,
@@ -588,13 +668,13 @@ def _run_rtdetrv2_benchmark(
         "mAP50": round(stats["mAP50"], 4) if stats["mAP50"] is not None else None,
         "mAP50_95": round(stats["mAP50_95"], 4) if stats["mAP50_95"] is not None else None,
         "mAP75": round(stats["mAP75"], 4) if stats["mAP75"] is not None else None,
-        "precision": None,
+        "precision": round(mean_precision, 4) if mean_precision is not None else None,
         "recall": round(stats["recall"], 4) if stats["recall"] is not None else None,
         "fitness": None,
-        "per_class": [],
+        "per_class": per_class,
         "confusion_matrix": None,
         "preprocess_ms": None,
-        "inference_ms": None,
+        "inference_ms": round(inference_ms, 2) if inference_ms is not None else None,
         "postprocess_ms": None,
         "params": meta.get("param_count"),
         "flops_gflops": None,
