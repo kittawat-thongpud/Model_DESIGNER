@@ -81,7 +81,7 @@ def get_weight_info(weight_id: str) -> dict[str, Any]:
                 if arch_plugin:
                     arch_plugin.register_modules()
 
-        from ultralytics import YOLO
+        from ultralytics import RTDETR, YOLO
         from ultralytics.utils.torch_utils import get_flops
         yolo = YOLO(str(pt_path))
         params = sum(p.numel() for p in yolo.model.parameters())
@@ -141,10 +141,11 @@ def create_empty_weight(
 
         if yolo_model:
             yolo_key = yolo_model.strip()
+            model_cls = RTDETR if yolo_key.lower().startswith("rtdetr") else YOLO
             if use_pretrained:
-                model = YOLO(f"{yolo_key}.pt")
+                model = model_cls(f"{yolo_key}.pt")
             else:
-                model = YOLO(f"{yolo_key}.yaml")
+                model = model_cls(f"{yolo_key}.yaml")
             sd = model.model.state_dict()
             pretrained_label = "pretrained-coco" if use_pretrained else "random-init"
             display_name = name.strip() if name.strip() else f"{yolo_key}-{pretrained_label}"

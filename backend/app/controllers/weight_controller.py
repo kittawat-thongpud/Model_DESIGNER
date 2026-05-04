@@ -132,21 +132,22 @@ async def create_empty_weight(body: CreateEmptyRequest):
     3. ``model_id``      → custom model YAML from the database.
     """
     import torch
-    from ultralytics import YOLO
+    from ultralytics import RTDETR, YOLO
 
     # ── Branch A: Official YOLO model ────────────────────────────────────────
     if body.yolo_model:
         yolo_key = body.yolo_model.strip()   # e.g. "yolov8n", "yolov8s"
+        model_cls = RTDETR if yolo_key.lower().startswith("rtdetr") else YOLO
         try:
             if body.use_pretrained:
                 # Downloads pretrained weights from Ultralytics hub if not cached
-                model = YOLO(f"{yolo_key}.pt")
+                model = model_cls(f"{yolo_key}.pt")
             else:
                 # Load architecture only (random init) via YAML
-                model = YOLO(f"{yolo_key}.yaml")
+                model = model_cls(f"{yolo_key}.yaml")
             sd = model.model.state_dict()
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load YOLO model '{yolo_key}': {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to load official Ultralytics model '{yolo_key}': {e}")
 
         pretrained_label = "pretrained-coco" if body.use_pretrained else "random-init"
         display_name = body.name.strip() if body.name.strip() else f"{yolo_key}-{pretrained_label}"

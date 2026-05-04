@@ -1,0 +1,10 @@
+# DINO ViT-S/8 metadata for Model Designer plugin discovery.
+# Source: https://github.com/facebookresearch/dino
+
+family: dino
+scale: vits8
+upstream_repo: https://github.com/facebookresearch/dino
+arch: vit_small
+patch_size: 8
+hub_model: dino_vits8
+task: self_supervised

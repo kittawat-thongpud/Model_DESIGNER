@@ -1228,6 +1228,11 @@ def register_custom_modules() -> None:
     
     This must be called before loading a YOLO model that uses custom modules
     (like SparseGlobalBlock).
+
+    Keep architecture plugins that patch Ultralytics' ``parse_model`` out of
+    this blanket startup hook.  They are registered by their selected
+    ``ModelArchPlugin`` so one architecture cannot overwrite another parser
+    patch in a long-lived backend process.
     """
     # 1. HSG-DET modules
     try:
@@ -1235,12 +1240,6 @@ def register_custom_modules() -> None:
     except ImportError as e:
         print(f"Warning: Could not import hsg_det: {e}")
 
-    # 2. HSG-DETR modules
-    try:
-        import hsg_detr  # noqa: F401
-    except ImportError as e:
-        print(f"Warning: Could not import hsg_detr: {e}")
-
-    # 3. Future: Dynamic user modules from module_storage
+    # 2. Future: Dynamic user modules from module_storage
     # (Currently they are just config-based, but if we add code generation
     # we would import them here)

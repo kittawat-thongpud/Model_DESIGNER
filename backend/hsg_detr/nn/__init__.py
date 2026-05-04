@@ -9,6 +9,8 @@ Idempotent — safe to call ``register()`` multiple times.
 """
 from __future__ import annotations
 
+import linecache
+
 from .sparse_global_token import (
     SGTokenBlock,
     SGStem,
@@ -109,7 +111,14 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
         new_globals[name] = cls
 
     try:
-        code = compile(src, "<hsg_detr_parse_model_patch>", "exec")
+        filename = "<hsg_detr_parse_model_patch>"
+        linecache.cache[filename] = (
+            len(src),
+            None,
+            [line + "\n" for line in src.splitlines()],
+            filename,
+        )
+        code = compile(src, filename, "exec")
         ns: dict = {}
         exec(code, new_globals, ns)  # noqa: S102
         if "parse_model" not in ns:

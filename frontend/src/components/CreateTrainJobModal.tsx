@@ -365,6 +365,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
   };
 
   const isTaskCompatible = (datasetTask: string, modelTask: string) => {
+    if (selectedModelId === 'arch:dino') return true;
     return normalizeTask(datasetTask) === normalizeTask(modelTask);
   };
 

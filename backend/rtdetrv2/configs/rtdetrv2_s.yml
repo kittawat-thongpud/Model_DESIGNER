@@ -1,0 +1,16 @@
+# RT-DETRv2-S metadata for Model Designer plugin discovery.
+# Source config:
+# https://github.com/lyuwenyu/RT-DETR/blob/main/rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml
+#
+# NOTE: This is not an Ultralytics model YAML. It records the upstream
+# lyuwenyu/RT-DETR config/checkpoint mapping so the architecture can be
+# discovered without importing the Mamba-YOLO vendor copy of RT-DETR.
+
+family: rtdetrv2
+scale: s
+upstream_repo: https://github.com/lyuwenyu/RT-DETR
+upstream_config: rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco.yml
+checkpoint_url: https://github.com/lyuwenyu/storage/releases/download/v0.2/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth
+params_m: 20
+flops_g: 60
+input_size: 640

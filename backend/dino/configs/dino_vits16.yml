@@ -1,0 +1,10 @@
+# DINO ViT-S/16 metadata for Model Designer plugin discovery.
+# Source: https://github.com/facebookresearch/dino
+
+family: dino
+scale: vits16
+upstream_repo: https://github.com/facebookresearch/dino
+arch: vit_small
+patch_size: 16
+hub_model: dino_vits16
+task: self_supervised

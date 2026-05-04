@@ -14,6 +14,7 @@ to add our four modules exactly as the upstream Mamba-YOLO fork does.
 from __future__ import annotations
 
 import importlib.util
+import linecache
 import sys
 import types
 from pathlib import Path
@@ -198,7 +199,14 @@ def _patch_parse_model(modules: dict) -> bool:
         new_globals[name] = cls
 
     try:
-        code = compile(src, "<mamba_parse_model_patch>", "exec")
+        filename = "<mamba_parse_model_patch>"
+        linecache.cache[filename] = (
+            len(src),
+            None,
+            [line + "\n" for line in src.splitlines()],
+            filename,
+        )
+        code = compile(src, filename, "exec")
         ns: dict = {}
         exec(code, new_globals, ns)  # noqa: S102
         if "parse_model" not in ns:
@@ -231,6 +239,16 @@ def _inject_globals(modules: dict) -> None:
         pass
 
 
+def _parse_model_has_modules(modules: dict) -> bool:
+    """Return True when the live parser can resolve this plugin's modules."""
+    try:
+        import ultralytics.nn.tasks as _tasks
+    except ImportError:
+        return False
+    parser_globals = getattr(_tasks.parse_model, "__globals__", {})
+    return all(parser_globals.get(name) is cls for name, cls in modules.items())
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 _registered = False
@@ -244,9 +262,9 @@ def register() -> None:
     Raises ImportError if the repo has not been cloned yet.
     """
     global _registered
-    if _registered:
-        return
     modules = _load_mamba_modules()
+    if _registered and _parse_model_has_modules(modules):
+        return
     _inject_globals(modules)
     _patch_parse_model(modules)
     _registered = True

@@ -1,0 +1,12 @@
+# RT-DETRv2-M metadata for Model Designer plugin discovery.
+# Source config:
+# https://github.com/lyuwenyu/RT-DETR/blob/main/rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_m_7x_coco.yml
+
+family: rtdetrv2
+scale: m
+upstream_repo: https://github.com/lyuwenyu/RT-DETR
+upstream_config: rtdetrv2_pytorch/configs/rtdetrv2/rtdetrv2_r50vd_m_7x_coco.yml
+checkpoint_url: https://github.com/lyuwenyu/storage/releases/download/v0.1/rtdetrv2_r50vd_m_7x_coco_ema.pth
+params_m: 36
+flops_g: 100
+input_size: 640

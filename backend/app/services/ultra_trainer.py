@@ -274,8 +274,53 @@ def _apply_native_crash_retry_mitigation(config: dict[str, Any], attempt: int) -
     return mitigated
 
 
+def _job_arch_family(job: dict | None) -> str:
+    if not job:
+        return ""
+    model_id = str(job.get("model_id") or "")
+    if model_id.startswith("arch:"):
+        return model_id[len("arch:"):].lower()
+    model_arch = str((job.get("config") or {}).get("model_arch") or "").lower()
+    if model_arch.startswith("rtdetrv2"):
+        return "rtdetrv2"
+    if model_arch.startswith("dino"):
+        return "dino"
+    return ""
+
+
+def _checkpoint_candidates_for_job(job_id: str, *, prefer_best: bool = False) -> list[Path]:
+    job = job_storage.load_job(job_id)
+    job_dir = JOBS_DIR / job_id
+    family = _job_arch_family(job)
+
+    if family == "rtdetrv2":
+        run_dir = job_dir / "runs" / "rtdetrv2"
+        ordered = [run_dir / "best.pth", run_dir / "last.pth", run_dir / "checkpoint.pth"]
+        if not prefer_best:
+            ordered = [run_dir / "last.pth", run_dir / "checkpoint.pth", run_dir / "best.pth"]
+        return [*ordered, *sorted(run_dir.rglob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)]
+
+    if family == "dino":
+        run_dir = job_dir / "runs" / "dino"
+        return [
+            run_dir / "checkpoint.pth",
+            *sorted(run_dir.glob("checkpoint*.pth"), key=lambda p: p.stat().st_mtime, reverse=True),
+        ]
+
+    weights_dir = job_dir / "runs" / "train" / "weights"
+    ordered = [weights_dir / "best.pt", weights_dir / "last.pt"] if prefer_best else [weights_dir / "last.pt", weights_dir / "best.pt"]
+    return ordered
+
+
 def _last_checkpoint_path(job_id: str) -> Path:
+    for checkpoint in _checkpoint_candidates_for_job(job_id):
+        if checkpoint.exists():
+            return checkpoint
     return JOBS_DIR / job_id / "runs" / "train" / "weights" / "last.pt"
+
+
+def _best_available_checkpoint_path(job_id: str) -> Path | None:
+    return next((p for p in _checkpoint_candidates_for_job(job_id, prefer_best=True) if p.exists()), None)
 
 
 def _close_worker_log_handle(proc: subprocess.Popen | None) -> None:
@@ -740,14 +785,14 @@ def resume_training(job_id: str) -> None:
     if job.get("status") == "running":
         raise ValueError(f"Job {job_id} is already running")
 
-    job_dir = JOBS_DIR / job_id
-    last_pt = job_dir / "runs" / "train" / "weights" / "last.pt"
-    if not last_pt.exists():
-        raise ValueError(f"No checkpoint (last.pt) found for job {job_id}")
+    checkpoint = _last_checkpoint_path(job_id)
+    if not checkpoint.exists():
+        raise ValueError(f"No checkpoint found for job {job_id}")
 
-    # Build resume config: same config but with resume=True pointing at last.pt
+    # Build resume config: same config but with resume pointing at the native
+    # checkpoint path for the trainer family.
     resume_config = dict(job.get("config", {}))
-    resume_config["resume"] = str(last_pt)
+    resume_config["resume"] = str(checkpoint)
     resume_config.pop("pretrained", None)
 
     _restart_job(job_id, resume_config)
@@ -766,18 +811,23 @@ def append_training(job_id: str, additional_epochs: int) -> None:
     if job.get("status") == "running":
         raise ValueError(f"Job {job_id} is already running")
 
-    job_dir = JOBS_DIR / job_id
-    last_pt = job_dir / "runs" / "train" / "weights" / "last.pt"
-    best_pt = job_dir / "runs" / "train" / "weights" / "best.pt"
-    checkpoint = last_pt if last_pt.exists() else (best_pt if best_pt.exists() else None)
+    checkpoint = _best_available_checkpoint_path(job_id)
     if checkpoint is None:
         raise ValueError(f"No checkpoint found for job {job_id}")
 
-    # Build append config: same config, load last.pt as pretrained, set epochs = additional_epochs
     append_config = dict(job.get("config", {}))
-    append_config["pretrained"] = str(checkpoint)
-    append_config["epochs"] = additional_epochs
-    append_config.pop("resume", None)
+    family = _job_arch_family(job)
+    if family in {"dino", "rtdetrv2"}:
+        # These upstream trainers resume by total target epochs.
+        append_config["resume"] = str(checkpoint)
+        append_config["epochs"] = int(job.get("epoch", 0) or 0) + additional_epochs
+        append_config.pop("pretrained", None)
+    else:
+        # Ultralytics path keeps the existing append semantics: warm-start and
+        # train a fresh run for the requested additional epoch count.
+        append_config["pretrained"] = str(checkpoint)
+        append_config["epochs"] = additional_epochs
+        append_config.pop("resume", None)
 
     # Update total_epochs in job record before starting
     job["total_epochs"] = job.get("total_epochs", 0) + additional_epochs
@@ -1236,6 +1286,7 @@ def _training_worker(
             if arch_plugin:
                 job_storage.append_job_log(job_id, "INFO",
                     f"Auto-detected arch plugin from YAML: {arch_plugin.display_name}")
+                arch_plugin.register_modules()
 
         # Muon optimizer in current Ultralytics build expects 2D tensors and can
         # assert on Mamba-YOLO parameter groups. Force a stable optimizer here.
@@ -1533,13 +1584,14 @@ def _training_worker(
                 job_storage.append_job_log(job_id, "INFO", f"Resuming from checkpoint: {resume_path}")
             elif yolo_model:
                 # Official YOLO model mode
+                official_model_cls = RTDETR if str(yolo_model).lower().startswith("rtdetr") else YOLO
                 if use_yolo_pretrained:
                     # Load pretrained YOLO model
-                    model = YOLO(f"{yolo_model}.pt")
+                    model = official_model_cls(f"{yolo_model}.pt")
                     job_storage.append_job_log(job_id, "INFO", f"Using official YOLO model: {yolo_model}.pt (pretrained)")
                 else:
                     # Load YOLO architecture without pretrained weights (train from scratch)
-                    model = YOLO(f"{yolo_model}.yaml")
+                    model = official_model_cls(f"{yolo_model}.yaml")
                     job_storage.append_job_log(job_id, "INFO", f"Using official YOLO model: {yolo_model}.yaml (from scratch)")
             else:
                 # Custom model from YAML
@@ -2153,7 +2205,8 @@ def _training_worker(
             # Recreate a fresh model instance using the same initialization mode.
             # NOTE: This is used when NaN happens before last.pt exists.
             if yolo_model:
-                return YOLO(f"{yolo_model}.pt") if use_yolo_pretrained else YOLO(f"{yolo_model}.yaml")
+                official_model_cls = RTDETR if str(yolo_model).lower().startswith("rtdetr") else YOLO
+                return official_model_cls(f"{yolo_model}.pt") if use_yolo_pretrained else official_model_cls(f"{yolo_model}.yaml")
             # Detect RTDETRDecoder to use correct model class
             try:
                 yaml_text = Path(yaml_path).read_text()
@@ -2918,6 +2971,26 @@ def _run_worker_from_args_file(args_path: str) -> int:
         job_storage.append_job_log(job_id, "INFO", f"Worker plugin discovery: {counts}")
     except Exception as exc:
         job_storage.append_job_log(job_id, "WARNING", f"Worker plugin discovery failed: {exc}")
+
+    try:
+        from ..plugins.loader import get_arch_plugin
+        model_arch = str((payload.get("config") or {}).get("model_arch") or "")
+        arch_plugin = get_arch_plugin(model_arch) if model_arch else None
+        if arch_plugin and arch_plugin.family == "rtdetrv2":
+            from . import rtdetrv2_trainer
+
+            job_storage.append_job_log(job_id, "INFO", f"Routing worker to RT-DETRv2 trainer: {model_arch}")
+            rtdetrv2_trainer.run_worker(payload)
+            return 0
+        if arch_plugin and arch_plugin.family == "dino":
+            from . import dino_trainer
+
+            job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO trainer: {model_arch}")
+            dino_trainer.run_worker(payload)
+            return 0
+    except Exception:
+        raise
+
     _training_worker(
         job_id,
         str(payload.get("yaml_path") or ""),

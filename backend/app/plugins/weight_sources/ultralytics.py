@@ -47,6 +47,11 @@ _YOLO_PRETRAINED: list[dict] = [
      "param_count": 3_400_000, "description": "YOLOv8 Nano segmentation — COCO"},
     {"model_key": "yolov8s-seg", "display_name": "YOLOv8s-seg", "task": "segmentation",
      "param_count": 11_800_000, "description": "YOLOv8 Small segmentation — COCO"},
+    # RT-DETR Detection
+    {"model_key": "rtdetr-l", "display_name": "RT-DETR-L", "task": "detection",
+     "param_count": 31_800_000, "description": "RT-DETR Large — NMS-free transformer detector"},
+    {"model_key": "rtdetr-x", "display_name": "RT-DETR-X", "task": "detection",
+     "param_count": 67_400_000, "description": "RT-DETR Extra-Large — NMS-free transformer detector"},
     # YOLO26 Detection
     {"model_key": "yolo26n", "display_name": "YOLO26n (Nano)", "task": "detection",
      "param_count": 3_200_000, "description": "YOLO26 Nano — 3.2M params, fastest, NMS-free"},
@@ -61,6 +66,10 @@ _YOLO_PRETRAINED: list[dict] = [
 ]
 
 _DOWNLOAD_URL = "https://github.com/ultralytics/assets/releases/download/v8.2.0/{key}.pt"
+
+
+def _is_rtdetr_key(model_key: str) -> bool:
+    return model_key.strip().lower().startswith("rtdetr")
 
 
 class UltralyticsWeightSource(WeightSourcePlugin):
@@ -195,10 +204,13 @@ class UltralyticsWeightSource(WeightSourcePlugin):
 
         entry = catalog[model_key]
 
-        # Use ultralytics YOLO() which auto-downloads + caches the .pt file
+        # Use the matching Ultralytics model class which auto-downloads + caches
+        # the .pt file. RT-DETR keys must go through RTDETR for correct task
+        # routing in versions that support those weights.
         try:
-            from ultralytics import YOLO
-            yolo_model = YOLO(f"{model_key}.pt")
+            from ultralytics import RTDETR, YOLO
+            model_cls = RTDETR if _is_rtdetr_key(model_key) else YOLO
+            yolo_model = model_cls(f"{model_key}.pt")
             # The .pt file is now at yolo_model.ckpt_path (or model_key.pt in cwd)
             pt_path = Path(yolo_model.ckpt_path) if hasattr(yolo_model, 'ckpt_path') else Path(f"{model_key}.pt")
             if not pt_path.exists():
