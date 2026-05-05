@@ -2431,6 +2431,19 @@ def _training_worker(
             target=_log_tailer, daemon=True, name=f"log_tailer_{job_id}")
         _tailer_thread.start()
 
+        # Strip pretrained from args.yaml so Ultralytics doesn't reload stale
+        # weight reference from the original run on resume
+        _args_yaml = job_dir / "runs" / "train" / "args.yaml"
+        if _args_yaml.exists() and train_kwargs.get("resume"):
+            try:
+                import yaml as _yaml
+                _ay = _yaml.safe_load(_args_yaml.read_text()) or {}
+                _ay.pop("pretrained", None)
+                _args_yaml.write_text(_yaml.dump(_ay))
+                job_storage.append_job_log(job_id, "DEBUG", "Stripped pretrained from args.yaml")
+            except Exception as _e:
+                job_storage.append_job_log(job_id, "WARNING", f"Could not strip pretrained from args.yaml: {_e}")
+
         while True:
             try:
                 with contextlib.redirect_stdout(log_writer), contextlib.redirect_stderr(log_writer):
