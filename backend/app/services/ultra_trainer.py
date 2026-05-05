@@ -1690,10 +1690,17 @@ def _training_worker(
                 job_storage.append_job_log(job_id, "INFO", f"Resuming from checkpoint: {resume_path}")
                 # Clear stale pretrained reference from checkpoint to prevent
                 # Ultralytics from attempting to load non-existent weight file
+                _cleared = False
                 if hasattr(model, 'args') and hasattr(model.args, 'pretrained'):
                     model.args.pretrained = ''
-                elif hasattr(model, 'overrides') and 'pretrained' in model.overrides:
+                    _cleared = True
+                if hasattr(model, 'overrides') and 'pretrained' in model.overrides:
                     model.overrides['pretrained'] = ''
+                    _cleared = True
+                job_storage.append_job_log(
+                    job_id, "DEBUG",
+                    f"Cleared pretrained from model metadata (cleared={_cleared})"
+                )
             elif yolo_model:
                 # Official YOLO model mode
                 official_model_cls = RTDETR if str(yolo_model).lower().startswith("rtdetr") else YOLO
@@ -2061,6 +2068,10 @@ def _training_worker(
                 f"dataset_root={str(ds_root)!r}, fstype={fstype!r}, "
                 f"workers={train_kwargs.get('workers')!r}, cache={train_kwargs.get('cache')!r}",
             )
+
+        # Ensure pretrained is NOT passed when resuming — Ultralytics loads it from checkpoint
+        if train_kwargs.get('resume'):
+            train_kwargs.pop('pretrained', None)
 
         job_storage.append_job_log(
             job_id,
