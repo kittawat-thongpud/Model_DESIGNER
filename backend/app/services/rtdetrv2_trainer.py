@@ -667,7 +667,26 @@ def run_worker(payload: dict[str, Any]) -> None:
     use_amp = bool(config.get("amp", True))
     use_pretrained = bool(config.get("use_yolo_pretrained", True))
     resume = str(config.get("resume") or "").strip()
-    resume_ckpt = _resolve_checkpoint(resume)
+
+    # ── Resolve resume checkpoint ────────────────────────────────────────────
+    # For RT-DETRv2, resume should use the job's own checkpoint (last.pth or
+    # best.pth), NOT a weight profile. If resume is truthy, look in the job's
+    # output directory first.
+    resume_ckpt: Path | None = None
+    if resume and resume.lower() not in {"false", "0", "none", ""}:
+        # Check job's own checkpoints first
+        job_candidates = [out_dir / "last.pth", out_dir / "best.pth"]
+        for cand in job_candidates:
+            if cand.exists():
+                resume_ckpt = cand
+                _log(f"Resume from job checkpoint: {cand}")
+                break
+        if resume_ckpt is None:
+            # Fallback: try to resolve as external path or weight ID
+            resume_ckpt = _resolve_checkpoint(resume)
+            if resume_ckpt:
+                _log(f"Resume from external checkpoint: {resume_ckpt}")
+
     pretrained_ckpt = _resolve_checkpoint(str(config.get("pretrained") or ""))
 
     # ── Parse imgsz → [h, w] list ────────────────────────────────────────────
@@ -782,6 +801,24 @@ def run_worker(payload: dict[str, Any]) -> None:
     except Exception:
         pass
 
+    # On resume, log.txt already has entries from previous runs.
+    # Skip to end so _poll_log_txt only reads NEW lines.
+    _initial_log_offset = 0
+    if log_txt.exists():
+        _initial_log_offset = log_txt.stat().st_size
+
+    # Track epochs already in extended_metrics.jsonl to avoid duplicates on resume
+    _seen_epochs: set[int] = set()
+    ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+    if ext_metrics_path.exists():
+        try:
+            for _line in ext_metrics_path.read_text(encoding="utf-8").splitlines():
+                _entry = json.loads(_line)
+                if "epoch" in _entry:
+                    _seen_epochs.add(int(_entry["epoch"]))
+        except Exception:
+            pass
+
     # State shared across stdout parsing
     parse_state: dict[str, Any] = {
         "total_epochs": epochs,
@@ -790,7 +827,8 @@ def run_worker(payload: dict[str, Any]) -> None:
         "val_loss": None,
         "mAP50": None,
         "mAP50_95": None,
-        "_log_txt_offset": 0,  # byte offset into log.txt
+        "_log_txt_offset": _initial_log_offset,  # byte offset into log.txt
+        "_seen_epochs": _seen_epochs,
         # Extra state for frontend progress widget
         "device": _device_str,
         "ram_gb": _ram_gb,
@@ -868,12 +906,15 @@ def run_worker(payload: dict[str, Any]) -> None:
             epoch_data = {k: v for k, v in epoch_data.items() if v is not None}
 
             # Write to <job_dir>/extended_metrics.jsonl (same location as Ultralytics)
-            ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
-            try:
-                with ext_metrics_path.open("a") as mf:
-                    mf.write(json.dumps(epoch_data) + "\n")
-            except Exception:
-                pass
+            # Skip if epoch already recorded (dedup across resume sessions)
+            if epoch_1 not in parse_state["_seen_epochs"]:
+                parse_state["_seen_epochs"].add(epoch_1)
+                ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+                try:
+                    with ext_metrics_path.open("a") as mf:
+                        mf.write(json.dumps(epoch_data) + "\n")
+                except Exception:
+                    pass
 
             # ── Emit PROGRESS log → log.jsonl → SSE via stream_controller ──
             _avg_epoch_s = round(elapsed / epoch_1, 1) if epoch_1 > 0 else None
