@@ -660,7 +660,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         # Clear pretrained on resume — don't load external weights when resuming
         if getattr(self.args, 'resume', False) and getattr(self.args, 'pretrained', None):
-            self.args.pretrained = ''
+            self.args.pretrained = None
             self.log("Cleared pretrained on resume", "DEBUG")
 
         threading.Thread(target=_watchdog, daemon=True, name="setup_train_watchdog").start()

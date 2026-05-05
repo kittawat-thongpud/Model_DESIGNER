@@ -1692,10 +1692,10 @@ def _training_worker(
                 # Ultralytics from attempting to load non-existent weight file
                 _cleared = False
                 if hasattr(model, 'args') and hasattr(model.args, 'pretrained'):
-                    model.args.pretrained = ''
+                    model.args.pretrained = None
                     _cleared = True
                 if hasattr(model, 'overrides') and 'pretrained' in model.overrides:
-                    model.overrides['pretrained'] = ''
+                    model.overrides['pretrained'] = None
                     _cleared = True
                 job_storage.append_job_log(
                     job_id, "DEBUG",
