@@ -658,6 +658,11 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "INFO",
                     )
 
+        # Clear stale pretrained before Ultralytics reloads it from args.yaml
+        if getattr(self.args, 'resume', False) and getattr(self.args, 'pretrained', None):
+            self.args.pretrained = ''
+            self.log("Cleared stale pretrained from args (resume mode)", "DEBUG")
+
         threading.Thread(target=_watchdog, daemon=True, name="setup_train_watchdog").start()
         try:
             result = super()._setup_train()
