@@ -719,7 +719,10 @@ class CustomDetectionTrainer(DetectionTrainer):
         if ckpt.get("optimizer") is not None:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scaler") is not None:
-            self.scaler.load_state_dict(ckpt["scaler"])
+            try:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            except RuntimeError:
+                self.log("Skipping empty scaler state (AMP was disabled)", "DEBUG")
 
         if self.ema and ckpt.get("ema"):
             # Keep upstream behavior of rebuilding EMA wrapper first.
