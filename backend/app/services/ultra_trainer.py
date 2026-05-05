@@ -1688,6 +1688,12 @@ def _training_worker(
                 else:
                     model = YOLO(resume_path)
                 job_storage.append_job_log(job_id, "INFO", f"Resuming from checkpoint: {resume_path}")
+                # Clear stale pretrained reference from checkpoint to prevent
+                # Ultralytics from attempting to load non-existent weight file
+                if hasattr(model, 'args') and hasattr(model.args, 'pretrained'):
+                    model.args.pretrained = ''
+                elif hasattr(model, 'overrides') and 'pretrained' in model.overrides:
+                    model.overrides['pretrained'] = ''
             elif yolo_model:
                 # Official YOLO model mode
                 official_model_cls = RTDETR if str(yolo_model).lower().startswith("rtdetr") else YOLO
