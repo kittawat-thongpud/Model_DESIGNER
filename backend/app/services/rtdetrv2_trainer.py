@@ -611,7 +611,7 @@ def run_worker(payload: dict[str, Any]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     batch = int(config["batch"] if config.get("batch") is not None else config.get("batch_size", 16))
-    workers = int(config["workers"] if config.get("workers") is not None else 4)
+    workers = int(config["workers"] if config.get("workers") is not None else 0)
     # Clamp workers: RT-DETRv2 runs as a nested subprocess where high num_workers
     # can exhaust /dev/shm (RuntimeError: received 0 items of ancdata).
     try:
@@ -687,10 +687,16 @@ def run_worker(payload: dict[str, Any]) -> None:
     if patched_config is not None:
         upstream_config = patched_config
 
+    # checkpoint_freq > epochs ensures numbered checkpoints (checkpoint0000.pth)
+    # are never written — only last.pth (overwritten each epoch) and best.pth
+    # (written when mAP improves) are kept.  This avoids disk bloat and I/O stalls.
+    checkpoint_freq = epochs + 1
+
     updates = [
         f"num_classes={nc}",
         "remap_mscoco_category=False",
         f"epoches={epochs}",
+        f"checkpoint_freq={checkpoint_freq}",
         f"train_dataloader.dataset.img_folder='{image_root}'",
         f"train_dataloader.dataset.ann_file='{train_json}'",
         f"train_dataloader.total_batch_size={batch}",
