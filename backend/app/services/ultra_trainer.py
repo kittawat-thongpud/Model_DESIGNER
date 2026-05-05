@@ -1740,13 +1740,19 @@ def _training_worker(
                                 "WARNING",
                                 f"Could not read weight file diagnostics: {diag_err}",
                             )
-                        model.load(str(weight_path))
-                        job_storage.append_job_log(job_id, "INFO", f"✓ Successfully loaded pretrained weights: {pretrained}")
-                        pretrained_loaded = True
+                        try:
+                            model.load(str(weight_path))
+                            job_storage.append_job_log(job_id, "INFO", f"✓ Successfully loaded pretrained weights: {pretrained}")
+                            pretrained_loaded = True
+                        except Exception as load_err:
+                            job_storage.append_job_log(job_id, "ERROR",
+                                f"✗ Failed to load pretrained weights from {weight_path}: {load_err}. "
+                                f"Training will proceed from scratch (random init).")
+                            config["pretrained"] = False
                     else:
                         job_storage.append_job_log(job_id, "WARNING",
                             f"✗ Pretrained weight not found: {pretrained} (resolved to: {weight_path}). "
-                            f"Setting pretrained=False to prevent Ultralytics auto-download.")
+                            f"Training will proceed from scratch (random init).")
                         config["pretrained"] = False
                 else:
                     job_storage.append_job_log(job_id, "INFO", "No pretrained weights specified - training from scratch")
