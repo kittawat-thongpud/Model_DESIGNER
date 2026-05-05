@@ -658,10 +658,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "INFO",
                     )
 
-        # Clear stale pretrained before Ultralytics reloads it from args.yaml
+        # Clear pretrained on resume — don't load external weights when resuming
         if getattr(self.args, 'resume', False) and getattr(self.args, 'pretrained', None):
             self.args.pretrained = ''
-            self.log("Cleared stale pretrained from args (resume mode)", "DEBUG")
+            self.log("Cleared pretrained on resume", "DEBUG")
 
         threading.Thread(target=_watchdog, daemon=True, name="setup_train_watchdog").start()
         try:
