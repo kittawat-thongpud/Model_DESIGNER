@@ -15,6 +15,7 @@ import JobConfiguration from '../components/JobConfiguration';
 import PlotsGallery from '../components/PlotsGallery';
 import ClassSamplesGallery from '../components/ClassSamplesGallery';
 import ExportWeightPanel from '../components/ExportWeightPanel';
+import HsgDetrMetrics, { HsgDetrMetricsEntry } from '../components/HsgDetrMetrics';
 
 interface Props { jobId: string; onBack: () => void; }
 
@@ -85,6 +86,8 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
     val_time_s?: number | null;
     message?: string;
   } | null>(null);
+
+  const [hsgMetricsHistory, setHsgMetricsHistory] = useState<HsgDetrMetricsEntry[]>([]);
 
   const [showAppendModal, setShowAppendModal] = useState(false);
   const [appendEpochs, setAppendEpochs] = useState(50);
@@ -167,6 +170,22 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
           val_time_s: (vd.val_time_s as number | null) ?? prev?.val_time_s,
           message: latest.message,
         }));
+      }
+      // Parse HSG-DETR METRICS logs → build history for HsgDetrMetrics component
+      const hsgLogs = l.filter(log => log.level === 'METRICS' && log.data?.type === 'hsg_detr_metrics');
+      if (hsgLogs.length > 0) {
+        // Logs are newest-first, reverse to get chronological order, deduplicate by epoch
+        const seen = new Set<number>();
+        const entries: HsgDetrMetricsEntry[] = [];
+        for (let i = hsgLogs.length - 1; i >= 0; i--) {
+          const d = hsgLogs[i].data as Record<string, unknown>;
+          const epoch = d.epoch as number;
+          if (!seen.has(epoch)) {
+            seen.add(epoch);
+            entries.push(d as unknown as HsgDetrMetricsEntry);
+          }
+        }
+        setHsgMetricsHistory(entries);
       }
     }).catch(() => {});
   }, [jobId]);
@@ -506,6 +525,11 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
 
         {/* Charts */}
         <JobCharts history={job.history} isDetection={isDetection} />
+
+        {/* HSG-DETR Internals (SGB, Decoder, Gradients) */}
+        {hsgMetricsHistory.length > 0 && (
+          <HsgDetrMetrics history={hsgMetricsHistory} />
+        )}
 
         {/* Configuration */}
         {job.config && (

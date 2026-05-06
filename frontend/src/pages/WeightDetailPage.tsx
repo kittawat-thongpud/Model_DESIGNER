@@ -16,6 +16,7 @@ import JobCharts from '../components/JobCharts';
 import PlotsGallery from '../components/PlotsGallery';
 import JobConfiguration from '../components/JobConfiguration';
 import ClassSamplesGallery from '../components/ClassSamplesGallery';
+import HsgDetrMetrics, { HsgDetrMetricsEntry } from '../components/HsgDetrMetrics';
 
 interface Props {
   weightId: string;
@@ -409,6 +410,16 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                 <>
                   {/* Training Charts */}
                   <JobCharts history={history} isDetection={isDetection} />
+
+                  {/* HSG-DETR Internals */}
+                  {(() => {
+                    // Parse HSG-DETR metrics from job logs if available
+                    const hsgEntries: HsgDetrMetricsEntry[] = [];
+                    if ((job as any)?._hsgMetrics) {
+                      // Already parsed (future optimization)
+                    }
+                    return null;
+                  })()}
 
                   {/* Training Config */}
                   <JobConfiguration
