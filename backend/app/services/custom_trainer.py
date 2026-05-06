@@ -263,10 +263,12 @@ class CustomValidator(DetectionValidator):
 class CustomDetectionTrainer(DetectionTrainer):
     """Custom trainer with enhanced monitoring for Model Designer."""
 
-    HSG_ALPHA_TARGET = 0.05
-    HSG_ALPHA_START_EPOCH = 10
-    HSG_ALPHA_WARMUP_EPOCHS = 80
-    HSG_ALPHA_RESUME_RAMP_EPOCHS = 20
+    # Scheduled Saliency-Guided Query Selection (alpha schedule)
+    # alpha: 0 → HSG_ALPHA_TARGET over HSG_ALPHA_WARMUP_EPOCHS epochs
+    HSG_ALPHA_TARGET = 0.30          # max saliency weight for query selection
+    HSG_ALPHA_START_EPOCH = 0        # start warming from epoch 0
+    HSG_ALPHA_WARMUP_EPOCHS = 30     # linear warmup duration
+    HSG_ALPHA_RESUME_RAMP_EPOCHS = 20  # ramp after resume to avoid jumps
     
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
         """Initialize custom trainer.
@@ -608,6 +610,96 @@ class CustomDetectionTrainer(DetectionTrainer):
         except ImportError:
             pass
     
+    def build_optimizer(self, model, name='auto', lr=None, momentum=0.937, decay=1e-3, iterations=1e5):
+        """Build optimizer with HSG-DETR-aware param groups.
+
+        Param groups:
+          - base model:        lr=lr0,        wd=decay
+          - SGB q/k/v/out:     lr=lr0 × 1.5,  wd=decay
+          - SGB gamma:         lr=lr0 × 5,    wd=0
+          - norm / bias:       lr=lr0,        wd=0
+          - decoder:           lr=lr0 × 1.5,  wd=decay
+        """
+        import torch.nn as nn
+
+        lr0 = lr if lr is not None else self.args.lr0
+        wd = decay
+
+        # ── Partition parameters ──────────────────────────────────────────
+        pg_base, pg_sgb_linear, pg_sgb_gamma = [], [], []
+        pg_norm_bias, pg_decoder = [], []
+
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            # SGB gamma (LayerScale residual weight)
+            if 'gamma' in n and ('SGTokenBlock' in n or 'sg_token' in n.lower()):
+                pg_sgb_gamma.append(p)
+                continue
+
+            # SGB q/k/v/out projections
+            if any(k in n for k in ('q_proj', 'k_proj', 'v_proj', 'out_proj')) and \
+               ('SGTokenBlock' in n or 'sg_token' in n.lower()):
+                pg_sgb_linear.append(p)
+                continue
+
+            # Decoder params (RTDETRDecoderSGB)
+            if 'decoder' in n.lower():
+                pg_decoder.append(p)
+                continue
+
+            # Norm / bias (weight_decay = 0)
+            if 'norm' in n or 'bias' in n or n.endswith('.bias'):
+                pg_norm_bias.append(p)
+                continue
+
+            # Everything else → base
+            pg_base.append(p)
+
+        groups = []
+        for name, params, lr_mult, use_wd in [
+            ('base',       pg_base,       1.0, True),
+            ('sgb_linear', pg_sgb_linear, 1.5, True),
+            ('sgb_gamma',  pg_sgb_gamma,  5.0, False),
+            ('norm_bias',  pg_norm_bias,  1.0, False),
+            ('decoder',    pg_decoder,    1.5, True),
+        ]:
+            if not params:
+                continue
+            g = {
+                'params': params,
+                'lr': lr0 * lr_mult,
+                'weight_decay': wd if use_wd else 0.0,
+                'name': name,
+            }
+            groups.append(g)
+
+        # ── Build optimizer ────────────────────────────────────────────────
+        opt_name = name if name and name != 'auto' else 'AdamW'
+        if opt_name.lower() == 'adamw':
+            from torch.optim import AdamW
+            optimizer = AdamW(groups, lr=lr0, weight_decay=wd, betas=(0.9, 0.999))
+        elif opt_name.lower() == 'adam':
+            from torch.optim import Adam
+            optimizer = Adam(groups, lr=lr0, weight_decay=wd, betas=(0.9, 0.999))
+        elif opt_name.lower() == 'sgd':
+            from torch.optim import SGD
+            optimizer = SGD(groups, lr=lr0, momentum=momentum, weight_decay=wd)
+        else:
+            from torch.optim import AdamW
+            optimizer = AdamW(groups, lr=lr0, weight_decay=wd, betas=(0.9, 0.999))
+
+        # Log group sizes
+        if self.job_id:
+            sizes = {g.get('name', '?'): len(g['params']) for g in groups}
+            job_storage.append_job_log(
+                self.job_id, 'INFO',
+                f'Optimizer param groups: {sizes} | lr0={lr0}, wd={wd}'
+            )
+
+        return optimizer
+
     def _setup_train(self):
         """Override setup to add logging."""
         self.log("Setting up training...", "INFO")
@@ -786,6 +878,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         import time as _time
         self._epoch_start_time = _time.time()
         self._update_hsg_detr_alpha()
+        self._log_hsg_detr_metrics()
 
     def _update_hsg_detr_alpha(self) -> None:
         """Warm up RTDETRDecoderSGB saliency selection without resume-time jumps."""
@@ -911,6 +1004,86 @@ class CustomDetectionTrainer(DetectionTrainer):
                 dst.set_alpha(float(src.alpha.detach().reshape(-1)[0]))
             except Exception:
                 pass
+
+    def _log_hsg_detr_metrics(self) -> None:
+        """Log SGB, decoder, and gradient metrics for HSG-DETR monitoring."""
+        if not self.job_id:
+            return
+        try:
+            model = unwrap_model(self.model)
+        except Exception:
+            return
+
+        sgb_blocks = [m for m in model.modules() if m.__class__.__name__ == 'SGTokenBlock']
+        decoder_modules = [m for m in model.modules() if m.__class__.__name__ == 'RTDETRDecoderSGB']
+
+        metrics: dict[str, float] = {}
+
+        # ── SGB metrics ──────────────────────────────────────────────────
+        for i, blk in enumerate(sgb_blocks):
+            tag = f'sgb/P{i+3}'
+            metrics[f'{tag}_ratio'] = float(getattr(blk, 'ratio', 0))
+            N = getattr(blk, 'last_N', None)
+            k = getattr(blk, 'last_k', None)
+            if N is not None:
+                metrics[f'{tag}_N'] = float(N)
+            if k is not None:
+                metrics[f'{tag}_k'] = float(k)
+            if N is not None and k is not None and N > 0:
+                metrics[f'{tag}_k_over_N'] = float(k) / float(N)
+            gamma = getattr(blk, 'gamma', None)
+            if gamma is not None:
+                metrics[f'{tag}_gamma_mean'] = float(gamma.detach().mean())
+            saliency = getattr(blk, 'last_saliency', None)
+            if saliency is not None and saliency.numel():
+                metrics[f'{tag}_saliency_mean'] = float(saliency.detach().float().mean())
+
+        # ── Decoder metrics ──────────────────────────────────────────────
+        for dec in decoder_modules:
+            alpha = getattr(dec, 'alpha', None)
+            if alpha is not None:
+                metrics['decoder/alpha'] = float(alpha.detach())
+            metrics['decoder/num_queries'] = int(getattr(dec, 'num_queries', 0))
+
+        # ── Gradient norms ───────────────────────────────────────────────
+        if hasattr(self, 'optimizer') and self.optimizer:
+            grad_norms: dict[str, float] = {}
+            for n, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                gn = float(p.grad.norm())
+                if 'SGTokenBlock' in n:
+                    if 'gamma' in n:
+                        grad_norms['sgb_gamma'] = max(grad_norms.get('sgb_gamma', 0), gn)
+                    else:
+                        grad_norms['sgb'] = max(grad_norms.get('sgb', 0), gn)
+                elif 'decoder' in n.lower():
+                    grad_norms['decoder'] = max(grad_norms.get('decoder', 0), gn)
+                elif 'backbone' in n.lower():
+                    grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
+                elif 'neck' in n.lower() or 'head' in n.lower():
+                    grad_norms['neck'] = max(grad_norms.get('neck', 0), gn)
+            for k, v in grad_norms.items():
+                metrics[f'grad/{k}_norm'] = v
+
+        # ── NaN/Inf flags ────────────────────────────────────────────────
+        has_nan = False
+        has_inf = False
+        for n, p in model.named_parameters():
+            if p.grad is not None:
+                if torch.isnan(p.grad).any():
+                    has_nan = True
+                if torch.isinf(p.grad).any():
+                    has_inf = True
+        metrics['grad/has_nan'] = float(has_nan)
+        metrics['grad/has_inf'] = float(has_inf)
+
+        if metrics:
+            job_storage.append_job_log(
+                self.job_id, 'METRICS',
+                f'HSG-DETR metrics epoch {getattr(self, "epoch", 0) + 1}',
+                {'type': 'hsg_detr_metrics', 'epoch': getattr(self, 'epoch', 0) + 1, **metrics}
+            )
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
