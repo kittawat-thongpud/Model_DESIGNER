@@ -102,7 +102,6 @@ class SGTokenBlock(nn.Module):
         self.mode = mode
 
         self.pre_norm = _make_gn(c2)
-        self.delta_norm = _make_gn(c2)
 
         # 1×1 projections — no spatial aggregation, just channel mixing
         self.q_proj = nn.Conv2d(c2, c2, 1, bias=False)
@@ -115,7 +114,7 @@ class SGTokenBlock(nn.Module):
 
         # Per-channel LayerScale residual.  Starting near identity keeps the
         # CNN/PAN path dominant while the sparse branch calibrates.
-        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
+        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 0.01))
 
         self._attn_scale = c2 ** -0.5
 
@@ -305,7 +304,6 @@ class SGTokenBlock(nn.Module):
         delta = self.out_proj(out)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
         delta = 6.0 * torch.tanh(delta.float() / 6.0)
-        delta = self.delta_norm(delta)
 
         # GroupNorm can introduce non-zero values at zero-canvas positions, so
         # mask once more to keep the sparse branch restricted to selected tokens.

@@ -1,8 +1,8 @@
 # =============================================================================
 # HSG-DETR-M (Medium) — Scale-Adaptive Token Ratio (SATR) policy
 # =============================================================================
-# SATR: P3=ρ, P4=2ρ, P5=4ρ  |  Medium ρ=0.030
-#   P3-SGB: 0.030 (3.0%)  |  P4-SGB: 0.060 (6.0%)  |  P5-SGB: 0.120 (12.0%)
+# SATR: P3=ρ, P4=2ρ, P5=4ρ  |  Medium ρ=0.070
+#   P3-SGB: 0.070 (7.0%)  |  P4-SGB: 0.140 (14.0%)  |  P5-SGB: 0.280 (28.0%)
 # Decoder: hd=256, nq=200  |  Alpha schedule: 0→0.30 over 30 epochs
 # =============================================================================
 nc: 80
@@ -24,24 +24,24 @@ backbone:
   - [-1, 1, SPPF, [1024, 5]]        # 8
 
 head:
-  # P5-SGB: 4ρ = 0.120 (12.0% tokens)
-  - [-1, 1, SGTokenBlock, [1024, 0.120]]   # 9  P5-SGB
+  # P5-SGB: 4ρ = 0.280 (28.0% tokens)
+  - [-1, 1, SGTokenBlock, [1024, 0.280]]   # 9  P5-SGB
 
   # FPN P5 → P4
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]           # 10
   - [[-1, 5], 1, Concat, [1]]                            # 11
   - [-1, 3, C2f, [512, False]]                          # 12
 
-  # P4-SGB: 2ρ = 0.060 (6.0% tokens)
-  - [-1, 1, SGTokenBlock, [512, 0.060]]   # 13 P4-SGB
+  # P4-SGB: 2ρ = 0.140 (14.0% tokens)
+  - [-1, 1, SGTokenBlock, [512, 0.140]]   # 13 P4-SGB
 
   # FPN P4 → P3
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]           # 14
   - [[-1, 3], 1, Concat, [1]]                            # 15
   - [-1, 3, C2f, [256, False]]                          # 16  P3
 
-  # P3-SGB: ρ = 0.030 (3.0% tokens)
-  - [-1, 1, SGTokenBlock, [256, 0.030]]   # 17 P3-SGB
+  # P3-SGB: ρ = 0.070 (7.0% tokens)
+  - [-1, 1, SGTokenBlock, [256, 0.070]]   # 17 P3-SGB
 
   # PAN P3 → P4
   - [-1, 1, Conv, [256, 3, 2]]                          # 18
