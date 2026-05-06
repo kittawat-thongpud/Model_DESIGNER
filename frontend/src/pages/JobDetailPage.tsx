@@ -16,6 +16,7 @@ import PlotsGallery from '../components/PlotsGallery';
 import ClassSamplesGallery from '../components/ClassSamplesGallery';
 import ExportWeightPanel from '../components/ExportWeightPanel';
 import HsgDetrMetrics, { HsgDetrMetricsEntry } from '../components/HsgDetrMetrics';
+import PerClassMetrics from '../components/PerClassMetrics';
 
 interface Props { jobId: string; onBack: () => void; }
 
@@ -529,6 +530,14 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
         {/* HSG-DETR Internals (SGB, Decoder, Gradients) */}
         {hsgMetricsHistory.length > 0 && (
           <HsgDetrMetrics history={hsgMetricsHistory} />
+        )}
+
+        {/* Per-Class Metrics */}
+        {job.history && job.history.length > 0 && (job.history[job.history.length - 1] as any).ap_per_class && (
+          <PerClassMetrics
+            epochData={job.history[job.history.length - 1] as any}
+            epoch={(job.history[job.history.length - 1] as any).epoch}
+          />
         )}
 
         {/* Configuration */}

@@ -17,6 +17,7 @@ import PlotsGallery from '../components/PlotsGallery';
 import JobConfiguration from '../components/JobConfiguration';
 import ClassSamplesGallery from '../components/ClassSamplesGallery';
 import HsgDetrMetrics, { HsgDetrMetricsEntry } from '../components/HsgDetrMetrics';
+import PerClassMetrics from '../components/PerClassMetrics';
 
 interface Props {
   weightId: string;
@@ -420,6 +421,14 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                     }
                     return null;
                   })()}
+
+                  {/* Per-Class Metrics */}
+                  {history.length > 0 && (history[history.length - 1] as any).ap_per_class && (
+                    <PerClassMetrics
+                      epochData={history[history.length - 1] as any}
+                      epoch={(history[history.length - 1] as any).epoch}
+                    />
+                  )}
 
                   {/* Training Config */}
                   <JobConfiguration

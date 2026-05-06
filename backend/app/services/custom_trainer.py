@@ -415,9 +415,13 @@ class CustomDetectionTrainer(DetectionTrainer):
         def _on_train_epoch_start_cb(trainer):
             trainer._on_train_epoch_start()
 
+        def _on_train_epoch_end_cb(trainer):
+            trainer._on_train_epoch_end()
+
         # Register batch-end callback (Ultralytics calls with trainer as arg)
         self.add_callback("on_train_batch_end", _on_train_batch_end_cb)
         self.add_callback("on_train_epoch_start", _on_train_epoch_start_cb)
+        self.add_callback("on_train_epoch_end", _on_train_epoch_end_cb)
 
         # Verify job_id is set
         if self.job_id:
@@ -874,10 +878,21 @@ class CustomDetectionTrainer(DetectionTrainer):
         return DummyPbar()
     
     def _on_train_epoch_start(self):
-        """Track epoch start time."""
+        """Track epoch start time and enable SGB debug for saliency capture."""
         import time as _time
         self._epoch_start_time = _time.time()
         self._update_hsg_detr_alpha()
+        # Enable debug on SGB blocks so last_saliency is stored during forward
+        try:
+            model = unwrap_model(self.model)
+            for m in model.modules():
+                if m.__class__.__name__ == 'SGTokenBlock' and hasattr(m, 'set_debug'):
+                    m.set_debug(True, cpu=False)
+        except Exception:
+            pass
+
+    def _on_train_epoch_end(self):
+        """Log HSG-DETR metrics at epoch end when gradients are fresh."""
         self._log_hsg_detr_metrics()
 
     def _update_hsg_detr_alpha(self) -> None:
