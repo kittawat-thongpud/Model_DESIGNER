@@ -213,34 +213,87 @@ class UrlPackagePeekRequest(BaseModel):
     timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
 
 
+def _convert_google_drive_url(url: str) -> str:
+    """Convert Google Drive share/download URLs to direct download URLs."""
+    import re
+
+    # Pattern 1: drive.google.com/file/d/FILE_ID/view
+    file_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if file_match:
+        file_id = file_match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    # Pattern 2: drive.google.com/open?id=FILE_ID
+    open_match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+    if open_match and 'drive.google.com' in url:
+        file_id = open_match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    # Pattern 3: googleusercontent.com/download - already direct but need confirm
+    if 'googleusercontent.com' in url and 'download' in url:
+        # Keep as-is but will need to handle confirm token
+        return url
+
+    return url
+
+
 @router.post("/peek/url", summary="Preview package from download URL")
 async def peek_package_url(body: UrlPackagePeekRequest):
     """Download and preview a .mdpkg package from URL without importing."""
-    url = body.url
+    url = _convert_google_drive_url(body.url)
+
     # Google Drive special handling
-    headers = {}
-    if "drive.google.com" in url or "googleusercontent.com" in url:
-        # Add headers to mimic browser for Google Drive
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
 
     try:
         logger.log("system", "INFO", "Package peek URL download start", {"url": url[:80]})
-        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
-            resp.raise_for_status()
-            # Check content type
-            content_type = resp.headers.get('content-type', '')
-            logger.log("system", "INFO", "Package peek URL response", {"content_type": content_type, "status": resp.status_code})
 
-            data = b""
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    data += chunk
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # First request - may get virus scan warning page for large files
+        resp = session.get(url, stream=True, timeout=body.timeout, allow_redirects=True)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get('content-type', '')
+        logger.log("system", "INFO", "Package peek URL response", {"content_type": content_type, "status": resp.status_code})
+
+        data = b""
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                data += chunk
 
         logger.log("system", "INFO", "Package peek URL download complete", {"bytes": len(data)})
 
-        # Check if we got HTML instead of binary (common with Google Drive)
+        # Check if we got Google Drive virus scan confirmation page
+        if b'google.com' in data[:5000] and (b'virus' in data[:5000].lower() or b'confirm' in data[:5000].lower() or b'download_warning' in data[:5000]):
+            # Try to extract confirm token and retry
+            import re
+            confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', data.decode('utf-8', errors='ignore'))
+            if confirm_match:
+                confirm_token = confirm_match.group(1)
+                logger.log("system", "INFO", "Google Drive confirm token found", {"token": confirm_token[:20]})
+
+                # Retry with confirm token
+                confirm_url = f"{url}&confirm={confirm_token}"
+                resp2 = session.get(confirm_url, stream=True, timeout=body.timeout)
+                resp2.raise_for_status()
+
+                data = b""
+                for chunk in resp2.iter_content(chunk_size=8192):
+                    if chunk:
+                        data += chunk
+
+                logger.log("system", "INFO", "Google Drive retry download complete", {"bytes": len(data)})
+
+        # Check if still got HTML
         if data.startswith(b'<!DOCTYPE') or data.startswith(b'<html') or b'<!DOCTYPE html' in data[:1000]:
-            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
+            logger.log("system", "WARNING", "URL returned HTML", {"preview": data[:200].decode('utf-8', errors='ignore')})
+            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. The file may require authentication or confirmation.")
 
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
@@ -337,11 +390,14 @@ async def import_package_url(body: UrlPackageImportRequest):
 
     Bypasses proxy upload limits by downloading directly on the server.
     """
-    url = body.url
+    url = _convert_google_drive_url(body.url)
+
     # Google Drive special handling
-    headers = {}
-    if "drive.google.com" in url or "googleusercontent.com" in url:
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
 
     try:
         logger.log("system", "INFO", "Starting package download", {
@@ -349,21 +405,39 @@ async def import_package_url(body: UrlPackageImportRequest):
             "timeout": body.timeout,
         })
 
-        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
-            resp.raise_for_status()
-            content_type = resp.headers.get('content-type', '')
-            logger.log("system", "INFO", "Package download response", {"content_type": content_type, "status": resp.status_code})
+        session = requests.Session()
+        session.headers.update(headers)
 
-            data = b""
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    data += chunk
+        resp = session.get(url, stream=True, timeout=body.timeout, allow_redirects=True)
+        resp.raise_for_status()
+        content_type = resp.headers.get('content-type', '')
+        logger.log("system", "INFO", "Package download response", {"content_type": content_type, "status": resp.status_code})
+
+        data = b""
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                data += chunk
 
         logger.log("system", "INFO", "Package download complete", {"bytes": len(data)})
 
-        # Check if we got HTML instead of binary
+        # Handle Google Drive virus scan confirmation
+        if b'google.com' in data[:5000] and (b'virus' in data[:5000].lower() or b'confirm' in data[:5000].lower()):
+            import re
+            confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', data.decode('utf-8', errors='ignore'))
+            if confirm_match:
+                confirm_token = confirm_match.group(1)
+                confirm_url = f"{url}&confirm={confirm_token}"
+                resp2 = session.get(confirm_url, stream=True, timeout=body.timeout)
+                resp2.raise_for_status()
+                data = b""
+                for chunk in resp2.iter_content(chunk_size=8192):
+                    if chunk:
+                        data += chunk
+                logger.log("system", "INFO", "Google Drive retry complete", {"bytes": len(data)})
+
+        # Check if still got HTML
         if data.startswith(b'<!DOCTYPE') or data.startswith(b'<html') or b'<!DOCTYPE html' in data[:1000]:
-            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
+            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file.")
 
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")

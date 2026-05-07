@@ -763,6 +763,25 @@ class UrlImportRequest(BaseModel):
     timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
 
 
+def _convert_google_drive_url(url: str) -> str:
+    """Convert Google Drive share URLs to direct download URLs."""
+    import re
+
+    # Pattern 1: drive.google.com/file/d/FILE_ID/view
+    file_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if file_match:
+        file_id = file_match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    # Pattern 2: drive.google.com/open?id=FILE_ID
+    open_match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+    if open_match and 'drive.google.com' in url:
+        file_id = open_match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    return url
+
+
 @router.post("/import/url", summary="Import weight from download URL")
 async def import_weight_url(body: UrlImportRequest):
     """Download and import a weight file from an external URL.
@@ -771,7 +790,7 @@ async def import_weight_url(body: UrlImportRequest):
     Supports resume-capable URLs and large files (up to timeout limit).
     """
     # Download to temp file with streaming
-    url = body.url
+    url = _convert_google_drive_url(body.url)
     suffix = Path(url).suffix or ".pt"
     if suffix not in [".pt", ".pth", ".ckpt", ".safetensors", ".bin"]:
         suffix = ".pt"
@@ -780,9 +799,10 @@ async def import_weight_url(body: UrlImportRequest):
         tmp_path = Path(tmp.name)
 
     # Google Drive special handling
-    headers = {}
-    if "drive.google.com" in url or "googleusercontent.com" in url:
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    }
 
     try:
         logger.log("system", "INFO", "Starting weight download", {
@@ -790,25 +810,49 @@ async def import_weight_url(body: UrlImportRequest):
             "timeout": body.timeout,
         })
 
-        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
-            resp.raise_for_status()
-            content_type = resp.headers.get('content-type', '')
-            logger.log("system", "INFO", "Weight download response", {"content_type": content_type, "status": resp.status_code})
+        session = requests.Session()
+        session.headers.update(headers)
 
-            downloaded = 0
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
+        resp = session.get(url, stream=True, timeout=body.timeout, allow_redirects=True)
+        resp.raise_for_status()
+        content_type = resp.headers.get('content-type', '')
+        logger.log("system", "INFO", "Weight download response", {"content_type": content_type, "status": resp.status_code})
+
+        downloaded = 0
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
 
         logger.log("system", "INFO", "Weight download complete", {"bytes": downloaded})
 
-        # Check if we got HTML instead of binary
+        # Check if we got Google Drive virus scan confirmation page
+        with open(tmp_path, "rb") as f:
+            header = f.read(5000)
+            if b'google.com' in header and (b'virus' in header.lower() or b'confirm' in header.lower()):
+                # Extract confirm token and retry
+                import re
+                content = header.decode('utf-8', errors='ignore')
+                confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', content)
+                if confirm_match:
+                    confirm_token = confirm_match.group(1)
+                    confirm_url = f"{url}&confirm={confirm_token}"
+                    logger.log("system", "INFO", "Google Drive confirm retry", {"token": confirm_token[:20]})
+
+                    resp2 = session.get(confirm_url, stream=True, timeout=body.timeout)
+                    resp2.raise_for_status()
+
+                    with open(tmp_path, "wb") as f2:
+                        for chunk in resp2.iter_content(chunk_size=8192):
+                            if chunk:
+                                f2.write(chunk)
+
+        # Final check for HTML
         with open(tmp_path, "rb") as f:
             header = f.read(1000)
             if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<!DOCTYPE html' in header:
-                raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
+                raise HTTPException(status_code=400, detail="URL returned HTML page instead of file.")
 
         result = weight_import.import_external_weight(tmp_path, body.name)
         logger.log("system", "INFO", "URL weight imported", {
