@@ -120,7 +120,7 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
               <ConfigItem label="Max Det" value={getValue('max_det')} />
               <ConfigItem label="Agnostic NMS" value={String(getValue('agnostic_nms'))} />
               <ConfigItem label="Seed" value={getValue('seed')} />
-              {modelScale && <ConfigItem label="Model Scale" value={modelScale.toUpperCase()} highlight />}
+              {typeof modelScale === 'string' && modelScale && <ConfigItem label="Model Scale" value={modelScale.toUpperCase()} highlight />}
               <div className="mt-4 pt-2 border-t border-slate-800">
                 <span className="text-xs text-slate-500 block mb-2">Model Info</span>
                 <div className="space-y-1">
