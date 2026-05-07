@@ -500,4 +500,39 @@ export const api = {
     }
     return res.json();
   },
+  importPackageFromLocal: async (
+    localPath: string,
+    renameMap: Record<string, string> = {},
+    includeJobs = false,
+  ): Promise<{ weights_imported: { old_id: string; new_id: string; name: string }[]; jobs_imported: { old_id: string; new_id: string }[]; errors: string[] }> => {
+    const res = await fetch('/api/packages/import/local', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ local_path: localPath, rename_map: renameMap, include_jobs: includeJobs }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  importPackageFromUrl: async (
+    url: string,
+    renameMap: Record<string, string> = {},
+    includeJobs = false,
+    timeout = 300,
+  ): Promise<{ weights_imported: { old_id: string; new_id: string; name: string }[]; jobs_imported: { old_id: string; new_id: string }[]; errors: string[] }> => {
+    const res = await fetch('/api/packages/import/url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, rename_map: renameMap, include_jobs: includeJobs, timeout }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
 };
+
+export { api };
