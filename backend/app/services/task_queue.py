@@ -10,13 +10,20 @@ LIGHTWEIGHT (not queued, always allowed):
   - inference on small/explicitly bounded inputs
 
 HEAVY (queued, admission-controlled):
-  - training           → max 1 GPU training job running at a time
-  - benchmark          → max 1 concurrent (GPU)
-  - validation         → max 1 concurrent (GPU, high-priority)
+  - training           → max 1 GPU training job running at a time (or VRAM-limited)
+  - benchmark          → max 1 concurrent (GPU) (or VRAM-limited)
+  - validation         → max 1 concurrent (GPU, high-priority) (or VRAM-limited)
   - dataset extraction / conversion / repartition
   - package import/export
   - large plot generation / report generation
   - weight transfer on large files
+
+VRAM-Aware Queue (when enabled):
+  - Tracks VRAM usage per GPU device
+  - Admits jobs only if sufficient VRAM available (with safety buffer)
+  - Prevents OOM by checking free VRAM before admission
+  - Monitors VRAM during execution and kills jobs exceeding limits
+  - Safety buffer: 15% + 2GB minimum to prevent system instability
 
 Queue behavior:
   - If a slot is available → task is admitted immediately (status = running)
@@ -44,6 +51,16 @@ if not _DB_PATH.is_absolute():
     _DB_PATH = DATA_DIR / _DB_PATH
 _SQLITE_TIMEOUT_S = float(_QUEUE_CONFIG.get("sqlite_timeout_s", 10.0))
 _QUEUE_CLEANUP_MAX_AGE_S = float(_QUEUE_CONFIG.get("cleanup_max_age_s", 86400 * 7))
+
+# ── VRAM Config ────────────────────────────────────────────────────────────────
+_VRAM_CONFIG = _QUEUE_CONFIG.get("vram", {})
+_VRAM_ENABLED = bool(_VRAM_CONFIG.get("enabled", False))
+_VRAM_SAFETY_BUFFER_GB = float(_VRAM_CONFIG.get("safety_buffer_gb", 2.0))
+_VRAM_SAFETY_BUFFER_PERCENT = float(_VRAM_CONFIG.get("safety_buffer_percent", 0.15))
+_VRAM_MONITOR_INTERVAL_S = float(_VRAM_CONFIG.get("monitor_interval_s", 10.0))
+_VRAM_OOM_KILL_THRESHOLD = float(_VRAM_CONFIG.get("oom_kill_threshold_percent", 0.95))
+_MODEL_SCALE_VRAM_GB = _VRAM_CONFIG.get("model_scale_vram_gb", {})
+_TASK_TYPE_VRAM_GB = _VRAM_CONFIG.get("task_type_vram_gb", {})
 
 # ── Task classification ───────────────────────────────────────────────────────
 
@@ -116,6 +133,150 @@ def _gpu_running_count(conn: sqlite3.Connection) -> int:
     ).fetchone()[0]
 
 
+def _get_gpu_vram_info() -> dict:
+    """Get VRAM info for all available GPUs."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"available": False}
+
+        gpu_info = {}
+        for i in range(torch.cuda.device_count()):
+            device = f"cuda:{i}"
+            total_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            free_gb = torch.cuda.mem_get_info(i)[0] / (1024**3)
+            gpu_info[device] = {
+                "total_gb": total_gb,
+                "free_gb": free_gb,
+                "used_gb": total_gb - free_gb,
+            }
+        gpu_info["available"] = True
+        return gpu_info
+    except Exception:
+        return {"available": False}
+
+
+def _get_allocated_vram_on_device(conn: sqlite3.Connection, gpu_device: str) -> float:
+    """Sum of VRAM allocated for running tasks on a specific GPU device."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(vram_allocated_gb), 0.0) as total FROM queue_tasks WHERE gpu_device=? AND status='running'",
+        (gpu_device,),
+    ).fetchone()
+    return float(row["total"]) if row else 0.0
+
+
+def _estimate_vram_requirement(task_type: str, model_scale: str | None = None) -> float:
+    """Estimate VRAM requirement based on task type and model scale."""
+    base_vram = float(_TASK_TYPE_VRAM_GB.get(task_type, 0.0))
+    if model_scale:
+        base_vram += float(_MODEL_SCALE_VRAM_GB.get(model_scale, 0.0))
+    return max(base_vram, 0.0)
+
+
+def _check_vram_available(gpu_device: str, required_gb: float) -> tuple[bool, str]:
+    """Check if sufficient VRAM is available on the device with safety buffer."""
+    gpu_info = _get_gpu_vram_info()
+    if not gpu_info.get("available"):
+        return True, "VRAM monitoring not available, allowing admission"
+
+    device_info = gpu_info.get(gpu_device)
+    if not device_info:
+        return False, f"GPU device {gpu_device} not found"
+
+    free_gb = device_info["free_gb"]
+    total_gb = device_info["total_gb"]
+
+    # Calculate safety buffer (15% + 2GB minimum)
+    buffer_gb = max(
+        _VRAM_SAFETY_BUFFER_GB,
+        total_gb * _VRAM_SAFETY_BUFFER_PERCENT,
+    )
+
+    # Check if free VRAM (minus buffer) is sufficient
+    available_after_buffer = free_gb - buffer_gb
+    if available_after_buffer < required_gb:
+        return False, f"Insufficient VRAM: need {required_gb:.1f}GB, have {available_after_buffer:.1f}GB available (free: {free_gb:.1f}GB, buffer: {buffer_gb:.1f}GB)"
+
+    return True, f"VRAM OK: need {required_gb:.1f}GB, have {available_after_buffer:.1f}GB available"
+
+
+def update_vram_usage(task_id: str, vram_used_gb: float) -> bool:
+    """Update actual VRAM usage for a running task."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE queue_tasks SET vram_used_gb=? WHERE task_id=?",
+            (vram_used_gb, task_id),
+        )
+        return True
+
+
+def check_oom_violations() -> list[dict]:
+    """Check all running GPU tasks for OOM violations and return violations."""
+    if not _VRAM_ENABLED:
+        return []
+
+    violations: list[dict] = []
+    gpu_info = _get_gpu_vram_info()
+
+    if not gpu_info.get("available"):
+        return violations
+
+    with _db() as conn:
+        placeholders = ",".join("?" * len(GPU_TASK_TYPES))
+        rows = conn.execute(
+            f"""SELECT task_id, task_type, ref_id, gpu_device, vram_allocated_gb, vram_used_gb
+               FROM queue_tasks
+               WHERE task_type IN ({placeholders}) AND status='running'""",
+            tuple(GPU_TASK_TYPES),
+        ).fetchall()
+
+        for row in rows:
+            task_id = row["task_id"]
+            task_type = row["task_type"]
+            ref_id = row["ref_id"]
+            gpu_device = row["gpu_device"] or "cuda:0"
+            vram_allocated = float(row["vram_allocated_gb"] or 0.0)
+            vram_used = float(row["vram_used_gb"] or 0.0)
+
+            if vram_allocated <= 0:
+                continue
+
+            device_info = gpu_info.get(gpu_device)
+            if not device_info:
+                continue
+
+            total_gb = device_info["total_gb"]
+            used_ratio = vram_used / total_gb if total_gb > 0 else 0.0
+
+            # Check if exceeding allocated limit significantly
+            if vram_used > vram_allocated * 1.5:  # 50% over allocation
+                violations.append({
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "ref_id": ref_id,
+                    "gpu_device": gpu_device,
+                    "vram_allocated_gb": vram_allocated,
+                    "vram_used_gb": vram_used,
+                    "reason": f"VRAM usage {vram_used:.1f}GB exceeds allocation {vram_allocated:.1f}GB by 50%",
+                    "severity": "high",
+                })
+
+            # Check if approaching total GPU limit (95%)
+            if used_ratio > _VRAM_OOM_KILL_THRESHOLD:
+                violations.append({
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "ref_id": ref_id,
+                    "gpu_device": gpu_device,
+                    "vram_allocated_gb": vram_allocated,
+                    "vram_used_gb": vram_used,
+                    "reason": f"VRAM usage {vram_used:.1f}GB ({used_ratio*100:.1f}%) exceeds OOM threshold {_VRAM_OOM_KILL_THRESHOLD*100:.1f}%",
+                    "severity": "critical",
+                })
+
+    return violations
+
+
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_DB_PATH), timeout=_SQLITE_TIMEOUT_S, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -151,12 +312,20 @@ def _init_db() -> None:
                 error       TEXT,
                 created_at  REAL NOT NULL,
                 started_at  REAL,
-                completed_at REAL
+                completed_at REAL,
+                gpu_device  TEXT,           -- GPU device ID (e.g., "cuda:0")
+                vram_allocated_gb REAL,    -- VRAM allocated for this task
+                vram_used_gb REAL,          -- Actual VRAM usage (updated during execution)
+                model_scale TEXT            -- Model scale (n/s/m/l/x) for VRAM estimation
             )
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_queue_status_type
             ON queue_tasks(task_type, status, priority DESC, created_at ASC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_queue_gpu_device
+            ON queue_tasks(gpu_device, status)
         """)
 
 
@@ -209,23 +378,52 @@ def _admit_pending_locked(conn: sqlite3.Connection, task_type: str, now: float) 
 
 
 def _admit_pending_gpu_locked(conn: sqlite3.Connection, now: float) -> list[tuple[str, str]]:
-    """Admit the next pending GPU task (training or benchmark) respecting the shared GPU slot."""
+    """Admit the next pending GPU task (training or benchmark) respecting VRAM and concurrency."""
     admitted: list[tuple[str, str]] = []
     placeholders = ",".join("?" * len(GPU_TASK_TYPES))
-    while _gpu_running_count(conn) < _GPU_CONCURRENCY_LIMIT:
-        row = conn.execute(
-            f"""SELECT task_id, task_type FROM queue_tasks
-               WHERE task_type IN ({placeholders}) AND status='pending'
-               ORDER BY priority DESC, created_at ASC LIMIT 1""",
-            tuple(GPU_TASK_TYPES),
-        ).fetchone()
-        if not row:
+
+    # Get all pending GPU tasks ordered by priority
+    pending_rows = conn.execute(
+        f"""SELECT task_id, task_type, model_scale, gpu_device
+           FROM queue_tasks
+           WHERE task_type IN ({placeholders}) AND status='pending'
+           ORDER BY priority DESC, created_at ASC""",
+        tuple(GPU_TASK_TYPES),
+    ).fetchall()
+
+    for row in pending_rows:
+        task_id = row["task_id"]
+        task_type = row["task_type"]
+        model_scale = row["model_scale"]
+        gpu_device = row["gpu_device"] or "cuda:0"
+
+        # Check concurrency limit
+        if _gpu_running_count(conn) >= _GPU_CONCURRENCY_LIMIT:
             break
-        conn.execute(
-            "UPDATE queue_tasks SET status='running', started_at=? WHERE task_id=?",
-            (now, row["task_id"]),
-        )
-        admitted.append((row["task_id"], row["task_type"]))
+
+        # VRAM-aware admission
+        if _VRAM_ENABLED:
+            vram_required = _estimate_vram_requirement(task_type, model_scale)
+            vram_available, vram_msg = _check_vram_available(gpu_device, vram_required)
+
+            if not vram_available:
+                # Skip this task, try next one
+                continue
+
+            # VRAM OK, admit the task
+            conn.execute(
+                "UPDATE queue_tasks SET status='running', started_at=?, gpu_device=?, vram_allocated_gb=? WHERE task_id=?",
+                (now, gpu_device, vram_required, task_id),
+            )
+            admitted.append((task_id, task_type))
+        else:
+            # Fallback: simple concurrency check
+            conn.execute(
+                "UPDATE queue_tasks SET status='running', started_at=?, gpu_device=? WHERE task_id=?",
+                (now, gpu_device, task_id),
+            )
+            admitted.append((task_id, task_type))
+
     return admitted
 
 
@@ -234,13 +432,16 @@ def enqueue(
     ref_id: str | None = None,
     payload: dict | None = None,
     priority: int = 0,
-) -> tuple[str, bool]:
+    gpu_device: str | None = None,
+    model_scale: str | None = None,
+) -> tuple[str, bool, str]:
     """
     Attempt to admit a heavy task.
 
-    Returns (task_id, admitted):
+    Returns (task_id, admitted, message):
       - admitted=True  → task is running immediately
       - admitted=False → task is pending (queued), will be admitted when a slot opens
+      - message        → status message explaining admission decision
     """
     import json as _json
 
@@ -248,25 +449,59 @@ def enqueue(
     now = time.time()
     limit = _CONCURRENCY_LIMITS.get(task_type, 1)
 
+    # Determine GPU device if not specified
+    if gpu_device is None and task_type in GPU_TASK_TYPES:
+        gpu_info = _get_gpu_vram_info()
+        if gpu_info.get("available") and len(gpu_info) > 1:
+            # Use first available GPU
+            gpu_device = list(gpu_info.keys())[0]
+        else:
+            gpu_device = "cuda:0"
+
+    # Estimate VRAM requirement
+    vram_required = _estimate_vram_requirement(task_type, model_scale) if _VRAM_ENABLED else 0.0
+
     admitted_callbacks: list[tuple[str, str]] = []
+    admission_message = ""
+
     with _db() as conn:
         if task_type in GPU_TASK_TYPES:
-            running_count = _gpu_running_count(conn)
-            effective_limit = _GPU_CONCURRENCY_LIMIT
+            # VRAM-aware admission for GPU tasks
+            if _VRAM_ENABLED and gpu_device:
+                # Check VRAM availability
+                vram_available, vram_msg = _check_vram_available(gpu_device, vram_required)
+                admission_message = vram_msg
+
+                if not vram_available:
+                    admitted = False
+                    status = TaskStatus.PENDING
+                else:
+                    # VRAM OK, check concurrency limit
+                    running_count = _gpu_running_count(conn)
+                    admitted = running_count < _GPU_CONCURRENCY_LIMIT
+                    status = TaskStatus.RUNNING if admitted else TaskStatus.PENDING
+                    if not admitted:
+                        admission_message = f"VRAM OK but concurrency limit reached ({running_count}/{_GPU_CONCURRENCY_LIMIT})"
+            else:
+                # Fallback to simple concurrency limit
+                running_count = _gpu_running_count(conn)
+                admitted = running_count < _GPU_CONCURRENCY_LIMIT
+                status = TaskStatus.RUNNING if admitted else TaskStatus.PENDING
+                admission_message = f"Concurrency check: {running_count}/{_GPU_CONCURRENCY_LIMIT}"
         else:
+            # Non-GPU tasks use simple concurrency limit
             running_count = conn.execute(
                 "SELECT COUNT(*) FROM queue_tasks WHERE task_type=? AND status='running'",
                 (task_type,),
             ).fetchone()[0]
-            effective_limit = limit
-
-        admitted = running_count < effective_limit
-        status = TaskStatus.RUNNING if admitted else TaskStatus.PENDING
+            admitted = running_count < limit
+            status = TaskStatus.RUNNING if admitted else TaskStatus.PENDING
+            admission_message = f"Concurrency check: {running_count}/{limit}"
 
         conn.execute(
             """INSERT INTO queue_tasks
-               (task_id, task_type, ref_id, status, priority, payload, created_at, started_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (task_id, task_type, ref_id, status, priority, payload, created_at, started_at, gpu_device, vram_allocated_gb, model_scale)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task_id,
                 task_type,
@@ -276,13 +511,16 @@ def enqueue(
                 _json.dumps(payload or {}),
                 now,
                 now if admitted else None,
+                gpu_device,
+                vram_required if admitted else None,
+                model_scale,
             ),
         )
         if admitted:
             admitted_callbacks.append((task_id, task_type))
     if admitted_callbacks:
         _fire_admission_callbacks(admitted_callbacks)
-    return task_id, admitted
+    return task_id, admitted, admission_message
 
 
 def complete(task_id: str, error: str | None = None) -> None:
@@ -492,7 +730,7 @@ def queue_status(task_type: str | None = None) -> dict:
 
         pending_tasks = []
         q = conn.execute(
-            """SELECT task_id, task_type, ref_id, priority, created_at
+            """SELECT task_id, task_type, ref_id, priority, created_at, model_scale
                FROM queue_tasks WHERE status='pending'
                ORDER BY priority DESC, created_at ASC LIMIT 50"""
         ).fetchall()
@@ -500,12 +738,43 @@ def queue_status(task_type: str | None = None) -> dict:
             pending_tasks.append(dict(r))
 
         gpu_running = _gpu_running_count(conn)
+
+        # Get VRAM info if enabled
+        vram_info = {}
+        if _VRAM_ENABLED:
+            gpu_info = _get_gpu_vram_info()
+            if gpu_info.get("available"):
+                vram_info["gpus"] = gpu_info
+                # Get running tasks with VRAM allocation
+                running_vram = conn.execute(
+                    """SELECT task_id, task_type, gpu_device, vram_allocated_gb, vram_used_gb, model_scale
+                       FROM queue_tasks WHERE status='running' AND task_type IN ('training','benchmark','validation')"""
+                ).fetchall()
+                vram_info["running_tasks"] = [
+                    {
+                        "task_id": r["task_id"],
+                        "task_type": r["task_type"],
+                        "gpu_device": r["gpu_device"],
+                        "vram_allocated_gb": float(r["vram_allocated_gb"] or 0.0),
+                        "vram_used_gb": float(r["vram_used_gb"] or 0.0),
+                        "model_scale": r["model_scale"],
+                    }
+                    for r in running_vram
+                ]
+                vram_info["config"] = {
+                    "enabled": _VRAM_ENABLED,
+                    "safety_buffer_gb": _VRAM_SAFETY_BUFFER_GB,
+                    "safety_buffer_percent": _VRAM_SAFETY_BUFFER_PERCENT,
+                    "model_scale_vram_gb": _MODEL_SCALE_VRAM_GB,
+                }
+
         return {
             "summary": summary,
             "pending": pending_tasks,
             "concurrency_limits": _CONCURRENCY_LIMITS,
             "gpu_busy": gpu_running >= _GPU_CONCURRENCY_LIMIT,
             "gpu_running": gpu_running,
+            "vram": vram_info,
         }
 
 

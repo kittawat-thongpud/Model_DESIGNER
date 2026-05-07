@@ -702,11 +702,17 @@ def start_training(
 
     _reconcile_training_queue()
 
-    # Enqueue training task — respects 1-GPU slot admission (Option A policy)
-    queue_task_id, admitted = task_queue.enqueue(
+    # Extract model scale from config for VRAM estimation
+    model_scale = config.get("scale", "n")
+    device = config.get("device", "")
+
+    # Enqueue training task — respects VRAM-aware admission
+    queue_task_id, admitted, admission_msg = task_queue.enqueue(
         task_queue.TaskType.TRAINING,
         ref_id=job_id,
         payload={"model_id": model_id, "model_name": model_name, "task": task},
+        gpu_device=device if device.startswith("cuda") else None,
+        model_scale=model_scale,
     )
 
     job = {
@@ -876,7 +882,13 @@ def _restart_job(job_id: str, config: dict) -> None:
 
     _reconcile_training_queue()
     _finalize_existing_queue_task(job, "Cancelled due to job restart", admit_pending=False)
-    queue_task_id, admitted = task_queue.enqueue(
+
+    # Extract model scale and device for VRAM estimation
+    config = job.get("config", {})
+    model_scale = config.get("scale", "n")
+    device = config.get("device", "")
+
+    queue_task_id, admitted, admission_msg = task_queue.enqueue(
         task_queue.TaskType.TRAINING,
         ref_id=job_id,
         payload={
@@ -885,6 +897,8 @@ def _restart_job(job_id: str, config: dict) -> None:
             "task": job.get("task"),
             "restart": True,
         },
+        gpu_device=device if device.startswith("cuda") else None,
+        model_scale=model_scale,
     )
 
     job["config"] = config

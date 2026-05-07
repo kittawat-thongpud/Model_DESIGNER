@@ -49,6 +49,25 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "plot_generation": 2,
             "weight_transfer": 2,
         },
+        "vram": {
+            "enabled": True,
+            "safety_buffer_gb": 2.0,
+            "safety_buffer_percent": 0.15,
+            "monitor_interval_s": 10.0,
+            "oom_kill_threshold_percent": 0.95,
+            "model_scale_vram_gb": {
+                "n": 4.0,
+                "s": 8.0,
+                "m": 16.0,
+                "l": 24.0,
+                "x": 32.0,
+            },
+            "task_type_vram_gb": {
+                "training": 0.0,
+                "benchmark": 2.0,
+                "validation": 2.0,
+            },
+        },
     },
     "training": {
         "defaults": {
