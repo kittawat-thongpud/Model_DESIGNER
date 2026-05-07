@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { WeightRecord, ModelSummary, ArchFamily } from '../types';
-import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download, BarChart2, Pencil, Check, Package, ChevronDown } from 'lucide-react';
+import { Weight, Trash2, RefreshCw, Eye, Plus, Loader2, X, Network, Upload, Download, BarChart2, Pencil, Check, Package, ChevronDown, FolderOpen, Link } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { fmtSize, fmtDataset } from '../utils/format';
 import { useWeightsStore } from '../store/weightsStore';
@@ -53,6 +53,12 @@ export default function WeightsPage({ onOpenWeight }: Props) {
   const [pkgIncludeJobs, setPkgIncludeJobs] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
   const exportMenuRef = useRef<HTMLDivElement>(null);
+  // Local/URL import modal state
+  const [showLocalImportModal, setShowLocalImportModal] = useState(false);
+  const [showUrlImportModal, setShowUrlImportModal] = useState(false);
+  const [localPath, setLocalPath] = useState('');
+  const [importUrl, setImportUrl] = useState('');
+  const [importName, setImportName] = useState('');
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -117,6 +123,44 @@ export default function WeightsPage({ onOpenWeight }: Props) {
     }
   };
 
+  const handleImportLocal = async () => {
+    if (!localPath.trim() || !importName.trim()) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const result = await api.importWeightFromLocal(localPath.trim(), importName.trim());
+      invalidateWeights();
+      load();
+      setShowLocalImportModal(false);
+      setLocalPath('');
+      setImportName('');
+      if (onOpenWeight) onOpenWeight(result.weight_id);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Local import failed');
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleImportUrl = async () => {
+    if (!importUrl.trim() || !importName.trim()) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const result = await api.importWeightFromUrl(importUrl.trim(), importName.trim());
+      invalidateWeights();
+      load();
+      setShowUrlImportModal(false);
+      setImportUrl('');
+      setImportName('');
+      if (onOpenWeight) onOpenWeight(result.weight_id);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'URL import failed');
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-6xl mx-auto p-8 space-y-6">
@@ -150,7 +194,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                 {!importing && <ChevronDown size={13} className={`transition-transform ${showImportMenu ? 'rotate-180' : ''}`} />}
               </button>
               {showImportMenu && !importing && (
-                <div className="absolute right-0 top-full mt-1 w-52 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-30 overflow-hidden">
+                <div className="absolute right-0 top-full mt-1 w-56 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-30 overflow-hidden">
                   <label className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer">
                     <Upload size={14} className="text-emerald-400 shrink-0" />
                     <div className="text-left">
@@ -160,6 +204,28 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                     <input ref={importFileRef} type="file" accept=".pt,.pth" className="hidden" disabled={importing}
                       onChange={(e) => { setShowImportMenu(false); handleImportFile(e); }} />
                   </label>
+                  <div className="border-t border-slate-700/50" />
+                  <button
+                    onClick={() => { setShowLocalImportModal(true); setShowImportMenu(false); }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer"
+                  >
+                    <FolderOpen size={14} className="text-amber-400 shrink-0" />
+                    <div className="text-left">
+                      <div className="font-medium">From Local Path</div>
+                      <div className="text-xs text-slate-500">Import from server disk</div>
+                    </div>
+                  </button>
+                  <div className="border-t border-slate-700/50" />
+                  <button
+                    onClick={() => { setShowUrlImportModal(true); setShowImportMenu(false); }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-sm text-slate-200 hover:bg-slate-700 transition-colors cursor-pointer"
+                  >
+                    <Link size={14} className="text-cyan-400 shrink-0" />
+                    <div className="text-left">
+                      <div className="font-medium">From URL</div>
+                      <div className="text-xs text-slate-500">Download and import</div>
+                    </div>
+                  </button>
                   <div className="border-t border-slate-700/50" />
                   <button
                     onClick={() => { setShowImportPkg(true); setShowImportMenu(false); }}
@@ -323,6 +389,102 @@ export default function WeightsPage({ onOpenWeight }: Props) {
             onClose={() => setShowImportPkg(false)}
             onDone={() => { invalidateWeights(); setTimeout(load, 50); }}
           />
+        )}
+
+        {/* Local Path Import Modal */}
+        {showLocalImportModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowLocalImportModal(false)}>
+            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[480px] overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+                <h3 className="text-white font-semibold text-sm flex items-center gap-2">
+                  <FolderOpen size={16} className="text-amber-400" /> Import from Local Path
+                </h3>
+                <button onClick={() => setShowLocalImportModal(false)} className="text-slate-500 hover:text-white cursor-pointer"><X size={16} /></button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Absolute File Path</label>
+                  <input
+                    autoFocus
+                    type="text"
+                    value={localPath}
+                    onChange={e => setLocalPath(e.target.value)}
+                    placeholder="/home/user/models/yolov8n.pt"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-amber-500 outline-none font-mono"
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">Path must be accessible by the server process</p>
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Weight Name</label>
+                  <input
+                    type="text"
+                    value={importName}
+                    onChange={e => setImportName(e.target.value)}
+                    placeholder="my_local_model"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-amber-500 outline-none"
+                  />
+                </div>
+                <div className="flex justify-end gap-2 pt-2">
+                  <button onClick={() => setShowLocalImportModal(false)} className="px-4 py-2 text-sm text-slate-400 hover:text-white cursor-pointer">Cancel</button>
+                  <button
+                    onClick={handleImportLocal}
+                    disabled={importing || !localPath.trim() || !importName.trim()}
+                    className="flex items-center gap-2 px-4 py-2 text-sm bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"
+                  >
+                    {importing ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />} Import
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* URL Import Modal */}
+        {showUrlImportModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowUrlImportModal(false)}>
+            <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[520px] overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+                <h3 className="text-white font-semibold text-sm flex items-center gap-2">
+                  <Link size={16} className="text-cyan-400" /> Import from URL
+                </h3>
+                <button onClick={() => setShowUrlImportModal(false)} className="text-slate-500 hover:text-white cursor-pointer"><X size={16} /></button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Download URL</label>
+                  <input
+                    autoFocus
+                    type="text"
+                    value={importUrl}
+                    onChange={e => setImportUrl(e.target.value)}
+                    placeholder="https://example.com/model.pt"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-cyan-500 outline-none font-mono"
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">Direct link to .pt, .pth, .ckpt, or .safetensors file</p>
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1.5">Weight Name</label>
+                  <input
+                    type="text"
+                    value={importName}
+                    onChange={e => setImportName(e.target.value)}
+                    placeholder="downloaded_model"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-cyan-500 outline-none"
+                  />
+                </div>
+                <div className="flex justify-end gap-2 pt-2">
+                  <button onClick={() => setShowUrlImportModal(false)} className="px-4 py-2 text-sm text-slate-400 hover:text-white cursor-pointer">Cancel</button>
+                  <button
+                    onClick={handleImportUrl}
+                    disabled={importing || !importUrl.trim() || !importName.trim()}
+                    className="flex items-center gap-2 px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"
+                  >
+                    {importing ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Download & Import
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Rename Weight Dialog */}

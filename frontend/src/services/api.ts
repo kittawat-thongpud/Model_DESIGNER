@@ -269,6 +269,10 @@ export const api = {
     }
     return res.json();
   },
+  importWeightFromLocal: (localPath: string, name: string) =>
+    post<ImportWeightResult>('/api/weights/import/local', { local_path: localPath, name }),
+  importWeightFromUrl: (url: string, name: string, timeout = 300) =>
+    post<ImportWeightResult>('/api/weights/import/url', { url, name, timeout }),
   getWeightGroups: (id: string) => get<WeightGroup[]>(`/api/weights/${id}/groups`),
   getWeightGroupsAnnotated: (id: string, modelId?: string) =>
     get<(WeightGroup & { node_label?: string })[]>(`/api/weights/${id}/groups-annotated${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`),
