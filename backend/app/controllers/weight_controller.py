@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
+import requests
 
 from ..schemas.weight_schema import (
     ExtractRequest, TransferRequest, AutoMapRequest,
@@ -708,6 +709,108 @@ async def import_weight(
             "key_count": result["key_count"],
         })
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+class LocalImportRequest(BaseModel):
+    local_path: str = Field(..., description="Absolute path to .pt/.pth file on server")
+    name: str = Field("imported_weight", description="Name for the imported weight")
+
+
+@router.post("/import/local", summary="Import weight from local server path")
+async def import_weight_local(body: LocalImportRequest):
+    """Import a weight file already present on the server's local filesystem.
+
+    Bypasses proxy upload limits by reading directly from disk.
+    """
+    src_path = Path(body.local_path)
+    if not src_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {body.local_path}")
+    if not src_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Path is not a file: {body.local_path}")
+
+    # Copy to temp location for atomic import
+    suffix = src_path.suffix or ".pt"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        shutil.copy2(str(src_path), str(tmp_path))
+
+    try:
+        result = weight_import.import_external_weight(tmp_path, body.name)
+        logger.log("system", "INFO", "Local weight imported", {
+            "weight_id": result["weight_id"],
+            "source_plugin": result["source_plugin"],
+            "source_path": str(src_path),
+            "key_count": result["key_count"],
+        })
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+class UrlImportRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) URL to download .pt/.pth file from")
+    name: str = Field("imported_weight", description="Name for the imported weight")
+    timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
+
+
+@router.post("/import/url", summary="Import weight from download URL")
+async def import_weight_url(body: UrlImportRequest):
+    """Download and import a weight file from an external URL.
+
+    Bypasses proxy upload limits by downloading directly on the server.
+    Supports resume-capable URLs and large files (up to timeout limit).
+    """
+    # Download to temp file with streaming
+    suffix = Path(body.url).suffix or ".pt"
+    if suffix not in [".pt", ".pth", ".ckpt", ".safetensors", ".bin"]:
+        suffix = ".pt"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        logger.log("system", "INFO", "Starting weight download", {
+            "url": body.url[:100] + "..." if len(body.url) > 100 else body.url,
+            "timeout": body.timeout,
+        })
+
+        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+            resp.raise_for_status()
+            downloaded = 0
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+        logger.log("system", "INFO", "Weight download complete", {
+            "url": body.url[:100] + "...",
+            "bytes": downloaded,
+        })
+
+        result = weight_import.import_external_weight(tmp_path, body.name)
+        logger.log("system", "INFO", "URL weight imported", {
+            "weight_id": result["weight_id"],
+            "source_plugin": result["source_plugin"],
+            "source_url": body.url[:100] + "...",
+            "key_count": result["key_count"],
+        })
+        return result
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
