@@ -703,7 +703,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                                       : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
                                   }`}
                                 >
-                                  <div>{s.scale.toUpperCase()}</div>
+                                  <div>{String(s.scale || '').toUpperCase()}</div>
                                   <div className="text-[9px] font-normal opacity-70 leading-tight">{s.label}</div>
                                 </button>
                               ))}

@@ -256,7 +256,7 @@ function ArchCard({ family, mambaStatus, mambaLoading, onMambaInstall, onMambaRe
                 className="text-xs px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 font-mono"
                 title={s.plugin_name}
               >
-                {s.label || s.scale.toUpperCase()}
+                {s.label || String(s.scale || '').toUpperCase()}
               </span>
             ))}
           </div>

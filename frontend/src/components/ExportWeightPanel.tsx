@@ -76,7 +76,7 @@ export default function ExportWeightPanel({ weightId, jobId, onClose, onWeightCr
         half,
         simplify,
       });
-      setResult({ ok: true, message: `${r.format.toUpperCase()} exported. Downloading…` });
+      setResult({ ok: true, message: `${String(r.format || exportFormat).toUpperCase()} exported. Downloading…` });
       setTimeout(() => api.downloadExportedWeight(resolvedWeightId, exportFormat), 800);
     } catch (e: unknown) {
       setResult({ ok: false, message: e instanceof Error ? e.message : 'Export failed' });
