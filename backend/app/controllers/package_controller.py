@@ -188,6 +188,8 @@ class LocalPackagePeekRequest(BaseModel):
 async def peek_package_local(body: LocalPackagePeekRequest):
     """Preview a .mdpkg package on the server's local filesystem without importing."""
     src_path = Path(body.local_path)
+    logger.log("system", "INFO", "Package peek local", {"path": str(src_path), "exists": src_path.exists()})
+
     if not src_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {body.local_path}")
     if not src_path.is_file():
@@ -195,11 +197,13 @@ async def peek_package_local(body: LocalPackagePeekRequest):
 
     try:
         data = src_path.read_bytes()
+        logger.log("system", "INFO", "Package peek local read", {"bytes": len(data)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
 
     result = package_service.peek_package(data)
     if "error" in result:
+        logger.log("system", "WARNING", "Package peek local failed", {"error": result["error"], "bytes": len(data)})
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
@@ -212,13 +216,32 @@ class UrlPackagePeekRequest(BaseModel):
 @router.post("/peek/url", summary="Preview package from download URL")
 async def peek_package_url(body: UrlPackagePeekRequest):
     """Download and preview a .mdpkg package from URL without importing."""
+    url = body.url
+    # Google Drive special handling
+    headers = {}
+    if "drive.google.com" in url or "googleusercontent.com" in url:
+        # Add headers to mimic browser for Google Drive
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
     try:
-        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+        logger.log("system", "INFO", "Package peek URL download start", {"url": url[:80]})
+        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
             resp.raise_for_status()
+            # Check content type
+            content_type = resp.headers.get('content-type', '')
+            logger.log("system", "INFO", "Package peek URL response", {"content_type": content_type, "status": resp.status_code})
+
             data = b""
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     data += chunk
+
+        logger.log("system", "INFO", "Package peek URL download complete", {"bytes": len(data)})
+
+        # Check if we got HTML instead of binary (common with Google Drive)
+        if data.startswith(b'<!DOCTYPE') or data.startswith(b'<html') or b'<!DOCTYPE html' in data[:1000]:
+            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
+
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
     except requests.exceptions.RequestException as e:
@@ -226,6 +249,7 @@ async def peek_package_url(body: UrlPackagePeekRequest):
 
     result = package_service.peek_package(data)
     if "error" in result:
+        logger.log("system", "WARNING", "Package peek URL failed", {"error": result["error"], "bytes": len(data)})
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
@@ -313,20 +337,33 @@ async def import_package_url(body: UrlPackageImportRequest):
 
     Bypasses proxy upload limits by downloading directly on the server.
     """
+    url = body.url
+    # Google Drive special handling
+    headers = {}
+    if "drive.google.com" in url or "googleusercontent.com" in url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
     try:
         logger.log("system", "INFO", "Starting package download", {
-            "url": body.url[:100] + "..." if len(body.url) > 100 else body.url,
+            "url": url[:100] + "..." if len(url) > 100 else url,
             "timeout": body.timeout,
         })
 
-        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
             resp.raise_for_status()
+            content_type = resp.headers.get('content-type', '')
+            logger.log("system", "INFO", "Package download response", {"content_type": content_type, "status": resp.status_code})
+
             data = b""
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     data += chunk
 
         logger.log("system", "INFO", "Package download complete", {"bytes": len(data)})
+
+        # Check if we got HTML instead of binary
+        if data.startswith(b'<!DOCTYPE') or data.startswith(b'<html') or b'<!DOCTYPE html' in data[:1000]:
+            raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
 
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
@@ -338,5 +375,5 @@ async def import_package_url(body: UrlPackageImportRequest):
     if result.errors and not result.weights_imported and not result.jobs_imported:
         raise HTTPException(status_code=400, detail=result.errors)
 
-    logger.log("system", "INFO", "Package imported from URL", {**result.to_dict(), "source_url": body.url[:100] + "..."})
+    logger.log("system", "INFO", "Package imported from URL", {**result.to_dict(), "source_url": url[:100] + "..."})
     return result.to_dict()

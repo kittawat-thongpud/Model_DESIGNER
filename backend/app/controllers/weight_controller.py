@@ -771,21 +771,30 @@ async def import_weight_url(body: UrlImportRequest):
     Supports resume-capable URLs and large files (up to timeout limit).
     """
     # Download to temp file with streaming
-    suffix = Path(body.url).suffix or ".pt"
+    url = body.url
+    suffix = Path(url).suffix or ".pt"
     if suffix not in [".pt", ".pth", ".ckpt", ".safetensors", ".bin"]:
         suffix = ".pt"
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
+    # Google Drive special handling
+    headers = {}
+    if "drive.google.com" in url or "googleusercontent.com" in url:
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
     try:
         logger.log("system", "INFO", "Starting weight download", {
-            "url": body.url[:100] + "..." if len(body.url) > 100 else body.url,
+            "url": url[:100] + "..." if len(url) > 100 else url,
             "timeout": body.timeout,
         })
 
-        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+        with requests.get(url, stream=True, timeout=body.timeout, headers=headers, allow_redirects=True) as resp:
             resp.raise_for_status()
+            content_type = resp.headers.get('content-type', '')
+            logger.log("system", "INFO", "Weight download response", {"content_type": content_type, "status": resp.status_code})
+
             downloaded = 0
             with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -793,10 +802,13 @@ async def import_weight_url(body: UrlImportRequest):
                         f.write(chunk)
                         downloaded += len(chunk)
 
-        logger.log("system", "INFO", "Weight download complete", {
-            "url": body.url[:100] + "...",
-            "bytes": downloaded,
-        })
+        logger.log("system", "INFO", "Weight download complete", {"bytes": downloaded})
+
+        # Check if we got HTML instead of binary
+        with open(tmp_path, "rb") as f:
+            header = f.read(1000)
+            if header.startswith(b'<!DOCTYPE') or header.startswith(b'<html') or b'<!DOCTYPE html' in header:
+                raise HTTPException(status_code=400, detail="URL returned HTML page instead of file. For Google Drive, use direct download link or shareable link with 'download' parameter.")
 
         result = weight_import.import_external_weight(tmp_path, body.name)
         logger.log("system", "INFO", "URL weight imported", {
