@@ -180,6 +180,56 @@ async def peek_package(
     return result
 
 
+class LocalPackagePeekRequest(BaseModel):
+    local_path: str = Field(..., description="Absolute path to .mdpkg file on server")
+
+
+@router.post("/peek/local", summary="Preview package from local path")
+async def peek_package_local(body: LocalPackagePeekRequest):
+    """Preview a .mdpkg package on the server's local filesystem without importing."""
+    src_path = Path(body.local_path)
+    if not src_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {body.local_path}")
+    if not src_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Path is not a file: {body.local_path}")
+
+    try:
+        data = src_path.read_bytes()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+
+    result = package_service.peek_package(data)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+class UrlPackagePeekRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) URL to download .mdpkg from")
+    timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
+
+
+@router.post("/peek/url", summary="Preview package from download URL")
+async def peek_package_url(body: UrlPackagePeekRequest):
+    """Download and preview a .mdpkg package from URL without importing."""
+    try:
+        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+            resp.raise_for_status()
+            data = b""
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    data += chunk
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+
+    result = package_service.peek_package(data)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
 # ── Import ────────────────────────────────────────────────────────────────────
 
 @router.post("/import", summary="Import a .mdpkg package")
