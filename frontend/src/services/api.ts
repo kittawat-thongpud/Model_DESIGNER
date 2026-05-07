@@ -474,6 +474,35 @@ export const api = {
     }
     return res.json();
   },
+  peekPackageFromLocal: async (
+    localPath: string,
+  ): Promise<{ version: string; weights: { id: string; model_name: string; dataset: string; epochs_trained: number }[]; jobs: string[] }> => {
+    const res = await fetch('/api/packages/peek/local', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ local_path: localPath }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  peekPackageFromUrl: async (
+    url: string,
+    timeout = 300,
+  ): Promise<{ version: string; weights: { id: string; model_name: string; dataset: string; epochs_trained: number }[]; jobs: string[] }> => {
+    const res = await fetch('/api/packages/peek/url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, timeout }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
   importPackage: async (
     file: File,
     renameMap: Record<string, string> = {},
