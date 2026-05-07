@@ -334,6 +334,16 @@ def _init_db() -> None:
                 model_scale TEXT            -- Model scale (n/s/m/l/x) for VRAM estimation
             )
         """)
+        # Migration: add columns if they don't exist (for existing databases)
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(queue_tasks)").fetchall()}
+        if "gpu_device" not in existing_cols:
+            conn.execute("ALTER TABLE queue_tasks ADD COLUMN gpu_device TEXT")
+        if "vram_allocated_gb" not in existing_cols:
+            conn.execute("ALTER TABLE queue_tasks ADD COLUMN vram_allocated_gb REAL")
+        if "vram_used_gb" not in existing_cols:
+            conn.execute("ALTER TABLE queue_tasks ADD COLUMN vram_used_gb REAL")
+        if "model_scale" not in existing_cols:
+            conn.execute("ALTER TABLE queue_tasks ADD COLUMN model_scale TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_queue_status_type
             ON queue_tasks(task_type, status, priority DESC, created_at ASC)
