@@ -114,7 +114,22 @@ class SGTokenBlock(nn.Module):
 
         # Per-channel LayerScale residual.  Starting near identity keeps the
         # CNN/PAN path dominant while the sparse branch calibrates.
-        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 0.01))
+        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 0.1))
+
+        # Learnable saliency head: small conv that learns which tokens matter.
+        # Combined with L2 energy for more robust token selection.
+        self.saliency_head = nn.Sequential(
+            nn.Conv2d(c2, c2 // 4, 1, bias=False),
+            _make_gn(c2 // 4),
+            nn.SiLU(),
+            nn.Conv2d(c2 // 4, 1, 1, bias=False),
+        )
+        self.saliency_mix = nn.Parameter(torch.tensor(0.5))  # blend L2 energy vs learned
+
+        # Alpha-coupled scaling: set by trainer to match decoder alpha warmup.
+        # gamma_effective = gamma * (1 + alpha_scale) so alpha warmup also
+        # activates the sparse branch.
+        self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
 
         self._attn_scale = c2 ** -0.5
 
@@ -212,10 +227,25 @@ class SGTokenBlock(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _compute_saliency(self, x: torch.Tensor) -> torch.Tensor:
-        """L2 activation energy per spatial token, in FP32."""
+        """L2 activation energy + learned saliency per spatial token, in FP32."""
         B, C, H, W = x.shape
         N = H * W
-        importance = x.view(B, C, N).float().pow(2).sum(dim=1)  # [B, N]
+        # L2 energy (heuristic)
+        l2_energy = x.view(B, C, N).float().pow(2).sum(dim=1)  # [B, N]
+        l2_energy = torch.nan_to_num(l2_energy, nan=0.0, posinf=0.0, neginf=0.0)
+        # Per-sample min-max normalisation
+        eps = 1e-6
+        l2_min = l2_energy.min(1, keepdim=True).values
+        l2_max = l2_energy.max(1, keepdim=True).values
+        l2_range = (l2_max - l2_min).clamp(min=eps)
+        l2_norm = (l2_energy - l2_min) / l2_range
+        # Learned saliency
+        learned = self.saliency_head(x.float()).view(B, N)  # [B, N]
+        learned = torch.sigmoid(learned)
+        learned = torch.nan_to_num(learned, nan=0.0, posinf=0.0, neginf=0.0)
+        # Blend: mix parameter clamped to [0,1]
+        mix = self.saliency_mix.sigmoid()
+        importance = mix * l2_norm + (1.0 - mix) * learned
         return torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _select_k(self, N: int) -> int:
@@ -303,7 +333,7 @@ class SGTokenBlock(nn.Module):
         out = out.view(B, C, H, W)
         delta = self.out_proj(out)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-        delta = 6.0 * torch.tanh(delta.float() / 6.0)
+        delta = 3.0 * torch.tanh(delta.float() / 3.0)
 
         # GroupNorm can introduce non-zero values at zero-canvas positions, so
         # mask once more to keep the sparse branch restricted to selected tokens.
@@ -327,7 +357,9 @@ class SGTokenBlock(nn.Module):
         self.last_mode = self.mode
 
         gamma = self.gamma.to(dtype=x.dtype)
-        self.last_gate = float(gamma.detach().abs().mean().item())
+        alpha_scale = self.alpha_scale.to(dtype=x.dtype, device=x.device)
+        gamma_effective = gamma * (1.0 + alpha_scale)
+        self.last_gate = float(gamma_effective.detach().abs().mean().item())
 
         with _fp32_context(x.device):
             x_branch = self.pre_norm(x.float())
@@ -343,7 +375,7 @@ class SGTokenBlock(nn.Module):
                 saliency = self._compute_saliency(x_branch) if self.debug_enabled else None
                 self._store_debug(topk_idx, saliency)
                 delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
-                return x + gamma * delta.to(dtype=x.dtype)
+                return x + gamma_effective * delta.to(dtype=x.dtype)
 
             importance = self._compute_saliency(x_branch)
 
@@ -360,9 +392,9 @@ class SGTokenBlock(nn.Module):
             if self.mode == "hybrid" and self.local_dw is not None:
                 local_delta = self.local_dw(x_branch)
                 local_gamma = self.local_gamma.to(dtype=x.dtype)
-                return x + gamma * delta.to(dtype=x.dtype) + local_gamma * local_delta.to(dtype=x.dtype)
+                return x + gamma_effective * delta.to(dtype=x.dtype) + local_gamma * local_delta.to(dtype=x.dtype)
 
-            return x + gamma * delta.to(dtype=x.dtype)
+            return x + gamma_effective * delta.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

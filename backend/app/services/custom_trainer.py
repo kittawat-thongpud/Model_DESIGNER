@@ -665,7 +665,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         for name, params, lr_mult, use_wd in [
             ('base',       pg_base,       1.0, True),
             ('sgb_linear', pg_sgb_linear, 1.5, True),
-            ('sgb_gamma',  pg_sgb_gamma,  5.0, False),
+            ('sgb_gamma',  pg_sgb_gamma,  1.0, False),
             ('norm_bias',  pg_norm_bias,  1.0, False),
             ('decoder',    pg_decoder,    1.5, True),
         ]:
@@ -971,6 +971,15 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for decoder in decoders:
             decoder.set_alpha(alpha)
+
+        # Sync alpha to SGB blocks: alpha warmup also activates sparse branch
+        sgb_blocks = [
+            m for m in model.modules()
+            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
+        ]
+        for blk in sgb_blocks:
+            blk.alpha_scale.fill_(alpha)
+
         self._sync_hsg_detr_alpha_to_ema()
 
         self._hsg_alpha_last = alpha
@@ -1027,6 +1036,21 @@ class CustomDetectionTrainer(DetectionTrainer):
         for src, dst in zip(model_decoders, ema_decoders):
             try:
                 dst.set_alpha(float(src.alpha.detach().reshape(-1)[0]))
+            except Exception:
+                pass
+
+        # Also sync SGB alpha_scale to EMA
+        model_sgb = [
+            m for m in model.modules()
+            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
+        ]
+        ema_sgb = [
+            m for m in ema_model.modules()
+            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
+        ]
+        for src, dst in zip(model_sgb, ema_sgb):
+            try:
+                dst.alpha_scale.copy_(src.alpha_scale)
             except Exception:
                 pass
 
