@@ -173,8 +173,11 @@ def _estimate_vram_requirement(task_type: str, model_scale: str | None = None) -
     return max(base_vram, 0.0)
 
 
-def _check_vram_available(gpu_device: str, required_gb: float) -> tuple[bool, str]:
-    """Check if sufficient VRAM is available on the device with safety buffer."""
+def _check_vram_available(gpu_device: str, required_gb: float, conn: sqlite3.Connection | None = None) -> tuple[bool, str]:
+    """Check if sufficient VRAM is available on the device with safety buffer.
+    
+    Accounts for both actual free VRAM and already-allocated VRAM from other running tasks.
+    """
     gpu_info = _get_gpu_vram_info()
     if not gpu_info.get("available"):
         return True, "VRAM monitoring not available, allowing admission"
@@ -192,12 +195,21 @@ def _check_vram_available(gpu_device: str, required_gb: float) -> tuple[bool, st
         total_gb * _VRAM_SAFETY_BUFFER_PERCENT,
     )
 
-    # Check if free VRAM (minus buffer) is sufficient
-    available_after_buffer = free_gb - buffer_gb
-    if available_after_buffer < required_gb:
-        return False, f"Insufficient VRAM: need {required_gb:.1f}GB, have {available_after_buffer:.1f}GB available (free: {free_gb:.1f}GB, buffer: {buffer_gb:.1f}GB)"
+    # Account for VRAM already allocated to other running tasks on this GPU
+    already_allocated = 0.0
+    if conn is not None:
+        already_allocated = _get_allocated_vram_on_device(conn, gpu_device)
 
-    return True, f"VRAM OK: need {required_gb:.1f}GB, have {available_after_buffer:.1f}GB available"
+    # Effective free VRAM = actual free - buffer - already allocated to others
+    effective_free = free_gb - buffer_gb - already_allocated
+
+    if effective_free < required_gb:
+        return False, (
+            f"Insufficient VRAM: need {required_gb:.1f}GB, have {effective_free:.1f}GB effective free "
+            f"(free: {free_gb:.1f}GB, buffer: {buffer_gb:.1f}GB, allocated to others: {already_allocated:.1f}GB)"
+        )
+
+    return True, f"VRAM OK: need {required_gb:.1f}GB, have {effective_free:.1f}GB effective free"
 
 
 def update_vram_usage(task_id: str, vram_used_gb: float) -> bool:
@@ -246,31 +258,34 @@ def check_oom_violations() -> list[dict]:
                 continue
 
             total_gb = device_info["total_gb"]
-            used_ratio = vram_used / total_gb if total_gb > 0 else 0.0
+
+            # Use actual GPU usage if vram_used not updated, fallback to system query
+            actual_used = vram_used if vram_used > 0 else device_info["used_gb"]
+            actual_ratio = actual_used / total_gb if total_gb > 0 else 0.0
 
             # Check if exceeding allocated limit significantly
-            if vram_used > vram_allocated * 1.5:  # 50% over allocation
+            if actual_used > vram_allocated * 1.5:  # 50% over allocation
                 violations.append({
                     "task_id": task_id,
                     "task_type": task_type,
                     "ref_id": ref_id,
                     "gpu_device": gpu_device,
                     "vram_allocated_gb": vram_allocated,
-                    "vram_used_gb": vram_used,
-                    "reason": f"VRAM usage {vram_used:.1f}GB exceeds allocation {vram_allocated:.1f}GB by 50%",
+                    "vram_used_gb": actual_used,
+                    "reason": f"VRAM usage {actual_used:.1f}GB exceeds allocation {vram_allocated:.1f}GB by 50%",
                     "severity": "high",
                 })
 
             # Check if approaching total GPU limit (95%)
-            if used_ratio > _VRAM_OOM_KILL_THRESHOLD:
+            if actual_ratio > _VRAM_OOM_KILL_THRESHOLD:
                 violations.append({
                     "task_id": task_id,
                     "task_type": task_type,
                     "ref_id": ref_id,
                     "gpu_device": gpu_device,
                     "vram_allocated_gb": vram_allocated,
-                    "vram_used_gb": vram_used,
-                    "reason": f"VRAM usage {vram_used:.1f}GB ({used_ratio*100:.1f}%) exceeds OOM threshold {_VRAM_OOM_KILL_THRESHOLD*100:.1f}%",
+                    "vram_used_gb": actual_used,
+                    "reason": f"VRAM usage {actual_used:.1f}GB ({actual_ratio*100:.1f}%) exceeds OOM threshold {_VRAM_OOM_KILL_THRESHOLD*100:.1f}%",
                     "severity": "critical",
                 })
 
@@ -404,7 +419,7 @@ def _admit_pending_gpu_locked(conn: sqlite3.Connection, now: float) -> list[tupl
         # VRAM-aware admission
         if _VRAM_ENABLED:
             vram_required = _estimate_vram_requirement(task_type, model_scale)
-            vram_available, vram_msg = _check_vram_available(gpu_device, vram_required)
+            vram_available, vram_msg = _check_vram_available(gpu_device, vram_required, conn)
 
             if not vram_available:
                 # Skip this task, try next one
@@ -452,9 +467,10 @@ def enqueue(
     # Determine GPU device if not specified
     if gpu_device is None and task_type in GPU_TASK_TYPES:
         gpu_info = _get_gpu_vram_info()
-        if gpu_info.get("available") and len(gpu_info) > 1:
-            # Use first available GPU
-            gpu_device = list(gpu_info.keys())[0]
+        if gpu_info.get("available"):
+            # Find first actual GPU key (skip "available" metadata key)
+            gpu_keys = [k for k in gpu_info if k.startswith("cuda")]
+            gpu_device = gpu_keys[0] if gpu_keys else "cuda:0"
         else:
             gpu_device = "cuda:0"
 
@@ -469,7 +485,7 @@ def enqueue(
             # VRAM-aware admission for GPU tasks
             if _VRAM_ENABLED and gpu_device:
                 # Check VRAM availability
-                vram_available, vram_msg = _check_vram_available(gpu_device, vram_required)
+                vram_available, vram_msg = _check_vram_available(gpu_device, vram_required, conn)
                 admission_message = vram_msg
 
                 if not vram_available:
@@ -691,7 +707,10 @@ def reconcile_tasks(
                     )
                     orphan_pending += 1
         if admit_pending:
-            admitted_callbacks = _admit_pending_locked(conn, task_type, now)
+            if task_type in GPU_TASK_TYPES:
+                admitted_callbacks = _admit_pending_gpu_locked(conn, now)
+            else:
+                admitted_callbacks = _admit_pending_locked(conn, task_type, now)
     if admitted_callbacks:
         _fire_admission_callbacks(admitted_callbacks)
     return {

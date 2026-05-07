@@ -1618,17 +1618,17 @@ async def run_benchmark(req: BenchmarkRequest):
     from ..services.task_queue import enqueue, complete, cancel, TaskType
 
     benchmark_id = uuid.uuid4().hex[:12]
-    task_id, admitted = enqueue(
+    task_id, admitted, admission_msg = enqueue(
         TaskType.BENCHMARK,
         ref_id=benchmark_id,
         payload={"weight_id": req.weight_id, "dataset": req.dataset},
+        gpu_device=req.device if req.device.startswith("cuda") else None,
     )
     if not admitted:
         cancel(task_id)
         raise HTTPException(
             409,
-            "GPU is busy with another training or benchmark job. "
-            "Retry when the current job finishes.",
+            f"GPU is busy: {admission_msg}",
         )
 
     _task_error: str | None = None
