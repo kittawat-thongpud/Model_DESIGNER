@@ -813,7 +813,17 @@ class CustomDetectionTrainer(DetectionTrainer):
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
         if ckpt.get("optimizer") is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except ValueError as e:
+                if "different number of parameter groups" in str(e):
+                    self.log(
+                        f"Resume optimizer state incompatible (architecture changed). "
+                        f"Starting optimizer fresh from epoch {self.start_epoch}.",
+                        "WARNING",
+                    )
+                else:
+                    raise
         if ckpt.get("scaler") is not None:
             try:
                 self.scaler.load_state_dict(ckpt["scaler"])
