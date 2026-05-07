@@ -715,7 +715,11 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return out
-        y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
+        # Eval/export: convert raw class scores to (max_score, label) format expected by RT-DETR validator
+        # Validator expects [bboxes(4), score(1), label(1)] = 6, not [bboxes(4), scores(nc)] = 4+nc
+        scores = dec_scores.squeeze(0).sigmoid()
+        max_scores, labels = scores.max(-1, keepdim=True)
+        y = torch.cat((dec_bboxes.squeeze(0), max_scores, labels.float()), -1)
         return y if self.export else (y, out)
 
     def _safe_decoder_forward(
