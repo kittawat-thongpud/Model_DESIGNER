@@ -21,6 +21,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
+import requests
 
 from ..services.config_service import get_package_config
 from ..services import package_service
@@ -213,4 +215,78 @@ async def import_package(
         raise HTTPException(status_code=400, detail=result.errors)
 
     logger.log("system", "INFO", "Package imported", result.to_dict())
+    return result.to_dict()
+
+
+class LocalPackageImportRequest(BaseModel):
+    local_path: str = Field(..., description="Absolute path to .mdpkg file on server")
+    rename_map: dict[str, str] = Field(default_factory=dict, description="JSON object {old_weight_id: new_display_name}")
+    include_jobs: bool = Field(default=False, description="Also import job records")
+
+
+@router.post("/import/local", summary="Import package from local server path")
+async def import_package_local(body: LocalPackageImportRequest):
+    """Import a .mdpkg package already present on the server's local filesystem.
+
+    Bypasses proxy upload limits by reading directly from disk.
+    """
+    src_path = Path(body.local_path)
+    if not src_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {body.local_path}")
+    if not src_path.is_file():
+        raise HTTPException(status_code=400, detail=f"Path is not a file: {body.local_path}")
+
+    try:
+        data = src_path.read_bytes()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+
+    result = package_service.import_package(data, rename_map=body.rename_map, include_jobs=body.include_jobs)
+
+    if result.errors and not result.weights_imported and not result.jobs_imported:
+        raise HTTPException(status_code=400, detail=result.errors)
+
+    logger.log("system", "INFO", "Package imported from local", {**result.to_dict(), "source_path": str(src_path)})
+    return result.to_dict()
+
+
+class UrlPackageImportRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) URL to download .mdpkg file from")
+    rename_map: dict[str, str] = Field(default_factory=dict, description="JSON object {old_weight_id: new_display_name}")
+    include_jobs: bool = Field(default=False, description="Also import job records")
+    timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
+
+
+@router.post("/import/url", summary="Import package from download URL")
+async def import_package_url(body: UrlPackageImportRequest):
+    """Download and import a .mdpkg package from an external URL.
+
+    Bypasses proxy upload limits by downloading directly on the server.
+    """
+    try:
+        logger.log("system", "INFO", "Starting package download", {
+            "url": body.url[:100] + "..." if len(body.url) > 100 else body.url,
+            "timeout": body.timeout,
+        })
+
+        with requests.get(body.url, stream=True, timeout=body.timeout) as resp:
+            resp.raise_for_status()
+            data = b""
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    data += chunk
+
+        logger.log("system", "INFO", "Package download complete", {"bytes": len(data)})
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=408, detail=f"Download timeout after {body.timeout}s")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+
+    result = package_service.import_package(data, rename_map=body.rename_map, include_jobs=body.include_jobs)
+
+    if result.errors and not result.weights_imported and not result.jobs_imported:
+        raise HTTPException(status_code=400, detail=result.errors)
+
+    logger.log("system", "INFO", "Package imported from URL", {**result.to_dict(), "source_url": body.url[:100] + "..."})
     return result.to_dict()
