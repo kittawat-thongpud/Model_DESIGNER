@@ -1,7 +1,8 @@
 import { useState, useRef } from 'react';
-import { X, Upload, Package, CheckCircle2, AlertTriangle, Loader2, Pencil } from 'lucide-react';
+import { X, Upload, Package, CheckCircle2, AlertTriangle, Loader2, Pencil, FolderOpen, Globe, FileUp } from 'lucide-react';
 import { api } from '../services/api';
 
+type SourceTab = 'upload' | 'local' | 'url';
 type Step = 'select' | 'rename' | 'done';
 
 interface WeightInfo {
@@ -24,6 +25,7 @@ interface Props {
 
 export default function ImportPackageModal({ onClose, onDone }: Props) {
   const [step, setStep] = useState<Step>('select');
+  const [sourceTab, setSourceTab] = useState<SourceTab>('upload');
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [peeking, setPeeking] = useState(false);
@@ -36,6 +38,9 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [uploadId, setUploadId] = useState<string | null>(null);
+  // Local/URL source inputs
+  const [localPath, setLocalPath] = useState('');
+  const [sourceUrl, setSourceUrl] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
   const handleFile = async (f: File) => {
@@ -82,30 +87,75 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
     if (f) handleFile(f);
   };
 
+  const handleLocalPeek = async () => {
+    if (!localPath.trim()) return;
+    setPeeking(true);
+    setError(null);
+    try {
+      const info = await api.peekPackageFromLocal(localPath.trim()) as any;
+      setWeights(info.weights);
+      setJobCount(info.jobs?.length || 0);
+      const m: Record<string, string> = {};
+      for (const w of info.weights) m[w.id] = w.model_name;
+      setNames(m);
+      setStep('rename');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to read package';
+      setError(msg);
+    } finally {
+      setPeeking(false);
+    }
+  };
+
+  const handleUrlPeek = async () => {
+    if (!sourceUrl.trim()) return;
+    setPeeking(true);
+    setError(null);
+    try {
+      const info = await api.peekPackageFromUrl(sourceUrl.trim()) as any;
+      setWeights(info.weights);
+      setJobCount(info.jobs?.length || 0);
+      const m: Record<string, string> = {};
+      for (const w of info.weights) m[w.id] = w.model_name;
+      setNames(m);
+      setStep('rename');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to download package';
+      setError(msg);
+    } finally {
+      setPeeking(false);
+    }
+  };
+
   const handleImport = async () => {
-    if (!file) return;
     setLoading(true);
     setError(null);
     try {
-      // Only send entries that differ from originals (or send all — backend handles it)
+      // Build rename map
       const renameMap: Record<string, string> = {};
       for (const w of weights) {
         if (names[w.id] && names[w.id] !== w.model_name) {
           renameMap[w.id] = names[w.id].trim();
         }
       }
-      console.log(`[ImportPackage] importing uploadId=${uploadId || 'direct'}`);
-      const res = await api.importPackage(file, renameMap, includeJobs, uploadId || undefined);
+
+      let res;
+      if (sourceTab === 'local') {
+        res = await api.importPackageFromLocal(localPath.trim(), renameMap, includeJobs);
+      } else if (sourceTab === 'url') {
+        res = await api.importPackageFromUrl(sourceUrl.trim(), renameMap, includeJobs);
+      } else {
+        // upload tab
+        if (!file) return;
+        console.log(`[ImportPackage] importing uploadId=${uploadId || 'direct'}`);
+        res = await api.importPackage(file, renameMap, includeJobs, uploadId || undefined);
+      }
       setResult(res);
       setStep('done');
     } catch (err) {
       console.error('[ImportPackage] import failed:', err);
       const msg = err instanceof Error ? err.message : 'Import failed';
-      const sizeMB = file ? (file.size / 1024 / 1024).toFixed(1) : '?';
-      const hint = msg.includes('Failed to fetch')
-        ? ` (file ${sizeMB} MB — may exceed proxy upload limit)`
-        : '';
-      setError(msg + hint);
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -135,36 +185,112 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
 
         <div className="p-6 space-y-4">
 
-          {/* ── STEP 1: select file ── */}
+          {/* ── STEP 1: select source ── */}
           {step === 'select' && (
-            <div
-              className={`border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer ${
-                dragging ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 hover:border-slate-600 bg-slate-800/30'
-              }`}
-              onClick={() => fileRef.current?.click()}
-              onDragOver={e => { e.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={handleDrop}
-            >
-              <input ref={fileRef} type="file" accept=".mdpkg,.zip" className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
-              {peeking ? (
-                <div className="flex flex-col items-center gap-2">
-                  <Loader2 size={28} className="text-indigo-400 animate-spin" />
-                  <p className="text-slate-400 text-sm">
-                    {uploadPct !== null && uploadPct < 100 ? `Uploading… ${uploadPct}%` : 'Reading package…'}
-                  </p>
-                  {uploadPct !== null && (
-                    <div className="w-48 h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                      <div className="h-full bg-indigo-500 transition-all duration-300 rounded-full" style={{ width: `${uploadPct}%` }} />
+            <div className="space-y-4">
+              {/* Source tabs */}
+              <div className="flex border-b border-slate-800">
+                {[
+                  { key: 'upload', label: 'Upload', icon: FileUp },
+                  { key: 'local', label: 'Local Path', icon: FolderOpen },
+                  { key: 'url', label: 'URL', icon: Globe },
+                ].map(({ key, label, icon: Icon }) => (
+                  <button
+                    key={key}
+                    onClick={() => setSourceTab(key as SourceTab)}
+                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 text-sm font-medium transition-colors cursor-pointer ${
+                      sourceTab === key
+                        ? 'bg-slate-800 text-white border-b-2 border-indigo-500'
+                        : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/50'
+                    }`}
+                  >
+                    <Icon size={14} /> {label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Upload tab */}
+              {sourceTab === 'upload' && (
+                <div
+                  className={`border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer ${
+                    dragging ? 'border-indigo-400 bg-indigo-500/10' : 'border-slate-700 hover:border-slate-600 bg-slate-800/30'
+                  }`}
+                  onClick={() => fileRef.current?.click()}
+                  onDragOver={e => { e.preventDefault(); setDragging(true); }}
+                  onDragLeave={() => setDragging(false)}
+                  onDrop={handleDrop}
+                >
+                  <input ref={fileRef} type="file" accept=".mdpkg,.zip" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+                  {peeking ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <Loader2 size={28} className="text-indigo-400 animate-spin" />
+                      <p className="text-slate-400 text-sm">
+                        {uploadPct !== null && uploadPct < 100 ? `Uploading… ${uploadPct}%` : 'Reading package…'}
+                      </p>
+                      {uploadPct !== null && (
+                        <div className="w-48 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-indigo-500 transition-all duration-300 rounded-full" style={{ width: `${uploadPct}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <Upload size={28} className="text-slate-500 mx-auto" />
+                      <p className="text-slate-400 text-sm">Drop a <span className="text-indigo-400 font-mono">.mdpkg</span> file here</p>
+                      <p className="text-slate-600 text-xs">or click to browse</p>
                     </div>
                   )}
                 </div>
-              ) : (
-                <div className="space-y-2">
-                  <Upload size={28} className="text-slate-500 mx-auto" />
-                  <p className="text-slate-400 text-sm">Drop a <span className="text-indigo-400 font-mono">.mdpkg</span> file here</p>
-                  <p className="text-slate-600 text-xs">or click to browse</p>
+              )}
+
+              {/* Local tab */}
+              {sourceTab === 'local' && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1.5">Absolute File Path</label>
+                    <input
+                      autoFocus
+                      type="text"
+                      value={localPath}
+                      onChange={e => setLocalPath(e.target.value)}
+                      placeholder="/home/user/package.mdpkg"
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none font-mono"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1">Path must be accessible by the server process</p>
+                  </div>
+                  <button
+                    onClick={handleLocalPeek}
+                    disabled={peeking || !localPath.trim()}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"
+                  >
+                    {peeking ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />} Preview Package
+                  </button>
+                </div>
+              )}
+
+              {/* URL tab */}
+              {sourceTab === 'url' && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1.5">Download URL</label>
+                    <input
+                      autoFocus
+                      type="text"
+                      value={sourceUrl}
+                      onChange={e => setSourceUrl(e.target.value)}
+                      placeholder="https://example.com/package.mdpkg"
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none font-mono"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1">Direct link to .mdpkg file</p>
+                  </div>
+                  <button
+                    onClick={handleUrlPeek}
+                    disabled={peeking || !sourceUrl.trim()}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"
+                  >
+                    {peeking ? <Loader2 size={14} className="animate-spin" /> : <Globe size={14} />} Download & Preview
+                  </button>
                 </div>
               )}
             </div>
