@@ -880,7 +880,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
                 shapes,
                 padding_mask,
                 attn_mask,
-                self.query_pos_head(ref_for_layer.to(dtype=self.query_pos_head.weight.dtype)).to(dtype=output.dtype),
+                self.query_pos_head(ref_for_layer.to(dtype=self.query_pos_head[0].weight.dtype)).to(dtype=output.dtype),
             )
 
             head_input = F.layer_norm(output, (output.shape[-1],))
