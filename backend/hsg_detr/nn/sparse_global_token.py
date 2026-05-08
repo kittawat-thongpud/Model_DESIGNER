@@ -339,15 +339,24 @@ class SGTokenBlock(nn.Module):
         v = self.v_proj(selected_n)   # [B, k, C]
         
         # k×k attention (sharp softmax, better than k×N flat softmax)
-        attn = torch.bmm(q, k_.transpose(1, 2)) * float(self._attn_scale)
+        # Use more conservative scale to prevent gradient explosion
+        attn = torch.bmm(q, k_.transpose(1, 2)) * (float(self._attn_scale) * 0.5)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = attn.clamp(min=-80.0, max=80.0)
-        attn = attn - attn.max(dim=-1, keepdim=True).values
+        # Tighter clamp for numerical stability in FP16
+        attn = attn.clamp(min=-50.0, max=50.0)
+        # Softmax stabilization: subtract max (safer than manual)
+        attn = attn - attn.max(dim=-1, keepdim=True).values.detach()
         attn = torch.softmax(attn, dim=-1)
+        # Handle degenerate cases where all values were -inf
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        # Renormalize if NaN handling changed distribution
+        attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        attn = attn / attn_sum
         
         attended = torch.bmm(attn, v)  # [B, k, C]
-        attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
+        # Immediate clamp to prevent gradient explosion
+        attended = torch.clamp(attended, min=-50.0, max=50.0)
+        attended = torch.nan_to_num(attended, nan=0.0, posinf=10.0, neginf=-10.0)
         return attended.to(orig_dtype)
 
     def _channel_recalibration(
@@ -377,13 +386,17 @@ class SGTokenBlock(nn.Module):
         
         # 1 + tanh: range (0, 2), zero-init → starts at 1.0 (identity)
         chan_w = 1.0 + torch.tanh(chan_w)
+        # Clamp to safe range [0.1, 1.9] to prevent gradient explosion
+        chan_w = torch.clamp(chan_w, min=0.1, max=1.9)
         
         # Store deviation from identity for metrics (0.0 = identity, >0 = learning)
         self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
         
         # Multiplicative recalibration (broadcast to spatial)
         chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
-        return x * chan_w.to(dtype=x.dtype)
+        out = x * chan_w.to(dtype=x.dtype)
+        # Final safety clamp for output
+        return torch.clamp(out, min=-1000.0, max=1000.0)
 
     def _spatial_refinement(
         self,
@@ -449,15 +462,27 @@ class SGTokenBlock(nn.Module):
             
             # ── 3. k×k self-attention ───────────────────────────────────
             attended = self._k_times_k_attention(selected)  # [B, k, C]
+            # Stabilize: clamp extreme values that can cause NaN in backward
+            attended = torch.clamp(attended, min=-100.0, max=100.0)
+            if not torch.isfinite(attended).all():
+                attended = torch.nan_to_num(attended, nan=0.0, posinf=10.0, neginf=-10.0)
             
             # ── 4. Channel recalibration (multiplicative) ───────────────
             x_recal = self._channel_recalibration(attended, x)  # [B, C, H, W]
+            # Stabilize output
+            x_recal = torch.clamp(x_recal, min=-1000.0, max=1000.0)
+            if not torch.isfinite(x_recal).all():
+                x_recal = torch.nan_to_num(x_recal, nan=0.0, posinf=100.0, neginf=-100.0)
             
             # ── 5. Spatial refinement (blended by alpha) ───────────────
             # Always compute spatial path (no if branch) to ensure gradient flow
             # alpha=0 → output = x_recal (spatial contribution zeroed)
             alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
             spatial_w = self._spatial_refinement(x_recal)
+            # Stabilize spatial weights
+            spatial_w = torch.clamp(spatial_w, min=-1000.0, max=1000.0)
+            if not torch.isfinite(spatial_w).all():
+                spatial_w = torch.nan_to_num(spatial_w, nan=0.0, posinf=100.0, neginf=-100.0)
             out = x_recal + alpha * (spatial_w - x_recal)
             
             # ── 6. Hybrid local path (multiplicative blend, non-bypassable) ─

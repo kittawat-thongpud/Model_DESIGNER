@@ -1120,16 +1120,29 @@ class CustomDetectionTrainer(DetectionTrainer):
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
+        # Pre-check: if any gradient is NaN/Inf, skip this step entirely
+        has_nan_grad = False
+        for p in self.model.parameters():
+            if p.grad is not None:
+                if not torch.isfinite(p.grad).all():
+                    has_nan_grad = True
+                    break
+        if has_nan_grad:
+            self._handle_nonfinite_gradients("Pre-check: NaN/Inf detected in gradients")
+            self.optimizer.zero_grad(set_to_none=True)
+            return
+        
         self.scaler.unscale_(self.optimizer)
         self._assert_batchnorm_buffers_finite("before optimizer step")
         try:
+            # Lower max_norm for TGSR stability (was 10.0)
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
-                max_norm=10.0,
+                max_norm=5.0,
                 error_if_nonfinite=True,
             )
         except TypeError:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
             if not torch.isfinite(total_norm):
                 self._handle_nonfinite_gradients(f"NaN/Inf gradient norm detected: {float(total_norm)}")
                 return
