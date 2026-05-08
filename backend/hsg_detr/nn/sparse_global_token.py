@@ -128,13 +128,14 @@ class SGTokenBlock(nn.Module):
         # ── Spatial Refinement ───────────────────────────────────────────
         # 1×1 depthwise for per-channel spatial modulation
         self.spatial_conv = nn.Conv2d(c2, c2, 1, groups=c2, bias=True)
-        nn.init.ones_(self.spatial_conv.weight)  # identity
+        # Near-identity with diversity (std=0.02 gives small variance for learning)
+        nn.init.normal_(self.spatial_conv.weight, mean=1.0, std=0.02)
         nn.init.zeros_(self.spatial_conv.bias)
 
         # Alpha for blending channel vs spatial (set by trainer during warmup)
         self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
 
-        # ── Hybrid mode: local path (still additive, but small) ───────────
+        # ── Hybrid mode: local path (multiplicative blend, non-bypassable) ─
         if mode == "hybrid":
             self.local_dw = nn.Sequential(
                 nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
@@ -143,17 +144,18 @@ class SGTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 _make_gn(c2),
             )
-            self.local_gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
+            # Multiplicative blend weight: sigmoid(0) = 0.5 default blend
+            self.local_blend = nn.Parameter(torch.zeros((1, c2, 1, 1)))
         else:
             self.local_dw = None
-            self.local_gamma = None
+            self.local_blend = None
 
         # Debug metadata
         self.debug_enabled = bool(debug_enabled)
         self.debug_to_cpu = False
         self.last_indices: torch.Tensor | None = None
         self.last_saliency: torch.Tensor | None = None
-        self.last_gate: float | None = None  # now tracks chan_w mean
+        self.last_gate: float | None = None  # tracks |chan_w - 1.0| (deviation from identity)
         self.last_mode: str | None = None
         self.last_k: int | None = None
         self.last_N: int | None = None
@@ -178,13 +180,19 @@ class SGTokenBlock(nn.Module):
         Strategy: Drop old gamma/out_proj keys, initialize chan_fc fresh.
         Architecture change is too large for weight remapping.
         """
-        # Remove legacy keys that don't exist in TGSR
-        legacy_keys = ['gamma', 'out_proj', 'local_gamma', 'local_dw']
-        for key in list(state_dict.keys()):
-            if prefix in key:
-                short_key = key[len(prefix):].split('.')[0]
-                if short_key in legacy_keys:
-                    state_dict.pop(key, None)
+        # Remove legacy keys that don't exist in TGSR (including q/k/v_proj Conv2d→Linear)
+        legacy_keys_to_drop = [
+            'gamma', 'out_proj', 'local_gamma', 'local_dw',
+            'q_proj', 'k_proj', 'v_proj',  # Conv2d weight shape [C,C,1,1] ≠ Linear [C,C]
+        ]
+        keys_to_remove = [
+            k for k in list(state_dict.keys())
+            if k.startswith(prefix) and any(
+                k[len(prefix):].split('.')[0] == lk for lk in legacy_keys_to_drop
+            )
+        ]
+        for k in keys_to_remove:
+            state_dict.pop(k, None)
         
         # Call parent to load remaining keys (saliency_head, saliency_mix, etc.)
         super()._load_from_state_dict(
@@ -335,15 +343,17 @@ class SGTokenBlock(nn.Module):
         
         Global descriptor (mean+max pool) → FC bottleneck → channel weights.
         Zero-init FC2 → starts as identity (chan_w ≈ 1.0)
+        All math in FP32 for AMP stability.
         """
         B, C, H, W = x.shape
         
-        # Global descriptor from attended tokens
-        ctx_mean = attended.mean(dim=1)   # [B, C]
-        ctx_max = attended.max(dim=1).values  # [B, C]
+        # Global descriptor from attended tokens (FP32 for stability)
+        attended_f = attended.float()
+        ctx_mean = attended_f.mean(dim=1)   # [B, C]
+        ctx_max = attended_f.max(dim=1).values  # [B, C]
         ctx = ctx_mean + ctx_max  # [B, C]
         
-        # FC bottleneck: C → r → C
+        # FC bottleneck: C → r → C (FP32)
         chan_w = self.chan_fc1(ctx)   # [B, r]
         chan_w = F.silu(chan_w)
         chan_w = self.chan_fc2(chan_w)  # [B, C]
@@ -351,8 +361,8 @@ class SGTokenBlock(nn.Module):
         # 1 + tanh: range (0, 2), zero-init → starts at 1.0 (identity)
         chan_w = 1.0 + torch.tanh(chan_w)
         
-        # Store for metrics
-        self.last_gate = float(chan_w.detach().mean().item())
+        # Store deviation from identity for metrics (0.0 = identity, >0 = learning)
+        self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
         
         # Multiplicative recalibration (broadcast to spatial)
         chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
@@ -364,7 +374,7 @@ class SGTokenBlock(nn.Module):
     ) -> torch.Tensor:
         """
         Learned spatial modulation via 1×1 depthwise conv.
-        Identity init (ones weight, zero bias) → starts as pass-through.
+        Near-identity init (mean=1.0, std=0.02) → starts ~pass-through with diversity.
         """
         # Depthwise 1×1: per-channel spatial modulation
         spatial_w = self.spatial_conv(x)  # [B, C, H, W]
@@ -425,22 +435,18 @@ class SGTokenBlock(nn.Module):
             x_recal = self._channel_recalibration(attended, x)  # [B, C, H, W]
             
             # ── 5. Spatial refinement (blended by alpha) ───────────────
+            # Always compute spatial path (no if branch) to ensure gradient flow
+            # alpha=0 → output = x_recal (spatial contribution zeroed)
             alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
+            spatial_w = self._spatial_refinement(x_recal)
+            out = x_recal + alpha * (spatial_w - x_recal)
             
-            if alpha > 0:
-                # Spatial refinement active
-                spatial_w = self._spatial_refinement(x_recal)
-                # Blend: alpha=0 → pure channel, alpha=1 → full spatial
-                out = x_recal + alpha * (spatial_w - x_recal)
-            else:
-                # Pure channel recalibration during warmup
-                out = x_recal
-            
-            # ── 6. Hybrid local path (additive, small) ─────────────────
+            # ── 6. Hybrid local path (multiplicative blend, non-bypassable) ─
             if self.mode == "hybrid" and self.local_dw is not None:
-                local_delta = self.local_dw(x_norm)
-                local_gamma = self.local_gamma.to(dtype=x.dtype)
-                out = out + local_gamma * local_delta.to(dtype=x.dtype)
+                local_feat = self.local_dw(x_norm)
+                # Multiplicative blend: sigmoid(0) = 0.5 default
+                blend = torch.sigmoid(self.local_blend).to(dtype=x.dtype)
+                out = out * (1.0 - blend) + local_feat.to(dtype=x.dtype) * blend
         
         return out.to(dtype=x.dtype)
 
