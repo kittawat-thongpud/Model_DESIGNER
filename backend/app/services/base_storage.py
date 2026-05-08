@@ -194,6 +194,89 @@ class BaseJsonStorage:
         self._index = self._scan_index()
         self._save_index()
 
+    def rebuild_index(self) -> dict[str, Any]:
+        """Public helper to force an index rebuild and return diagnostics."""
+        self._rebuild_index()
+        return self.diagnose()
+
+    def diagnose(self, *, sample_limit: int = 20) -> dict[str, Any]:
+        """Return storage health details for debugging empty API lists."""
+        index_error: str | None = None
+        index_data: dict[str, dict] = {}
+        if self._index_path.exists():
+            try:
+                with open(self._index_path) as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    index_data = loaded
+                else:
+                    index_error = f"index root is {type(loaded).__name__}, expected dict"
+            except Exception as exc:
+                index_error = str(exc)
+
+        disk_idx = self._scan_index()
+        disk_ids = set(disk_idx)
+        index_ids = set(index_data)
+        missing_from_index = sorted(disk_ids - index_ids)
+        stale_index_ids = sorted(index_ids - disk_ids)
+        mtime_mismatch: list[str] = []
+        for record_id in sorted(disk_ids & index_ids):
+            try:
+                disk_mtime = float(disk_idx[record_id].get("mtime", 0))
+                index_mtime = float(index_data[record_id].get("mtime", 0))
+            except Exception:
+                mtime_mismatch.append(record_id)
+                continue
+            if disk_mtime != index_mtime:
+                mtime_mismatch.append(record_id)
+
+        json_errors: list[dict[str, str]] = []
+        loadable_count = 0
+        for record_id in sorted(disk_ids):
+            path = self._path(record_id)
+            try:
+                with open(path) as f:
+                    json.load(f)
+                loadable_count += 1
+            except Exception as exc:
+                json_errors.append({"record_id": record_id, "path": str(path), "error": str(exc)})
+                if len(json_errors) >= sample_limit:
+                    break
+
+        list_all_count: int | None = None
+        list_all_error: str | None = None
+        try:
+            list_all_count = len(self.list_all())
+        except Exception as exc:
+            list_all_error = str(exc)
+
+        return {
+            "directory": str(self.directory),
+            "directory_exists": self.directory.exists(),
+            "folder_mode": self.folder_mode,
+            "suffix": self.suffix,
+            "index_path": str(self._index_path),
+            "index_exists": self._index_path.exists(),
+            "index_error": index_error,
+            "index_count": len(index_data),
+            "disk_count": len(disk_idx),
+            "loadable_count": loadable_count,
+            "list_all_count": list_all_count,
+            "list_all_error": list_all_error,
+            "index_matches_disk": (
+                index_error is None
+                and not missing_from_index
+                and not stale_index_ids
+                and not mtime_mismatch
+            ),
+            "missing_from_index": missing_from_index[:sample_limit],
+            "stale_index_ids": stale_index_ids[:sample_limit],
+            "mtime_mismatch": mtime_mismatch[:sample_limit],
+            "disk_ids_sample": sorted(disk_idx)[:sample_limit],
+            "index_ids_sample": sorted(index_data)[:sample_limit],
+            "json_errors": json_errors,
+        }
+
     def _save_index(self) -> None:
         """Persist the index to disk."""
         if self._index is None:
