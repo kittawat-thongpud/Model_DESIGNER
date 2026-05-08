@@ -367,21 +367,21 @@ class SGTokenBlock(nn.Module):
         x: torch.Tensor,         # [B, C, H, W]
     ) -> torch.Tensor:
         """
-        Multiplicative channel recalibration from attended tokens.
-        
-        Global descriptor (mean+max pool) → FC bottleneck → channel weights.
-        Zero-init FC2 → starts as identity (chan_w ≈ 1.0)
-        All math in FP32 for AMP stability.
+        Multiplicative channel recalibration (non-bypassable).
+        output = x * chan_w, where chan_w ∈ [0.1, 1.9] from 1+tanh.
         """
         B, C, H, W = x.shape
         
-        # Global descriptor from attended tokens (FP32 for stability)
-        attended_f = attended.float()
+        # Match dtype to chan_fc1 weights to avoid AMP mismatch
+        dtype = self.chan_fc1.weight.dtype
+        
+        # Global descriptor from attended tokens
+        attended_f = attended.to(dtype=dtype)
         ctx_mean = attended_f.mean(dim=1)   # [B, C]
         ctx_max = attended_f.max(dim=1).values  # [B, C]
         ctx = ctx_mean + ctx_max  # [B, C]
         
-        # FC bottleneck: C → r → C (FP32)
+        # FC bottleneck: C → r → C
         chan_w = self.chan_fc1(ctx)   # [B, r]
         chan_w = F.silu(chan_w)
         chan_w = self.chan_fc2(chan_w)  # [B, C]
