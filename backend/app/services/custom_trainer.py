@@ -267,7 +267,7 @@ class CustomDetectionTrainer(DetectionTrainer):
     # alpha: 0 → HSG_ALPHA_TARGET over HSG_ALPHA_WARMUP_EPOCHS epochs
     HSG_ALPHA_TARGET = 0.30          # max saliency weight for query selection
     HSG_ALPHA_START_EPOCH = 0        # start warming from epoch 0
-    HSG_ALPHA_WARMUP_EPOCHS = 30     # linear warmup duration
+    HSG_ALPHA_WARMUP_EPOCHS = 15     # linear warmup duration
     HSG_ALPHA_RESUME_RAMP_EPOCHS = 20  # ramp after resume to avoid jumps
     
     def __init__(self, cfg=None, overrides=None, _callbacks=None):

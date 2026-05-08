@@ -103,3 +103,6 @@ convert.csv
 training_state/
 top_performers*.json
 jobs_summary*.json
+
+# claude
+.claude/
