@@ -32,7 +32,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function get<T>(path: string): Promise<T> {
-  return request<T>(path, {
+  // Add timestamp to bypass Cloudflare cache (temporary fix)
+  const separator = path.includes('?') ? '&' : '?';
+  const cacheBuster = `${separator}_t=${Date.now()}`;
+  return request<T>(path + cacheBuster, {
     cache: 'no-store',
     headers: { 'Cache-Control': 'no-cache' },
   });
