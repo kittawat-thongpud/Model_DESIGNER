@@ -407,7 +407,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._hsg_alpha_resume_base: float | None = None
         self._hsg_alpha_resume_epoch: int | None = None
         
-        # TGSR metrics caches for extended_metrics.jsonl persistence
+        # HSG-DETR sparse metrics caches for extended_metrics.jsonl persistence
         self._last_hsg_metrics: dict[str, float] | None = None
         self._last_grad_norms: dict[str, float] = {}
 
@@ -619,58 +619,83 @@ class CustomDetectionTrainer(DetectionTrainer):
             pass
     
     def build_optimizer(self, model, name='auto', lr=None, momentum=0.937, decay=1e-3, iterations=1e5):
-        """Build optimizer with TGSR-aware param groups.
+        """Build optimizer with selected-token SGB-aware param groups.
 
         Param groups:
-          - base model:        lr=lr0,        wd=decay
-          - SGB attn (q/k/v):  lr=lr0 × 1.5,  wd=decay
-          - SGB recal (chan):  lr=lr0 × 2.0,  wd=0     ← multiplicative weights
-          - norm / bias:       lr=lr0,        wd=0
-          - decoder:           lr=lr0 × 1.5,  wd=decay
+          - base model:             lr=lr0,        wd=decay
+          - SGB sparse projections: lr=lr0 x 1.5,  wd=decay
+          - SGB gamma:              lr=lr0 x 2.0,  wd=0
+          - norm / bias:            lr=lr0,        wd=0
+          - decoder:                lr=lr0 x 1.5,  wd=decay
         """
-        import torch.nn as nn
-
         lr0 = lr if lr is not None else self.args.lr0
         wd = decay
 
+        # Map parameters by owning module instance so grouping does not depend
+        # on fragile string paths emitted by Ultralytics parse_model.
+        sgb_roles: dict[int, str] = {}
+        decoder_ids: set[int] = set()
+        for module in model.modules():
+            cls_name = module.__class__.__name__
+            if cls_name == "SGTokenBlock":
+                for local_name, param in module.named_parameters(recurse=True):
+                    if not param.requires_grad:
+                        continue
+                    if local_name == "gamma":
+                        sgb_roles[id(param)] = "sgb_gamma"
+                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj")):
+                        sgb_roles[id(param)] = "sgb_sparse"
+                    else:
+                        sgb_roles[id(param)] = "norm_bias"
+            elif cls_name == "RTDETRDecoderSGB":
+                for _, param in module.named_parameters(recurse=True):
+                    if param.requires_grad:
+                        decoder_ids.add(id(param))
+
         # ── Partition parameters ──────────────────────────────────────────
-        pg_base, pg_sgb_attn, pg_sgb_recal = [], [], []
+        pg_base, pg_sgb_sparse, pg_sgb_gamma = [], [], []
         pg_norm_bias, pg_decoder = [], []
+        assigned: set[int] = set()
 
         for n, p in model.named_parameters():
-            if not p.requires_grad:
+            pid = id(p)
+            if not p.requires_grad or pid in assigned:
                 continue
 
-            # SGB channel recalibration (multiplicative weights - no WD)
-            if any(k in n for k in ('chan_fc1', 'chan_fc2', 'spatial_conv')) and \
-               ('SGTokenBlock' in n or 'sg_token' in n.lower()):
-                pg_sgb_recal.append(p)
+            role = sgb_roles.get(pid)
+            if role == "sgb_gamma":
+                pg_sgb_gamma.append(p)
+                assigned.add(pid)
+                continue
+            if role == "sgb_sparse":
+                pg_sgb_sparse.append(p)
+                assigned.add(pid)
+                continue
+            if role == "norm_bias":
+                pg_norm_bias.append(p)
+                assigned.add(pid)
                 continue
 
-            # SGB attention projections (q/k/v linear)
-            if any(k in n for k in ('q_proj', 'k_proj', 'v_proj')) and \
-               ('SGTokenBlock' in n or 'sg_token' in n.lower()):
-                pg_sgb_attn.append(p)
-                continue
-
-            # Decoder params (RTDETRDecoderSGB)
-            if 'decoder' in n.lower():
+            if pid in decoder_ids or 'decoder' in n.lower():
                 pg_decoder.append(p)
+                assigned.add(pid)
                 continue
 
             # Norm / bias (weight_decay = 0)
-            if 'norm' in n or 'bias' in n or n.endswith('.bias'):
+            if 'norm' in n.lower() or 'bias' in n.lower() or n.endswith('.bias'):
                 pg_norm_bias.append(p)
+                assigned.add(pid)
                 continue
 
             # Everything else → base
             pg_base.append(p)
+            assigned.add(pid)
 
         groups = []
         for name, params, lr_mult, use_wd in [
             ('base',       pg_base,       1.0, True),
-            ('sgb_attn',   pg_sgb_attn,   1.5, True),
-            ('sgb_recal',  pg_sgb_recal,  2.0, False),  # higher LR, no WD for multiplicative
+            ('sgb_sparse', pg_sgb_sparse, 1.5, True),
+            ('sgb_gamma',  pg_sgb_gamma,  2.0, False),
             ('norm_bias',  pg_norm_bias,  1.0, False),
             ('decoder',    pg_decoder,    1.5, True),
         ]:
@@ -876,16 +901,19 @@ class CustomDetectionTrainer(DetectionTrainer):
         return DummyPbar()
     
     def _on_train_epoch_start(self):
-        """Track epoch start time and enable SGB debug for saliency capture."""
+        """Track epoch start time and toggle lightweight SGB debug capture."""
         import time as _time
         self._epoch_start_time = _time.time()
         self._update_hsg_detr_alpha()
-        # Enable debug on SGB blocks so last_saliency is stored during forward
+        # Full selector tensors are expensive; only capture them when gradient
+        # recording is explicitly enabled. Scalar SGB metrics are always stored
+        # by the block itself.
         try:
             model = unwrap_model(self.model)
+            capture_sparse_debug = bool(getattr(self, "record_gradients", False))
             for m in model.modules():
                 if m.__class__.__name__ == 'SGTokenBlock' and hasattr(m, 'set_debug'):
-                    m.set_debug(True, cpu=False)
+                    m.set_debug(capture_sparse_debug, cpu=True)
         except Exception:
             pass
 
@@ -960,14 +988,6 @@ class CustomDetectionTrainer(DetectionTrainer):
         for decoder in decoders:
             decoder.set_alpha(alpha)
 
-        # Sync alpha to SGB blocks: alpha warmup also activates sparse branch
-        sgb_blocks = [
-            m for m in model.modules()
-            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
-        ]
-        for blk in sgb_blocks:
-            blk.alpha_scale.fill_(alpha)
-
         self._sync_hsg_detr_alpha_to_ema()
 
         self._hsg_alpha_last = alpha
@@ -1027,23 +1047,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             except Exception:
                 pass
 
-        # Also sync SGB alpha_scale to EMA
-        model_sgb = [
-            m for m in model.modules()
-            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
-        ]
-        ema_sgb = [
-            m for m in ema_model.modules()
-            if m.__class__.__name__ == "SGTokenBlock" and hasattr(m, "alpha_scale")
-        ]
-        for src, dst in zip(model_sgb, ema_sgb):
-            try:
-                dst.alpha_scale.copy_(src.alpha_scale)
-            except Exception:
-                pass
-
     def _log_hsg_detr_metrics(self) -> None:
-        """Log TGSR metrics: chan_w (non-bypassable multiplicative weights)."""
+        """Log selected-token SGB metrics."""
         if not self.job_id:
             return
         try:
@@ -1056,7 +1061,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         metrics: dict[str, float] = {}
 
-        # ── TGSR SGB metrics ─────────────────────────────────────────────
+        # ── Selected-token SGB metrics ───────────────────────────────────
         for i, blk in enumerate(sgb_blocks):
             tag = f'sgb/P{i+3}'
             metrics[f'{tag}_ratio'] = float(getattr(blk, 'ratio', 0))
@@ -1068,16 +1073,29 @@ class CustomDetectionTrainer(DetectionTrainer):
                 metrics[f'{tag}_k'] = float(k)
             if N is not None and k is not None and N > 0:
                 metrics[f'{tag}_k_over_N'] = float(k) / float(N)
-            
-            # TGSR: track chan_w (multiplicative recalibration weights)
-            # last_gate now stores chan_w mean (deviation from 1.0 = active contribution)
-            chan_w_mean = getattr(blk, 'last_gate', None)
-            if chan_w_mean is not None:
-                metrics[f'{tag}_chan_w_mean'] = float(chan_w_mean)
-                # Deviation from 1.0 (identity) = how much SGB is contributing
-                # Target: > 0.05 within 5 epochs, > 0.10 by epoch 30
-                metrics[f'{tag}_chan_w_deviation'] = abs(float(chan_w_mean) - 1.0)
-            
+
+            selected_ratio = getattr(blk, 'last_selected_ratio', None)
+            if selected_ratio is not None:
+                metrics[f'{tag}_selected_ratio'] = float(selected_ratio)
+            gamma_abs = getattr(blk, 'last_gamma_abs_mean', None)
+            if gamma_abs is not None:
+                metrics[f'{tag}_gamma_abs_mean'] = float(gamma_abs)
+            delta_selected = getattr(blk, 'last_delta_norm_selected', None)
+            if delta_selected is not None:
+                metrics[f'{tag}_delta_norm_selected'] = float(delta_selected)
+            delta_nonselected = getattr(blk, 'last_delta_norm_nonselected', None)
+            if delta_nonselected is not None:
+                metrics[f'{tag}_delta_norm_nonselected'] = float(delta_nonselected)
+            selected_grad = getattr(blk, 'last_selected_grad_norm', None)
+            if selected_grad is not None:
+                metrics[f'{tag}_selected_grad_norm'] = float(selected_grad)
+            nonselected_sparse_grad = getattr(blk, 'last_nonselected_sparse_grad', None)
+            if nonselected_sparse_grad is not None:
+                metrics[f'{tag}_nonselected_sparse_grad'] = float(nonselected_sparse_grad)
+            finite_guard_count = getattr(blk, 'last_finite_guard_count', None)
+            if finite_guard_count is not None:
+                metrics[f'{tag}_finite_guard_count'] = float(finite_guard_count)
+
             saliency = getattr(blk, 'last_saliency', None)
             if saliency is not None and saliency.numel():
                 metrics[f'{tag}_saliency_mean'] = float(saliency.detach().float().mean())
@@ -1135,7 +1153,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         self.scaler.unscale_(self.optimizer)
         self._assert_batchnorm_buffers_finite("before optimizer step")
         try:
-            # Lower max_norm for TGSR stability (was 10.0)
+            # Keep clipping conservative for the sparse CNN/DETR hybrid.
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 max_norm=5.0,
@@ -1212,21 +1230,34 @@ class CustomDetectionTrainer(DetectionTrainer):
             model = unwrap_model(self.model)
         except Exception:
             return
-        
+
+        sgb_roles: dict[int, str] = {}
+        decoder_ids: set[int] = set()
+        for module in model.modules():
+            cls_name = module.__class__.__name__
+            if cls_name == "SGTokenBlock":
+                for local_name, param in module.named_parameters(recurse=True):
+                    if local_name == "gamma":
+                        sgb_roles[id(param)] = "sgb_gamma"
+                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj")):
+                        sgb_roles[id(param)] = "sgb_sparse"
+                    elif local_name.startswith("norm"):
+                        sgb_roles[id(param)] = "sgb_norm"
+                    else:
+                        sgb_roles[id(param)] = "sgb"
+            elif cls_name == "RTDETRDecoderSGB":
+                for _, param in module.named_parameters(recurse=True):
+                    decoder_ids.add(id(param))
+
         grad_norms: dict[str, float] = {}
         for n, p in model.named_parameters():
             if p.grad is None:
                 continue
             gn = float(p.grad.norm())
-            if 'SGTokenBlock' in n or 'sg_token' in n.lower():
-                # TGSR parameters: chan_fc, spatial_conv, q/k/v_proj
-                if any(x in n for x in ['chan_fc', 'spatial_conv']):
-                    grad_norms['sgb_recal'] = max(grad_norms.get('sgb_recal', 0), gn)
-                elif any(x in n for x in ['q_proj', 'k_proj', 'v_proj']):
-                    grad_norms['sgb_attn'] = max(grad_norms.get('sgb_attn', 0), gn)
-                else:
-                    grad_norms['sgb'] = max(grad_norms.get('sgb', 0), gn)
-            elif 'decoder' in n.lower():
+            role = sgb_roles.get(id(p))
+            if role:
+                grad_norms[role] = max(grad_norms.get(role, 0), gn)
+            elif id(p) in decoder_ids or 'decoder' in n.lower():
                 grad_norms['decoder'] = max(grad_norms.get('decoder', 0), gn)
             elif 'backbone' in n.lower():
                 grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
@@ -1782,7 +1813,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         job_dir = JOBS_DIR / self.job_id
         extended_metrics_file = job_dir / "extended_metrics.jsonl"
         
-        # Prepare TGSR metrics from cache
+        # Prepare HSG-DETR sparse metrics from cache
         _hsg = getattr(self, '_last_hsg_metrics', None) or {}
         # Filter grad/ prefixed keys and strip prefix for cleaner JSON
         _grad_norms = {
@@ -1806,7 +1837,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             "val_cls_loss": metrics.get('val_cls_loss'),
             "val_dfl_loss": metrics.get('val_dfl_loss'),
             
-            # TGSR/HSG-DETR metrics (cached from _log_hsg_detr_metrics)
+            # HSG-DETR metrics (cached from _log_hsg_detr_metrics)
             "hsg_detr": _hsg or None,
             "gradient_norms": _grad_norms,
             

@@ -1013,20 +1013,20 @@ _HSG_DETR_MODULES: list[dict[str, Any]] = [
         "category": "attention",
         "description": (
             "Sparse-Token Global Self-Attention (HSG-DETR). "
-            "Internal top-k token selection, sparse self-attention on selected tokens, "
-            "scatter-back to spatial grid, and gated residual fusion. "
+            "L2 top-k token selection, Linear Q/K/V only on selected tokens, "
+            "zero-canvas scatter-back, and per-channel LayerScale fusion. "
             "Single tensor in / single tensor out for Ultralytics parse_model compatibility. "
-            "Supports dense / topk / hybrid ablation modes."
+            "Supports dense / topk ablation modes."
         ),
         "args": [
             {"name": "out_channels", "type": "int", "default": 256,
              "help": "Number of channels (channel-preserving; auto-injected by parse_model)"},
-            {"name": "token_budget", "type": "int", "default": 384,
-             "help": "Hard cap on selected tokens (k ≤ min(budget, ratio·N))"},
             {"name": "ratio", "type": "float", "default": 0.25,
              "help": "Fraction of spatial tokens to retain (0 < ratio ≤ 1)"},
             {"name": "mode", "type": "str", "default": "topk",
-             "help": "dense (full attn), topk (sparse attn), or hybrid (local+sparse fusion)"},
+             "help": "dense (full selected-token attn) or topk (sparse attn)"},
+            {"name": "gamma_init", "type": "float", "default": 0.05,
+             "help": "Initial per-channel LayerScale for sparse delta"},
         ],
         "source": "hsg_detr",
     },

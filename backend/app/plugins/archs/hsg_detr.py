@@ -63,8 +63,8 @@ class HSGDetRPlugin(ModelArchPlugin):
     def description(self) -> str:
         return (
             "HSG-DETR — Sparse-Token SGB encoder feeding RT-DETR decoder. "
-            "Top-k token selection before sparse global self-attention, "
-            "scatter-back with gated residual, RTDETRDecoder head. "
+            "Top-k token selection before selected-token-only sparse global self-attention, "
+            "zero-canvas scatter-back with per-channel LayerScale, RTDETRDecoder head. "
             "SGB-centric architecture: sparse global reasoning is the core "
             "feature representation, not an add-on. "
             "Scratch training recommended during stability/debug runs."

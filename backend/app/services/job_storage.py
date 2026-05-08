@@ -151,7 +151,7 @@ def get_job_history(job_id: str) -> list[dict]:
                     "epoch_time": epoch_time,
                     "val_time_s": data.get("val_time_s"),
                     
-                    # HSG-DETR TGSR metrics (persisted from training)
+                    # HSG-DETR sparse metrics (persisted from training)
                     "hsg_detr": data.get("hsg_detr"),
                     
                     # Gradient norms (persisted from training)

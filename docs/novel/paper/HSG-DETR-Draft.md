@@ -21,7 +21,7 @@ We propose **HSG-DETR** (Hybrid Sparse-Guided Detection Transformer) to address 
 
 1. **Clue-preserving backbone.** `SGStem` replaces the conventional stride-2 + stride-2 stem with a four-stage depthwise-aware pattern that preserves low-level structural cues before spatial resolution is halved. `SGDown` further decouples $1{\times}1$ channel alignment from $3{\times}3$ stride-2 spatial reduction so that channel mixing does not interfere with spatial detail at each downsampling step.
 
-2. **Scale-aware sparse fusion neck.** Each pyramid level carries an `SGTokenBlock` that scores all spatial tokens by L2 activation energy, selects a fraction $r \in (0,1]$ of them as a *salient subset*, computes self-attention only within that subset, and scatters the enriched tokens back to the spatial grid. The resulting module introduces global reasoning at $\mathcal{O}(k^2 d)$ cost with $k = rN$ — reducing attention work by a factor of $r^2$ relative to dense attention while preserving a static computation graph. A per-channel LayerScale parameter $\gamma$ initialized near zero ensures the sparse branch is a smooth additive refinement of the CNN feature, enabling stable warm-starting from pretrained convolutional weights.
+2. **Scale-aware sparse fusion neck.** Each pyramid level carries an `SGTokenBlock` that scores all spatial tokens by L2 activation energy, selects a fraction $r \in (0,1]$ of them as a *salient subset*, computes self-attention only within that subset, and scatters the enriched tokens back to the spatial grid. The resulting module introduces global reasoning at $\mathcal{O}(k^2 d)$ cost with $k = rN$ — reducing attention work by a factor of $r^2$ relative to dense attention. A per-channel LayerScale parameter $\gamma$ initialized to $0.05$ keeps the sparse branch small but trainable from the first optimizer step.
 
 3. **Saliency-guided RT-DETR decoder.** `RTDETRDecoderSGB` extends the RT-DETR decoder by combining the encoder classification score with token-wise L2 saliency energy through a scheduled weight $\alpha$, biasing decoder query initialization toward *both* semantically confident and spatially active regions. A safe unit-interval refinement mechanism protects the iterative inverse-sigmoid box update from numerical instability at the interval boundaries.
 
@@ -184,7 +184,7 @@ We use $r_3 = 0.05$, $r_4 = 0.12$, $r_5 = 0.25$ (see configuration `hsg_detr_l.y
 
 ![Fig. 2](imgs/SGTokenBlock.png)
 
-*Fig. 2. `SGTokenBlock` internal pipeline. (1) Per-token L2 activation energy is computed from the pre-normalized input. (2) The top-$k$ most salient token indices are selected. (3) Three $1{\times}1$ convolutions produce $\mathbf{Q}$, $\mathbf{K}$, $\mathbf{V}$. (4) The top-$k$ indices gather a compact sparse subset. (5) Scaled dot-product self-attention is computed within the subset in FP32 for AMP stability. (6) Attended values are scattered back to their original grid positions on a zero canvas. (7) A $1{\times}1$ output projection and GroupNorm shape the delta. (8) A per-channel LayerScale $\gamma$ blends the sparse delta with the residual input.*
+*Fig. 2. `SGTokenBlock` internal pipeline. (1) Per-token L2 activation energy is computed from the pre-normalized input. (2) The top-$k$ most salient token indices are selected. (3) Only the selected tokens are gathered into a compact sparse subset. (4) Linear projections produce $\mathbf{Q}$, $\mathbf{K}$, and $\mathbf{V}$ on this selected subset only. (5) Scaled dot-product self-attention is computed within the subset in FP32 for AMP stability. (6) The selected-token delta is scattered back to the original grid on a zero canvas, so non-selected positions receive no sparse-attention update. (7) A selected-token output projection and tanh soft-clamp shape the delta. (8) A non-zero per-channel LayerScale $\gamma$ blends the sparse delta with the residual input.*
 
 Let $\mathbf{X} \in \mathbb{R}^{B \times C \times H \times W}$ be the input and $\mathbf{X}_t \in \mathbb{R}^{B \times C \times N}$ its flattened token view with $N = HW$.
 
@@ -202,21 +202,21 @@ $$
 
 **Top-$k$ selection.** The $k = \lfloor rN \rfloor$ positions with highest $s_n$ are gathered into an index set $\mathcal{I}_k = \mathrm{argtop\text{-}}k(s)$.
 
-**Projections and gather.** Three parameter-free-free $1{\times}1$ convolutions produce queries, keys, and values:
+**Selected-token projections.** The selected subset is first gathered:
 
 $$
-\mathbf{Q} = \mathbf{W}_q \ast \mathbf{X}^{\text{pre}}, \quad
-\mathbf{K} = \mathbf{W}_k \ast \mathbf{X}^{\text{pre}}, \quad
-\mathbf{V} = \mathbf{W}_v \ast \mathbf{X}^{\text{pre}}
+\mathbf{X}_{\mathcal{I}} = \mathrm{gather}(\mathbf{X}^{\text{pre}}, \mathcal{I}_k) \in \mathbb{R}^{B \times k \times C}.
 $$
 
-and the sparse subset is extracted by gather:
+Linear projections are then applied only to these $k$ selected tokens:
 
 $$
-\mathbf{Q}_{\mathcal{I}} = \mathrm{gather}(\mathbf{Q}, \mathcal{I}_k) \in \mathbb{R}^{B \times k \times C}
+\mathbf{Q}_{\mathcal{I}} = \mathbf{X}_{\mathcal{I}}\mathbf{W}_q, \quad
+\mathbf{K}_{\mathcal{I}} = \mathbf{X}_{\mathcal{I}}\mathbf{W}_k, \quad
+\mathbf{V}_{\mathcal{I}} = \mathbf{X}_{\mathcal{I}}\mathbf{W}_v.
 $$
 
-and identically for $\mathbf{K}_{\mathcal{I}}$ and $\mathbf{V}_{\mathcal{I}}$.
+This is the key implementation difference from a dense convolutional projection: non-selected spatial positions are not projected by the sparse branch at all.
 
 **Sparse self-attention.** Scaled dot-product attention is computed within the selected subset in FP32 with LayerNorm on the query/key streams:
 
@@ -234,17 +234,24 @@ $$
 \tilde{\mathbf{V}}_n \;=\; \begin{cases} \mathbf{Z}_{\mathcal{I},k} & n = \mathcal{I}_k[k] \\ \mathbf{0} & \text{otherwise} \end{cases}
 $$
 
-**Output projection, bounded delta, and LayerScale residual.** The delta is shaped by a $1{\times}1$ output projection, a GroupNorm, and a tanh soft-clamp; the final output is an additive refinement of the residual input:
+**Output projection, bounded delta, and LayerScale residual.** The selected-token delta is shaped by a linear output projection and a tanh soft-clamp; the final output is an additive refinement of the residual input:
 
 $$
-\boldsymbol{\Delta} \;=\; \mathrm{GN}\!\left( 6.0 \cdot \tanh\!\big( \mathbf{W}_o \ast \tilde{\mathbf{V}} \,/\, 6.0 \big) \right) \odot \mathbf{M}_{\mathcal{I}}
+\boldsymbol{\Delta}_{\mathcal{I}} \;=\; 6.0 \cdot \tanh\!\big( \mathbf{Z}_{\mathcal{I}}\mathbf{W}_o \,/\, 6.0 \big), \qquad
+\boldsymbol{\Delta}_n =
+\begin{cases}
+\boldsymbol{\Delta}_{\mathcal{I},k}, & n = \mathcal{I}_k[k] \\
+\mathbf{0}, & \text{otherwise}
+\end{cases}
 $$
 
 $$
 \mathbf{Y} \;=\; \mathbf{X} \;+\; \boldsymbol{\gamma} \odot \boldsymbol{\Delta}
 $$
 
-where $\mathbf{M}_{\mathcal{I}}$ is the binary selection mask and $\boldsymbol{\gamma} \in \mathbb{R}^{1 \times C \times 1 \times 1}$ is a learnable per-channel LayerScale parameter initialized to $10^{-4}$. Initializing $\boldsymbol{\gamma}$ near zero makes the sparse branch behave as a *near-identity* transform at the start of training, so the CNN pathway remains dominant while the attention projections calibrate.
+where $\boldsymbol{\gamma} \in \mathbb{R}^{1 \times C \times 1 \times 1}$ is a learnable per-channel LayerScale parameter initialized to $\gamma_0 = 0.05$. This warm non-zero initialization keeps the CNN residual path dominant while ensuring that the sparse branch receives useful gradients from the first optimizer step.
+
+**Gradient contract.** The sparse branch updates only selected spatial positions. Selected positions receive gradients through both the CNN residual path and the sparse-attention delta, while non-selected positions receive gradients through the CNN residual path only. The Q/K/V/output projection parameters are therefore trained exclusively by the selected token set $\mathcal{I}_k$, matching the sparse-computation contract of the module.
 
 ### E. Saliency-Guided Detection Head
 
@@ -372,7 +379,7 @@ $$
 \frac{\partial \mathcal{L}}{\partial \mathbf{X}} \;=\; \frac{\partial \mathcal{L}}{\partial \mathbf{Y}} \,\Big(1 + \boldsymbol{\gamma} \odot \tfrac{\partial \boldsymbol{\Delta}}{\partial \mathbf{X}}\Big)
 $$
 
-At initialization, $\boldsymbol{\gamma} \approx \mathbf{0}$ and the gradient reduces to the standard CNN backbone gradient, guaranteeing that warm-starting from pretrained convolutional weights is numerically identical to standard training in early epochs. As training proceeds, $\boldsymbol{\gamma}$ grows along the channel axes where the sparse branch produces loss-reducing corrections, providing a self-regulating curriculum analogous to the scalar-gate mechanism in [ref] but with per-channel granularity.
+At initialization, $\boldsymbol{\gamma} = 0.05$ rather than zero. This deliberately gives the sparse branch a small but real gradient signal from the first optimizer step, avoiding the observed failure mode where a zero or near-zero gate leaves the sparse path inactive. Because the residual CNN path remains unscaled, the initial feature transformation is still dominated by the convolutional pathway while selected-token sparse corrections begin learning immediately.
 
 ### E. L2 Energy as Spectral Saliency
 
@@ -394,13 +401,13 @@ Training follows the RT-DETR protocol: a multi-loss Hungarian-matched criterion 
 
 1. **Scheduled $\alpha$.** The saliency weight in `RTDETRDecoderSGB` is warmed up from $0$ to $\alpha_{\max} = 0.5$ over the first few epochs, so that early training follows the pure classifier-based RT-DETR query selection and gradually transitions to the saliency-weighted scheme.
 
-2. **AMP with FP32 islands.** `SGTokenBlock` casts the attention block to FP32 around the softmax and scatter operations to prevent underflow under mixed precision training.
+2. **AMP with FP32 islands.** `SGTokenBlock` keeps the convolutional/residual path under AMP and casts only the numerically sensitive attention logits and softmax computation to FP32. Decoder box refinement similarly keeps the safe inverse-sigmoid and bounded box delta in FP32 without disabling AMP for the full decoder.
 
-3. **Identity-safe initialization.** All `SGTokenBlock.gamma` parameters start at $10^{-4}$ (near zero), ensuring the sparse branch contributes a near-zero delta at epoch 0 and the CNN-only pathway remains dominant during warm-up.
+3. **Warm sparse initialization.** All `SGTokenBlock.gamma` parameters start at $\gamma_0 = 0.05$, ensuring the sparse branch contributes a small selected-token delta at epoch 0 and receives non-zero gradients immediately.
 
 ### B. Inference
 
-At inference, denoising queries are removed; the decoder directly selects top-$n_q$ queries by the saliency-weighted score $m$ and runs six decoder layers with safe inverse-sigmoid refinement. The final per-query class probabilities and refined boxes are produced without NMS. Because `SGTokenBlock` is implemented entirely with static-shape PyTorch primitives (`torch.topk`, `torch.gather`, `scatter_`, `torch.bmm`), the full model compiles to a static ONNX graph and exports to TensorRT without custom operators.
+At inference, denoising queries are removed; the decoder directly selects top-$n_q$ queries by the saliency-weighted score $m$ and runs six decoder layers with safe inverse-sigmoid refinement. The final per-query class probabilities and refined boxes are produced without NMS. Because `SGTokenBlock` is implemented with standard PyTorch primitives (`torch.topk`, `torch.gather`, selected-token linear projections, `torch.bmm`, and `scatter`), deployment export can be validated without custom CUDA operators.
 
 ### C. Model Scales
 
@@ -444,7 +451,7 @@ HSG-DETR retains the mature YOLO backbone topology, the RT-DETR decoder protocol
 
 ### B. The Roles of $\gamma$ and $\alpha$
 
-The two scalar/vector hyperparameters $\boldsymbol{\gamma}$ (LayerScale) and $\alpha$ (saliency weight) serve complementary purposes. $\boldsymbol{\gamma}$ is a *per-channel, learned* gate that modulates the neck-level sparse delta — its magnitude per channel is a direct diagnostic of which feature channels benefit from global reasoning at each pyramid scale. $\alpha$ is a *scheduled, decoder-level* hyperparameter that shifts the balance between classifier-driven and saliency-driven query initialization. Monitoring the channel-wise statistics of $\boldsymbol{\gamma}$ and the training-time schedule of $\alpha$ therefore provides two independent diagnostic signals for sparse-attention convergence.
+The two scalar/vector hyperparameters $\boldsymbol{\gamma}$ (LayerScale) and $\alpha$ (saliency weight) serve complementary purposes. $\boldsymbol{\gamma}$ is a *per-channel, learned* scale that modulates the neck-level sparse delta — its magnitude per channel is a direct diagnostic of which feature channels benefit from selected-token global reasoning at each pyramid scale. $\alpha$ is a *scheduled, decoder-level* hyperparameter that shifts the balance between classifier-driven and saliency-driven query initialization. Monitoring the channel-wise statistics of $\boldsymbol{\gamma}$, selected-token delta norms, and the training-time schedule of $\alpha$ therefore provides independent diagnostic signals for sparse-attention convergence.
 
 ### C. Scope and Limitations
 
@@ -460,7 +467,7 @@ The two scalar/vector hyperparameters $\boldsymbol{\gamma}$ (LayerScale) and $\a
 
 We have presented **HSG-DETR**, a hybrid CNN–Transformer detection architecture whose central contributions are (i) the clue-preserving backbone blocks `SGStem` and `SGDown` that retain small-object and occlusion cues through early downsampling; (ii) the sparse self-attention module `SGTokenBlock` that delivers global inter-token reasoning at $\mathcal{O}(k^2 d)$ cost with $r^2$ relative complexity reduction, stabilized by a per-channel LayerScale residual; and (iii) the saliency-guided `RTDETRDecoderSGB` that aligns query initialization with spatially salient structure through a scheduled weight $\alpha$ and a numerically safe inverse-sigmoid refinement loop.
 
-Theoretically, Proposition 1 formalizes the sparse-vs-dense cost ratio, Proposition 2 guarantees bounded saliency-weighted scores, and Proposition 3 ensures the safe inverse sigmoid is finite and bounded — together providing a clear stability envelope for the proposed design. Architecturally, the sparse branch is designed as a near-identity additive refinement, so warm-starting from pretrained convolutional weights is stable and the resulting graph remains fully static and ONNX/TensorRT-exportable.
+Theoretically, Proposition 1 formalizes the sparse-vs-dense cost ratio, Proposition 2 guarantees bounded saliency-weighted scores, and Proposition 3 ensures the safe inverse sigmoid is finite and bounded — together providing a clear stability envelope for the proposed design. Architecturally, the sparse branch is designed as a small selected-token additive refinement with $\gamma_0 = 0.05$, so warm-starting remains stable while the sparse path is trainable from the first optimizer step.
 
 Three directions are identified for future work. First, replacing the heuristic L2-energy selector with a **learnable per-token saliency gate** could further improve token selection on low-contrast scenes. Second, **temporal token propagation** would exploit inter-frame coherence for sequential perception. Third, extending `SGTokenBlock` to **multi-modal inputs** (camera + LiDAR) would broaden applicability to full autonomous-driving perception stacks.
 

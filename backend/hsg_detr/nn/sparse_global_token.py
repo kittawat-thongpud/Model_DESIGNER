@@ -1,24 +1,22 @@
 """
-SparseGlobalTokenBlock — Token-Guided Spatial Recalibration (TGSR) for HSG-DETR.
+SparseGlobalTokenBlock for HSG-DETR.
 
-TGSR Architecture:
-  - Token selection via saliency (L2 + learned)
-  - k×k self-attention on selected tokens (sharp softmax)
-  - Channel recalibration: multiplicative (non-bypassable)
-  - Spatial refinement: learned per-channel modulation
+The HSG-DETR sparse branch is intentionally selected-token-only:
+  - score spatial tokens with parameter-free L2 energy
+  - project Q/K/V only after top-k gather
+  - run k x k sparse attention in an FP32 island
+  - scatter the selected delta onto a zero canvas
+  - fuse with a small non-zero per-channel LayerScale gamma
 
-Key innovation: Multiplicative paradigm replaces additive+gamma
-  OLD: output = x + gamma * delta          ← gamma→0 = bypass
-  NEW: output = x * channel_weights        ← must learn meaningful weights
-
-Zero-initialization ensures start-as-identity behavior.
+Non-selected spatial positions keep the CNN residual path, but they do not
+receive sparse-attention updates. This keeps the block honest to the "sparse
+attention with CNN hybrid" design in the paper draft.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
 
@@ -33,19 +31,28 @@ def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     ).clamp(-limit, limit)
 
 
+def _bounded_tanh(x: torch.Tensor, limit: float = 6.0) -> torch.Tensor:
+    """Soft-bound a tensor without hard clipping gradients in the central range."""
+    limit = float(limit)
+    if limit <= 0:
+        return x
+    return limit * torch.tanh(x / limit)
+
+
+def _module_param_dtype(module: nn.Module, fallback: torch.dtype) -> torch.dtype:
+    """Return the dtype of a module parameter without assuming a specific layout."""
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return fallback
+
+
 def _make_gn(channels: int) -> nn.GroupNorm:
     """Return a GroupNorm layer without BatchNorm running buffers."""
     groups = min(32, int(channels))
     while int(channels) % groups != 0:
         groups -= 1
     return nn.GroupNorm(groups, int(channels), eps=1e-5)
-
-
-def _fp32_context(device: torch.device):
-    """Disable autocast so numerically sensitive sparse blocks stay in FP32."""
-    if device.type in {"cuda", "cpu"}:
-        return torch.autocast(device_type=device.type, enabled=False)
-    return nullcontext()
 
 
 def _safe_unit_interval(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -61,15 +68,11 @@ def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
 
 class SGTokenBlock(nn.Module):
     """
-    Token-Guided Spatial Recalibration (TGSR) block.
+    Selected-token-only sparse attention block for HSG-DETR.
 
-    Multiplicative paradigm replaces additive+gamma to prevent structural bypass:
-      - Token selection via saliency (L2 + learned blend)
-      - k×k self-attention on selected tokens (sharp softmax, better gradients)
-      - Channel recalibration: multiplicative (optimizer cannot bypass)
-      - Spatial refinement: learned per-channel modulation
-
-    Zero-initialized output layers → starts as identity (chan_w ≈ 1.0)
+    The sparse branch projects and updates only the top-k selected spatial
+    tokens. Non-selected locations keep the CNN residual path and receive no
+    sparse-branch delta.
     """
 
     VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
@@ -82,6 +85,10 @@ class SGTokenBlock(nn.Module):
         ratio: float = 0.25,
         mode: str = "topk",
         debug_enabled: bool = False,
+        gamma_init: float = 0.05,
+        finite_limit: float = 20.0,
+        attn_logit_limit: float = 50.0,
+        delta_limit: float = 6.0,
     ) -> None:
         super().__init__()
         assert c1 == c2, f"SGTokenBlock is channel-preserving (c1={c1}, c2={c2})"
@@ -92,80 +99,43 @@ class SGTokenBlock(nn.Module):
         if not torch.isfinite(torch.tensor(ratio)):
             raise ValueError(f"Invalid ratio: {ratio}")
 
-        self.c = c2
+        self.c = int(c2)
         self.ratio = max(0.0, min(ratio, 1.0))
-        self.mode = mode
+        # Accept legacy "hybrid" configs, but the new baseline has no local path.
+        self.mode = "topk" if mode == "hybrid" else mode
+        self.requested_mode = mode
+        self.finite_limit = float(finite_limit)
+        self.attn_logit_limit = float(attn_logit_limit)
+        self.delta_limit = float(delta_limit)
 
         self.pre_norm = _make_gn(c2)
-
-        # ── Saliency head (unchanged) ────────────────────────────────────
-        self.saliency_head = nn.Sequential(
-            nn.Conv2d(c2, c2 // 4, 1, bias=False),
-            _make_gn(c2 // 4),
-            nn.SiLU(),
-            nn.Conv2d(c2 // 4, 1, 1, bias=False),
-        )
-        nn.init.zeros_(self.saliency_head[-1].weight)  # AdaptFormer: start as identity
-        self.saliency_mix = nn.Parameter(torch.tensor(0.5))
-
-        # ── k×k Self-attention (Linear projections, not Conv2d) ─────────────
-        # Pre-LN for stability
         self.norm = nn.LayerNorm(c2)
         self.q_proj = nn.Linear(c2, c2, bias=False)
         self.k_proj = nn.Linear(c2, c2, bias=False)
         self.v_proj = nn.Linear(c2, c2, bias=False)
-        # Xavier init for attention stability (lower variance than kaiming)
+        self.out_proj = nn.Linear(c2, c2, bias=False)
+        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
+        self._attn_scale = c2 ** -0.5
+
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
-        self._attn_scale = c2 ** -0.5
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
 
-        # ── Channel Recalibration ──────────────────────────────────────────
-        # Two-stage: compress → expand with non-linearity
-        r = max(1, c2 // 16)
-        self.chan_fc1 = nn.Linear(c2, r, bias=True)
-        self.chan_fc2 = nn.Linear(r, c2, bias=True)
-        # Small init for chan_fc1 to reduce warmup lag (chan_fc2 zero-init for identity)
-        nn.init.normal_(self.chan_fc1.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.chan_fc1.bias)
-        # Zero-init: start as identity (chan_w ≈ 1.0 from 1 + tanh(0) = 1)
-        nn.init.zeros_(self.chan_fc2.weight)
-        nn.init.zeros_(self.chan_fc2.bias)
-
-        # ── Spatial Refinement ───────────────────────────────────────────
-        # 1×1 depthwise for per-channel spatial modulation
-        self.spatial_conv = nn.Conv2d(c2, c2, 1, groups=c2, bias=True)
-        # Near-identity with diversity (std=0.02 gives small variance for learning)
-        nn.init.normal_(self.spatial_conv.weight, mean=1.0, std=0.02)
-        nn.init.zeros_(self.spatial_conv.bias)
-
-        # Alpha for blending channel vs spatial (set by trainer during warmup)
-        self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
-
-        # ── Hybrid mode: local path (multiplicative blend, non-bypassable) ─
-        if mode == "hybrid":
-            self.local_dw = nn.Sequential(
-                nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
-                _make_gn(c2),
-                nn.SiLU(),
-                nn.Conv2d(c2, c2, 1, bias=False),
-                _make_gn(c2),
-            )
-            # Multiplicative blend: sigmoid(-3) ≈ 0.047 default (minimal local contribution at init)
-            self.local_blend = nn.Parameter(torch.full((1, c2, 1, 1), -3.0))
-        else:
-            self.local_dw = None
-            self.local_blend = None
-
-        # Debug metadata
         self.debug_enabled = bool(debug_enabled)
         self.debug_to_cpu = False
         self.last_indices: torch.Tensor | None = None
         self.last_saliency: torch.Tensor | None = None
-        self.last_gate: float | None = None  # tracks |chan_w - 1.0| (deviation from identity)
         self.last_mode: str | None = None
         self.last_k: int | None = None
         self.last_N: int | None = None
+        self.last_selected_ratio: float | None = None
+        self.last_gamma_abs_mean: float | None = None
+        self.last_delta_norm_selected: float | None = None
+        self.last_delta_norm_nonselected: float | None = None
+        self.last_selected_grad_norm: float | None = None
+        self.last_nonselected_sparse_grad: float | None = None
+        self.last_finite_guard_count: int | None = None
 
     def __setstate__(self, state: dict) -> None:
         """Restore runtime-only attrs for checkpoints saved before debug flags existed."""
@@ -182,44 +152,60 @@ class SGTokenBlock(nn.Module):
         unexpected_keys: list,
         error_msgs: list,
     ) -> None:
-        """Backward compat: old checkpoints have gamma/out_proj, TGSR has chan_fc.
-        
-        Strategy: Drop old gamma/out_proj keys, initialize chan_fc fresh.
-        Architecture change is too large for weight remapping.
-        """
-        # Remove legacy keys that don't exist in TGSR (including q/k/v_proj Conv2d→Linear)
-        legacy_keys_to_drop = [
-            'gamma', 'out_proj', 'local_gamma', 'local_dw',
-            'q_proj', 'k_proj', 'v_proj',  # Conv2d weight shape [C,C,1,1] ≠ Linear [C,C]
-        ]
-        keys_to_remove = [
-            k for k in list(state_dict.keys())
-            if k.startswith(prefix) and any(
-                k[len(prefix):].split('.')[0] == lk for lk in legacy_keys_to_drop
-            )
-        ]
-        for k in keys_to_remove:
-            state_dict.pop(k, None)
-        
-        # Warn about dropped keys for operational visibility
+        """Drop obsolete sparse-block keys and incompatible legacy Conv2d projections."""
+        legacy_roots = {
+            "saliency_head",
+            "saliency_mix",
+            "chan_fc1",
+            "chan_fc2",
+            "spatial_conv",
+            "alpha_scale",
+            "local_dw",
+            "local_blend",
+            "local_gamma",
+            "gate",
+        }
+        own_state = self.state_dict()
+        keys_to_remove: list[str] = []
+        for key in list(state_dict.keys()):
+            if not key.startswith(prefix):
+                continue
+            local_name = key[len(prefix):]
+            root = local_name.split(".")[0]
+            if root in legacy_roots:
+                keys_to_remove.append(key)
+                continue
+            expected = own_state.get(local_name)
+            value = state_dict.get(key)
+            if (
+                expected is not None
+                and torch.is_tensor(value)
+                and tuple(value.shape) != tuple(expected.shape)
+            ):
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            state_dict.pop(key, None)
+
         if keys_to_remove:
             import warnings
-            short_names = list(set(k.split('.')[-2] for k in keys_to_remove))[:5]
+
+            short_names = sorted({k[len(prefix):].split(".")[0] for k in keys_to_remove})[:8]
             warnings.warn(
-                f"TGSR checkpoint load: dropped {len(keys_to_remove)} legacy keys "
-                f"(architecture changed). Re-initializing: {short_names}...",
+                "SGTokenBlock checkpoint load: dropped "
+                f"{len(keys_to_remove)} obsolete/incompatible keys: {short_names}",
                 UserWarning,
             )
-        
-        # Call parent to load remaining keys (saliency_head, saliency_mix, etc.)
+
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
-        
-        # Re-initialize TGSR-specific layers that weren't in old checkpoints
-        # (chan_fc1, chan_fc2, spatial_conv, q/k/v_proj as Linear)
-        # They'll start with default init (zero-init for recal layers)
 
     # ------------------------------------------------------------------ #
     # Debug / introspection
@@ -232,10 +218,16 @@ class SGTokenBlock(nn.Module):
             "debug_to_cpu": False,
             "last_indices": None,
             "last_saliency": None,
-            "last_gate": None,
             "last_mode": None,
             "last_k": None,
             "last_N": None,
+            "last_selected_ratio": None,
+            "last_gamma_abs_mean": None,
+            "last_delta_norm_selected": None,
+            "last_delta_norm_nonselected": None,
+            "last_selected_grad_norm": None,
+            "last_nonselected_sparse_grad": None,
+            "last_finite_guard_count": None,
         }
         for name, value in defaults.items():
             if not hasattr(self, name):
@@ -247,10 +239,16 @@ class SGTokenBlock(nn.Module):
         return {
             "indices": self.last_indices,
             "saliency": self.last_saliency,
-            "gate": self.last_gate,
             "mode": self.last_mode,
             "k": self.last_k,
             "N": self.last_N,
+            "selected_ratio": self.last_selected_ratio,
+            "gamma_abs_mean": self.last_gamma_abs_mean,
+            "delta_norm_selected": self.last_delta_norm_selected,
+            "delta_norm_nonselected": self.last_delta_norm_nonselected,
+            "selected_grad_norm": self.last_selected_grad_norm,
+            "nonselected_sparse_grad": self.last_nonselected_sparse_grad,
+            "finite_guard_count": self.last_finite_guard_count,
         }
 
     def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
@@ -267,7 +265,7 @@ class SGTokenBlock(nn.Module):
         indices: torch.Tensor | None = None,
         saliency: torch.Tensor | None = None,
     ) -> None:
-        """Store detached metadata only when debug capture is explicitly enabled."""
+        """Store detached selector metadata only when debug capture is enabled."""
         self._ensure_runtime_attrs()
         if not self.debug_enabled:
             self.last_indices = None
@@ -285,133 +283,70 @@ class SGTokenBlock(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _compute_saliency(self, x: torch.Tensor) -> torch.Tensor:
-        """L2 activation energy + learned saliency per spatial token."""
-        B, C, H, W = x.shape
-        N = H * W
-        # Match dtype to saliency_head to avoid AMP mismatch
-        dtype = self.saliency_head[0].weight.dtype
-        # L2 energy (heuristic)
-        l2_energy = x.view(B, C, N).to(dtype=dtype).pow(2).sum(dim=1)  # [B, N]
-        l2_energy = torch.nan_to_num(l2_energy, nan=0.0, posinf=0.0, neginf=0.0)
-        # Per-sample min-max normalisation
-        eps = 1e-6
-        l2_min = l2_energy.min(1, keepdim=True).values
-        l2_max = l2_energy.max(1, keepdim=True).values
-        l2_range = (l2_max - l2_min).clamp(min=eps)
-        l2_norm = (l2_energy - l2_min) / l2_range
-        # Learned saliency
-        learned = self.saliency_head(x.to(dtype=dtype)).view(B, N)  # [B, N]
-        learned = torch.sigmoid(learned)
-        learned = torch.nan_to_num(learned, nan=0.0, posinf=0.0, neginf=0.0)
-        # Blend: mix parameter clamped to [0,1]
-        mix = self.saliency_mix.sigmoid()
-        importance = mix * l2_norm + (1.0 - mix) * learned
-        return torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+    def _compute_saliency(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Parameter-free L2 activation energy per spatial token."""
+        B, C, H, W = x_norm.shape
+        saliency = x_norm.detach().float().view(B, C, H * W).pow(2).sum(dim=1)
+        return torch.nan_to_num(saliency, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _select_k(self, N: int) -> int:
         """Compute effective k based on mode and constraints."""
         if self.mode == "dense":
             if int(N) > self.DENSE_TOKEN_LIMIT:
                 raise RuntimeError(
-                    f"Dense SGB too large: N={N}. Use topk/hybrid instead."
+                    f"Dense SGB too large: N={N}. Use topk instead."
                 )
             return int(N)
         return max(1, min(int(round(self.ratio * int(N))), int(N)))
 
-    def _k_times_k_attention(
-        self,
-        selected: torch.Tensor,  # [B, k, C]
-    ) -> torch.Tensor:
-        """
-        k×k self-attention on selected tokens (NOT k×N).
-        
-        Sharp softmax due to smaller range = better gradients.
-        Pre-LN for stability.
-        """
-        B, k, C = selected.shape
-        
-        # Pre-LN (match norm's dtype to avoid mixed dtype error)
-        orig_dtype = selected.dtype
-        selected_n = self.norm(selected.to(self.norm.weight.dtype))
-        
-        # Linear projections
-        q = self.q_proj(selected_n)  # [B, k, C]
-        k_ = self.k_proj(selected_n)  # [B, k, C]
-        v = self.v_proj(selected_n)   # [B, k, C]
-        
-        # k×k attention (sharp softmax, better than k×N flat softmax)
-        # Use more conservative scale to prevent gradient explosion
-        attn = torch.bmm(q, k_.transpose(1, 2)) * (float(self._attn_scale) * 0.5)
-        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        # Tighter clamp for numerical stability in FP16
-        attn = attn.clamp(min=-50.0, max=50.0)
-        # Softmax stabilization: subtract max (safer than manual)
+    def _selected_attention_delta(self, selected: torch.Tensor) -> torch.Tensor:
+        """Run Q/K/V and sparse self-attention only on selected tokens."""
+        proj_dtype = self.q_proj.weight.dtype
+        selected_proj = selected.to(dtype=proj_dtype)
+        q_raw = self.q_proj(selected_proj)
+        k_raw = self.k_proj(selected_proj)
+        v_raw = self.v_proj(selected_proj)
+
+        norm_w = self.norm.weight.float() if self.norm.weight is not None else None
+        norm_b = self.norm.bias.float() if self.norm.bias is not None else None
+        q = F.layer_norm(
+            q_raw.float(),
+            self.norm.normalized_shape,
+            norm_w,
+            norm_b,
+            self.norm.eps,
+        )
+        k = F.layer_norm(
+            k_raw.float(),
+            self.norm.normalized_shape,
+            norm_w,
+            norm_b,
+            self.norm.eps,
+        )
+        v = v_raw.float()
+
+        attn = torch.bmm(q, k.transpose(1, 2)) * float(self._attn_scale)
+        attn = _finite_or_zero(attn, limit=self.attn_logit_limit)
         attn = attn - attn.max(dim=-1, keepdim=True).values.detach()
         attn = torch.softmax(attn, dim=-1)
-        # Handle degenerate cases where all values were -inf
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        # Renormalize if NaN handling changed distribution
-        attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        attn = attn / attn_sum
-        
-        attended = torch.bmm(attn, v)  # [B, k, C]
-        # Immediate clamp to prevent gradient explosion
-        attended = torch.clamp(attended, min=-50.0, max=50.0)
-        attended = torch.nan_to_num(attended, nan=0.0, posinf=10.0, neginf=-10.0)
-        return attended.to(orig_dtype)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-    def _channel_recalibration(
-        self,
-        attended: torch.Tensor,  # [B, k, C]
-        x: torch.Tensor,         # [B, C, H, W]
-    ) -> torch.Tensor:
-        """
-        Multiplicative channel recalibration (non-bypassable).
-        output = x * chan_w, where chan_w ∈ [0.1, 1.9] from 1+tanh.
-        """
-        B, C, H, W = x.shape
-        
-        # Match dtype to chan_fc1 weights to avoid AMP mismatch
-        dtype = self.chan_fc1.weight.dtype
-        
-        # Global descriptor from attended tokens
-        attended_f = attended.to(dtype=dtype)
-        ctx_mean = attended_f.mean(dim=1)   # [B, C]
-        ctx_max = attended_f.max(dim=1).values  # [B, C]
-        ctx = ctx_mean + ctx_max  # [B, C]
-        
-        # FC bottleneck: C → r → C
-        chan_w = self.chan_fc1(ctx)   # [B, r]
-        chan_w = F.silu(chan_w)
-        chan_w = self.chan_fc2(chan_w)  # [B, C]
-        
-        # 1 + tanh: range (0, 2), zero-init → starts at 1.0 (identity)
-        chan_w = 1.0 + torch.tanh(chan_w)
-        # Clamp to safe range [0.1, 1.9] to prevent gradient explosion
-        chan_w = torch.clamp(chan_w, min=0.1, max=1.9)
-        
-        # Store deviation from identity for metrics (0.0 = identity, >0 = learning)
-        self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
-        
-        # Multiplicative recalibration (broadcast to spatial)
-        chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
-        out = x * chan_w.to(dtype=x.dtype)
-        # Final safety clamp for output
-        return torch.clamp(out, min=-1000.0, max=1000.0)
+        attended = torch.bmm(attn, v)
+        attended = _bounded_tanh(attended, limit=self.delta_limit)
+        out_dtype = self.out_proj.weight.dtype
+        delta = self.out_proj(attended.to(dtype=out_dtype)).float()
+        delta = _bounded_tanh(delta, limit=self.delta_limit)
+        return _finite_or_zero(delta, limit=self.delta_limit).to(dtype=selected.dtype)
 
-    def _spatial_refinement(
-        self,
-        x: torch.Tensor,  # [B, C, H, W]
-    ) -> torch.Tensor:
-        """
-        Learned spatial modulation via 1×1 depthwise conv.
-        Near-identity init (mean=1.0, std=0.02) → starts ~pass-through with diversity.
-        """
-        # Depthwise 1×1: per-channel spatial modulation (match dtype to avoid AMP mismatch)
-        dtype = self.spatial_conv.weight.dtype
-        spatial_w = self.spatial_conv(x.to(dtype=dtype))  # [B, C, H, W]
-        return spatial_w
+    def _capture_selected_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        """Backward hook used only for debug metrics."""
+        try:
+            self.last_selected_grad_norm = float(grad.detach().float().norm().item())
+            self.last_nonselected_sparse_grad = 0.0
+        except Exception:
+            pass
+        return grad
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -419,83 +354,68 @@ class SGTokenBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        TGSR forward: multiplicative paradigm (non-bypassable).
-        
+        Selected-token-only sparse attention.
+
         Flow:
-          1. Token selection (saliency)
-          2. k×k self-attention on selected
-          3. Channel recalibration (multiplicative, dense output)
-          4. Spatial refinement (blended by alpha_scale)
+          finite guard -> GN -> L2 top-k -> gather selected tokens
+          -> Linear Q/K/V -> FP32 attention -> Linear out
+          -> zero-canvas scatter -> x + gamma * delta
         """
         self._ensure_runtime_attrs()
         B, C, H, W = x.shape
         N = int(H) * int(W)
-        
         k_actual = self._select_k(N)
+
         self.last_N = N
         self.last_k = k_actual
         self.last_mode = self.mode
-        
-        with _fp32_context(x.device):
-            # ── 1. Normalize and compute saliency ─────────────────────────
-            # Use pre_norm's dtype to avoid mixed dtype error during AMP
-            x_norm = self.pre_norm(x.to(self.pre_norm.weight.dtype))
-            
-            if self.mode == "dense":
-                # Use all tokens
-                importance = None
-                topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-                k_actual = N
-            else:
-                # Saliency from RAW features (preserve L2 magnitude info, pre_norm destroys it)
-                importance = self._compute_saliency(x)
-                if not torch.isfinite(importance).any():
-                    importance = torch.ones_like(importance)
-                topk_idx = torch.topk(importance, k_actual, dim=1).indices
-                topk_idx = torch.clamp(topk_idx, 0, N - 1)
-            
-            topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
-            self._store_debug(topk_idx, importance)
-            
-            # ── 2. Gather selected tokens ────────────────────────────────
-            x_flat = x_norm.view(B, C, N)  # [B, C, N]
-            idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
-            selected = torch.gather(x_flat, 2, idx_exp)  # [B, C, k]
-            selected = selected.transpose(1, 2)  # [B, k, C]
-            
-            # ── 3. k×k self-attention ───────────────────────────────────
-            attended = self._k_times_k_attention(selected)  # [B, k, C]
-            # Stabilize: clamp extreme values that can cause NaN in backward
-            attended = torch.clamp(attended, min=-100.0, max=100.0)
-            if not torch.isfinite(attended).all():
-                attended = torch.nan_to_num(attended, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-            # ── 4. Channel recalibration (multiplicative) ───────────────
-            x_recal = self._channel_recalibration(attended, x)  # [B, C, H, W]
-            # Stabilize output
-            x_recal = torch.clamp(x_recal, min=-1000.0, max=1000.0)
-            if not torch.isfinite(x_recal).all():
-                x_recal = torch.nan_to_num(x_recal, nan=0.0, posinf=100.0, neginf=-100.0)
-            
-            # ── 5. Spatial refinement (blended by alpha) ───────────────
-            # Always compute spatial path (no if branch) to ensure gradient flow
-            # alpha=0 → output = x_recal (spatial contribution zeroed)
-            alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
-            spatial_w = self._spatial_refinement(x_recal)
-            # Stabilize spatial weights
-            spatial_w = torch.clamp(spatial_w, min=-1000.0, max=1000.0)
-            if not torch.isfinite(spatial_w).all():
-                spatial_w = torch.nan_to_num(spatial_w, nan=0.0, posinf=100.0, neginf=-100.0)
-            out = x_recal + alpha * (spatial_w - x_recal)
-            
-            # ── 6. Hybrid local path (multiplicative blend, non-bypassable) ─
-            if self.mode == "hybrid" and self.local_dw is not None:
-                local_feat = self.local_dw(x_norm)
-                # Multiplicative blend: sigmoid(0) = 0.5 default
-                blend = torch.sigmoid(self.local_blend).to(dtype=x.dtype)
-                out = out * (1.0 - blend) + local_feat.to(dtype=x.dtype) * blend
-        
-        return out.to(dtype=x.dtype)
+        self.last_selected_ratio = float(k_actual) / float(N) if N else 0.0
+        self.last_gamma_abs_mean = float(self.gamma.detach().float().abs().mean().item())
+        self.last_selected_grad_norm = None
+        self.last_nonselected_sparse_grad = 0.0
+
+        if self.debug_enabled:
+            finite = torch.isfinite(x)
+            self.last_finite_guard_count = int((~finite).sum().item())
+        else:
+            self.last_finite_guard_count = 0
+
+        x_safe = _finite_or_zero(x, limit=self.finite_limit)
+        norm_dtype = self.pre_norm.weight.dtype
+        x_norm = self.pre_norm(x_safe.to(dtype=norm_dtype)).to(dtype=x_safe.dtype)
+        x_norm = _finite_or_zero(x_norm, limit=self.finite_limit)
+
+        if self.mode == "dense":
+            saliency = None
+            topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+            k_actual = N
+        else:
+            saliency = self._compute_saliency(x_norm)
+            if not torch.isfinite(saliency).any():
+                saliency = torch.ones_like(saliency)
+            topk_idx = torch.topk(saliency, k_actual, dim=1).indices
+
+        topk_idx = topk_idx.clamp(0, N - 1).long()
+        self._store_debug(topk_idx, saliency)
+
+        x_flat = x_norm.view(B, C, N)
+        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)
+        selected = torch.gather(x_flat, 2, idx_exp).transpose(1, 2)
+
+        delta_tokens = self._selected_attention_delta(selected)
+        if delta_tokens.requires_grad:
+            delta_tokens.register_hook(self._capture_selected_grad)
+
+        self.last_delta_norm_selected = float(
+            delta_tokens.detach().float().norm(dim=-1).mean().item()
+        )
+        self.last_delta_norm_nonselected = 0.0
+
+        delta_flat = x_safe.new_zeros(B, C, N)
+        delta_flat = delta_flat.scatter(2, idx_exp, delta_tokens.transpose(1, 2).to(dtype=x_safe.dtype))
+        delta = delta_flat.view(B, C, H, W)
+        out = x_safe + self.gamma.to(dtype=x_safe.dtype, device=x_safe.device) * delta
+        return _finite_or_zero(out, limit=self.finite_limit).to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -781,7 +701,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         # Guard: validate topk indices before using for indexing
         N_features = features.shape[1]  # h*w
         topk_ind = torch.clamp(topk_ind, 0, N_features - 1)
-        topk_ind = torch.nan_to_num(topk_ind, nan=0).long()
+        topk_ind = topk_ind.long()
 
         # ── Remainder identical to base RTDETRDecoder ──────────────────
         batch_ind = (
@@ -805,7 +725,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
 
         embeddings = (
-            self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
+            self.tgt_embed.weight.to(dtype=features.dtype).unsqueeze(0).repeat(bs, 1, 1)
             if self.learnt_init_query
             else top_k_features
         )
@@ -838,11 +758,9 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             dn_bbox = dn_bbox.clamp(-self.DN_LOGIT_LIMIT, self.DN_LOGIT_LIMIT)
 
         embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
-        # Decoder runs in FP32 (AMP disabled for stability)
-        # Cast inputs to FP32 for decoder
         dec_bboxes, dec_scores = self._safe_decoder_forward(
-            embed.float(),
-            refer_bbox.float(),
+            embed,
+            refer_bbox,
             feats,
             shapes,
             attn_mask=attn_mask,
@@ -857,11 +775,12 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return out
-        # Eval/export: convert raw class scores to (max_score, label) format expected by RT-DETR validator
-        # Validator expects [bboxes(4), score(1), label(1)] = 6, not [bboxes(4), scores(nc)] = 4+nc
-        scores = dec_scores.squeeze(0).sigmoid()
+        # Eval/export: convert the selected decoder layer to the format expected
+        # by the RT-DETR validator: [bbox(4), max_score(1), label(1)].
+        layer_idx = int(getattr(self, "eval_idx", -1))
+        scores = dec_scores[layer_idx].sigmoid()
         max_scores, labels = scores.max(-1, keepdim=True)
-        y = torch.cat((dec_bboxes.squeeze(0), max_scores, labels.float()), -1)
+        y = torch.cat((dec_bboxes[layer_idx], max_scores, labels.float()), -1)
         return y if self.export else (y, out)
 
     def _safe_decoder_forward(
@@ -873,54 +792,41 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         attn_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mirror the base decoder but keep reference boxes in a safer numeric range.
-        
-        Decoder runs in FP32 (_fp32_context) for MLP compatibility and numerical stability.
-        """
-        with _fp32_context(embed.device):
-            output = embed
-            dec_bboxes = []
-            dec_cls = []
-            last_refined_bbox = None
-            refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
+        """Mirror the base decoder while isolating only box refinement in FP32."""
+        output = embed
+        dec_bboxes = []
+        dec_cls = []
+        refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
 
-            # Cast feats to FP32 for decoder layer compatibility (cross_attn expects FP32)
-            feats_f32 = feats.float() if feats.dtype != torch.float32 else feats
-            
-            for i, layer in enumerate(self.decoder.layers):
-                ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
-                # Cast MLPs to FP32 for forward pass (weights may be FP16 from AMP)
-                query_pos = self.query_pos_head.float()(ref_for_layer.float())
-                output = layer(
-                    output,
-                    ref_for_layer.to(dtype=output.dtype),
-                    feats_f32,  # FP32 for decoder
-                    shapes,
-                    padding_mask,
-                    attn_mask,
-                    query_pos,
-                )
+        for i, layer in enumerate(self.decoder.layers):
+            ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
+            query_dtype = _module_param_dtype(self.query_pos_head, output.dtype)
+            query_pos = self.query_pos_head(ref_for_layer.to(dtype=query_dtype)).to(dtype=output.dtype)
+            output = layer(
+                output,
+                ref_for_layer.to(dtype=output.dtype),
+                feats.to(dtype=output.dtype),
+                shapes,
+                padding_mask,
+                attn_mask,
+                query_pos,
+            )
 
-                head_input = F.layer_norm(output, (output.shape[-1],))
-                # Cast bbox head to FP32
-                bbox = self.dec_bbox_head[i].float()(head_input.float())
-                bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
-                refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
-                refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
+            head_input = F.layer_norm(output, (output.shape[-1],))
+            bbox_head = self.dec_bbox_head[i]
+            bbox_dtype = _module_param_dtype(bbox_head, head_input.dtype)
+            bbox = bbox_head(head_input.to(dtype=bbox_dtype)).float()
+            bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
+            refined_bbox = torch.sigmoid(
+                bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS)
+            )
+            refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
 
-                if self.training:
-                    # Cast score head to FP32
-                    dec_cls.append(self.dec_score_head[i].float()(head_input.float()))
-                else:
-                    dec_cls.append(self.dec_score_head[i].float()(head_input.float()).sigmoid())
+            score_head = self.dec_score_head[i]
+            score_dtype = _module_param_dtype(score_head, head_input.dtype)
+            dec_cls.append(score_head(head_input.to(dtype=score_dtype)))
 
-                if i == 0:
-                    last_refined_bbox = refined_bbox
-                    refer_bbox = refined_bbox.detach() if self.training else refined_bbox
-                else:
-                    last_refined_bbox = refined_bbox
-                    refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+            refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+            dec_bboxes.append(refined_bbox)
 
-                dec_bboxes.append(last_refined_bbox)
-
-            return torch.stack(dec_bboxes), torch.stack(dec_cls)
+        return torch.stack(dec_bboxes), torch.stack(dec_cls)

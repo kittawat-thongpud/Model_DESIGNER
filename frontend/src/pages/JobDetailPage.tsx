@@ -232,7 +232,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
     }
   }, [job?.status]);
 
-  // Merge TGSR metrics from job.history (persisted in extended_metrics.jsonl)
+  // Merge HSG-DETR sparse debug metrics from job.history (persisted in extended_metrics.jsonl)
   useEffect(() => {
     if (!job?.history || job.history.length === 0) return;
     
@@ -251,7 +251,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
         const hsgData = (h as any).hsg_detr as Record<string, number> | undefined;
         
         if (hsgData) {
-          // Merge TGSR metrics
+          // Merge selected-token SGB, decoder alpha, and gradient diagnostics.
           merged.set(epoch, { ...existing, ...hsgData, epoch });
         }
       }
