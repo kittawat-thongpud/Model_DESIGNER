@@ -286,11 +286,13 @@ class SGTokenBlock(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _compute_saliency(self, x: torch.Tensor) -> torch.Tensor:
-        """L2 activation energy + learned saliency per spatial token, in FP32."""
+        """L2 activation energy + learned saliency per spatial token."""
         B, C, H, W = x.shape
         N = H * W
+        # Match dtype to saliency_head to avoid AMP mismatch
+        dtype = self.saliency_head[0].weight.dtype
         # L2 energy (heuristic)
-        l2_energy = x.view(B, C, N).float().pow(2).sum(dim=1)  # [B, N]
+        l2_energy = x.view(B, C, N).to(dtype=dtype).pow(2).sum(dim=1)  # [B, N]
         l2_energy = torch.nan_to_num(l2_energy, nan=0.0, posinf=0.0, neginf=0.0)
         # Per-sample min-max normalisation
         eps = 1e-6
@@ -299,7 +301,7 @@ class SGTokenBlock(nn.Module):
         l2_range = (l2_max - l2_min).clamp(min=eps)
         l2_norm = (l2_energy - l2_min) / l2_range
         # Learned saliency
-        learned = self.saliency_head(x.float()).view(B, N)  # [B, N]
+        learned = self.saliency_head(x.to(dtype=dtype)).view(B, N)  # [B, N]
         learned = torch.sigmoid(learned)
         learned = torch.nan_to_num(learned, nan=0.0, posinf=0.0, neginf=0.0)
         # Blend: mix parameter clamped to [0,1]
@@ -406,9 +408,9 @@ class SGTokenBlock(nn.Module):
         Learned spatial modulation via 1×1 depthwise conv.
         Near-identity init (mean=1.0, std=0.02) → starts ~pass-through with diversity.
         """
-        # Depthwise 1×1: per-channel spatial modulation (FP32 for AMP compatibility)
-        with _fp32_context(x.device):
-            spatial_w = self.spatial_conv(x.float())  # [B, C, H, W]
+        # Depthwise 1×1: per-channel spatial modulation (match dtype to avoid AMP mismatch)
+        dtype = self.spatial_conv.weight.dtype
+        spatial_w = self.spatial_conv(x.to(dtype=dtype))  # [B, C, H, W]
         return spatial_w
 
     # ------------------------------------------------------------------ #
@@ -446,7 +448,7 @@ class SGTokenBlock(nn.Module):
                 k_actual = N
             else:
                 # Saliency from RAW features (preserve L2 magnitude info, pre_norm destroys it)
-                importance = self._compute_saliency(x.float())
+                importance = self._compute_saliency(x)
                 if not torch.isfinite(importance).any():
                     importance = torch.ones_like(importance)
                 topk_idx = torch.topk(importance, k_actual, dim=1).indices
