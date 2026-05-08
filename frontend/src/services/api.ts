@@ -32,7 +32,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function get<T>(path: string): Promise<T> {
-  return request<T>(path);
+  return request<T>(path, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-cache' },
+  });
 }
 
 function post<T>(path: string, body?: unknown): Promise<T> {
