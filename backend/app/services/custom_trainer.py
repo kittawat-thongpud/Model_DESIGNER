@@ -779,23 +779,6 @@ class CustomDetectionTrainer(DetectionTrainer):
         )
         return result
 
-    def _disable_amp_for_hsg_detr(self) -> None:
-        """Train HSG-DETR in FP32 until the RT-DETR loss path is numerically stable."""
-        model = unwrap_model(self.model)
-        has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
-        if not has_hsg_decoder:
-            return
-
-        if not getattr(self, "amp", False):
-            return
-
-        self.amp = False
-        try:
-            self.scaler = torch.amp.GradScaler("cuda", enabled=False)
-        except TypeError:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=False)
-        self.log("HSG-DETR AMP disabled: RT-DETR loss path will run in FP32", "WARNING")
-
     def _disable_deterministic_for_hsg_detr(self) -> None:
         """Avoid deterministic CUDA paths that RT-DETR/HSG-DETR cannot fully support."""
         model = unwrap_model(self.model)
