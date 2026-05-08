@@ -880,10 +880,10 @@ class RTDETRDecoderSGB(RTDETRDecoder):
                 shapes,
                 padding_mask,
                 attn_mask,
-                self.query_pos_head(ref_for_layer).to(dtype=output.dtype),
+                self.query_pos_head(ref_for_layer.to(dtype=self.query_pos_head.weight.dtype)).to(dtype=output.dtype),
             )
 
-            head_input = F.layer_norm(output.float(), (output.shape[-1],))
+            head_input = F.layer_norm(output, (output.shape[-1],))
             bbox = self.dec_bbox_head[i](head_input)
             bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
             refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
