@@ -176,6 +176,9 @@ def _start_training_subprocess(
     env["MD_TRAINING_CHILD"] = "1"
     env["PYTHONFAULTHANDLER"] = "1"
 
+    # Clear any CUDA-related env vars that might cause context issues in subprocess
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+
     worker_log = job_dir / "worker_process.log"
     log_fh = open(worker_log, "ab", buffering=0)
     cmd = [
@@ -183,7 +186,7 @@ def _start_training_subprocess(
         "-X",
         "faulthandler",
         "-m",
-        "app.services.ultra_trainer",
+        __name__,
         "--worker",
         str(args_path),
     ]
@@ -195,8 +198,6 @@ def _start_training_subprocess(
     )
     proc = subprocess.Popen(
         cmd,
-        cwd=str(Path(__file__).resolve().parents[3]),
-        env=env,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -1854,11 +1855,16 @@ def _training_worker(
         _avail = _torch.cuda.device_count()
         _device_val = str(train_kwargs.get("device", "")).strip()
 
-        # Log available hardware
+        # Log available hardware (with error handling for corrupted CUDA context)
         if _avail > 0:
-            _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
-            job_storage.append_job_log(job_id, "INFO",
-                f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
+            try:
+                _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
+            except Exception as e:
+                job_storage.append_job_log(job_id, "WARNING",
+                    f"Could not get GPU names (CUDA context may be corrupted): {e}")
+                # Continue with training - Ultralytics will handle device selection
         else:
             job_storage.append_job_log(job_id, "INFO", "No CUDA GPUs detected — using CPU")
 
