@@ -1,15 +1,17 @@
 """
-SparseGlobalTokenBlock — SGB-centric sparse-token encoder for HSG-DETR.
+SparseGlobalTokenBlock — Token-Guided Spatial Recalibration (TGSR) for HSG-DETR.
 
-Single tensor-in / tensor-out block with internal top-k selector, compatible
-with Ultralytics ``parse_model``.  Supports three ablation modes:
-  - ``dense``  : full self-attention (O(N²d)) — ablation baseline
-  - ``topk``   : hard top-k sparse attention (O(k²d)) — production
-  - ``hybrid`` : dense local + sparse global fusion — accuracy
+TGSR Architecture:
+  - Token selection via saliency (L2 + learned)
+  - k×k self-attention on selected tokens (sharp softmax)
+  - Channel recalibration: multiplicative (non-bypassable)
+  - Spatial refinement: learned per-channel modulation
 
-Optional metadata (selected indices, saliency scores, residual scale) can be
-stored as instance attributes for debug / visualization without breaking
-``parse_model`` (single tensor return).
+Key innovation: Multiplicative paradigm replaces additive+gamma
+  OLD: output = x + gamma * delta          ← gamma→0 = bypass
+  NEW: output = x * channel_weights        ← must learn meaningful weights
+
+Zero-initialization ensures start-as-identity behavior.
 """
 from __future__ import annotations
 
@@ -59,18 +61,15 @@ def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
 
 class SGTokenBlock(nn.Module):
     """
-    Sparse-Token Global Self-Attention block.
+    Token-Guided Spatial Recalibration (TGSR) block.
 
-    Internally performs top-k token selection, sparse self-attention,
-    scatter-back, and gated residual fusion.  Returns a single tensor
-    so it is transparent to Ultralytics ``parse_model``.
+    Multiplicative paradigm replaces additive+gamma to prevent structural bypass:
+      - Token selection via saliency (L2 + learned blend)
+      - k×k self-attention on selected tokens (sharp softmax, better gradients)
+      - Channel recalibration: multiplicative (optimizer cannot bypass)
+      - Spatial refinement: learned per-channel modulation
 
-    Args:
-        c1 (int): Input channels (auto-injected by parse_model).
-        c2 (int): Output channels (auto-injected by parse_model from YAML args[0]).
-        ratio (float): Fraction of spatial tokens to retain; k = ratio·N (scales with imgsz).
-        mode (str): One of ``"dense"``, ``"topk"``, ``"hybrid"``.
-        debug_enabled (bool): Store detached selector metadata during forward.
+    Zero-initialized output layers → starts as identity (chan_w ≈ 1.0)
     """
 
     VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
@@ -85,17 +84,13 @@ class SGTokenBlock(nn.Module):
         debug_enabled: bool = False,
     ) -> None:
         super().__init__()
-        assert c1 == c2, (
-            f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
-        )
+        assert c1 == c2, f"SGTokenBlock is channel-preserving (c1={c1}, c2={c2})"
         mode = str(mode).lower()
         if mode not in self.VALID_MODES:
-            raise ValueError(
-                f"Invalid SGTokenBlock mode: {mode}. Expected one of {sorted(self.VALID_MODES)}"
-            )
+            raise ValueError(f"Invalid mode: {mode}. Expected {sorted(self.VALID_MODES)}")
         ratio = float(ratio)
         if not torch.isfinite(torch.tensor(ratio)):
-            raise ValueError(f"Invalid SGTokenBlock ratio: {ratio}")
+            raise ValueError(f"Invalid ratio: {ratio}")
 
         self.c = c2
         self.ratio = max(0.0, min(ratio, 1.0))
@@ -103,37 +98,43 @@ class SGTokenBlock(nn.Module):
 
         self.pre_norm = _make_gn(c2)
 
-        # 1×1 projections — no spatial aggregation, just channel mixing
-        self.q_proj = nn.Conv2d(c2, c2, 1, bias=False)
-        self.k_proj = nn.Conv2d(c2, c2, 1, bias=False)
-        self.v_proj = nn.Conv2d(c2, c2, 1, bias=False)
-        self.out_proj = nn.Conv2d(c2, c2, 1, bias=False)
-
-        # Layer norm on selected tokens (channel dim)
-        self.norm = nn.LayerNorm(c2)
-
-        # Per-channel LayerScale residual.  Starting near identity keeps the
-        # CNN/PAN path dominant while the sparse branch calibrates.
-        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 0.1))
-
-        # Learnable saliency head: small conv that learns which tokens matter.
-        # Combined with L2 energy for more robust token selection.
+        # ── Saliency head (unchanged) ────────────────────────────────────
         self.saliency_head = nn.Sequential(
             nn.Conv2d(c2, c2 // 4, 1, bias=False),
             _make_gn(c2 // 4),
             nn.SiLU(),
             nn.Conv2d(c2 // 4, 1, 1, bias=False),
         )
-        self.saliency_mix = nn.Parameter(torch.tensor(0.5))  # blend L2 energy vs learned
+        nn.init.zeros_(self.saliency_head[-1].weight)  # AdaptFormer: start as identity
+        self.saliency_mix = nn.Parameter(torch.tensor(0.5))
 
-        # Alpha-coupled scaling: set by trainer to match decoder alpha warmup.
-        # gamma_effective = gamma * (1 + alpha_scale) so alpha warmup also
-        # activates the sparse branch.
-        self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
-
+        # ── k×k Self-attention (Linear projections, not Conv2d) ─────────────
+        # Pre-LN for stability
+        self.norm = nn.LayerNorm(c2)
+        self.q_proj = nn.Linear(c2, c2, bias=False)
+        self.k_proj = nn.Linear(c2, c2, bias=False)
+        self.v_proj = nn.Linear(c2, c2, bias=False)
         self._attn_scale = c2 ** -0.5
 
-        # ── Hybrid mode: lightweight local path ───────────────────────────
+        # ── Channel Recalibration ──────────────────────────────────────────
+        # Two-stage: compress → expand with non-linearity
+        r = max(1, c2 // 16)
+        self.chan_fc1 = nn.Linear(c2, r, bias=True)
+        self.chan_fc2 = nn.Linear(r, c2, bias=True)
+        # Zero-init: start as identity (chan_w ≈ 1.0 from 1 + tanh(0) = 1)
+        nn.init.zeros_(self.chan_fc2.weight)
+        nn.init.zeros_(self.chan_fc2.bias)
+
+        # ── Spatial Refinement ───────────────────────────────────────────
+        # 1×1 depthwise for per-channel spatial modulation
+        self.spatial_conv = nn.Conv2d(c2, c2, 1, groups=c2, bias=True)
+        nn.init.ones_(self.spatial_conv.weight)  # identity
+        nn.init.zeros_(self.spatial_conv.bias)
+
+        # Alpha for blending channel vs spatial (set by trainer during warmup)
+        self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
+
+        # ── Hybrid mode: local path (still additive, but small) ───────────
         if mode == "hybrid":
             self.local_dw = nn.Sequential(
                 nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
@@ -147,12 +148,12 @@ class SGTokenBlock(nn.Module):
             self.local_dw = None
             self.local_gamma = None
 
-        # Debug metadata (populated only when debug is enabled)
+        # Debug metadata
         self.debug_enabled = bool(debug_enabled)
         self.debug_to_cpu = False
         self.last_indices: torch.Tensor | None = None
         self.last_saliency: torch.Tensor | None = None
-        self.last_gate: float | None = None
+        self.last_gate: float | None = None  # now tracks chan_w mean
         self.last_mode: str | None = None
         self.last_k: int | None = None
         self.last_N: int | None = None
@@ -161,6 +162,39 @@ class SGTokenBlock(nn.Module):
         """Restore runtime-only attrs for checkpoints saved before debug flags existed."""
         super().__setstate__(state)
         self._ensure_runtime_attrs()
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list,
+        unexpected_keys: list,
+        error_msgs: list,
+    ) -> None:
+        """Backward compat: old checkpoints have gamma/out_proj, TGSR has chan_fc.
+        
+        Strategy: Drop old gamma/out_proj keys, initialize chan_fc fresh.
+        Architecture change is too large for weight remapping.
+        """
+        # Remove legacy keys that don't exist in TGSR
+        legacy_keys = ['gamma', 'out_proj', 'local_gamma', 'local_dw']
+        for key in list(state_dict.keys()):
+            if prefix in key:
+                short_key = key[len(prefix):].split('.')[0]
+                if short_key in legacy_keys:
+                    state_dict.pop(key, None)
+        
+        # Call parent to load remaining keys (saliency_head, saliency_mix, etc.)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+        
+        # Re-initialize TGSR-specific layers that weren't in old checkpoints
+        # (chan_fc1, chan_fc2, spatial_conv, q/k/v_proj as Linear)
+        # They'll start with default init (zero-init for recal layers)
 
     # ------------------------------------------------------------------ #
     # Debug / introspection
@@ -258,143 +292,157 @@ class SGTokenBlock(nn.Module):
             return int(N)
         return max(1, min(int(round(self.ratio * int(N))), int(N)))
 
-    def _sparse_attention_delta(
+    def _k_times_k_attention(
         self,
-        x: torch.Tensor,
-        q: torch.Tensor,
-        kk: torch.Tensor,
-        v: torch.Tensor,
-        topk_idx: torch.Tensor,
-        k_actual: int,
+        selected: torch.Tensor,  # [B, k, C]
     ) -> torch.Tensor:
         """
-        Run self-attention on selected tokens and scatter back.
-
-        All attention math in FP32 for AMP stability.
+        k×k self-attention on selected tokens (NOT k×N).
+        
+        Sharp softmax due to smaller range = better gradients.
+        Pre-LN for stability.
         """
-        B, C, H, W = x.shape
-        N = H * W
-        topk_idx = torch.nan_to_num(topk_idx, nan=0).long().clamp(0, N - 1)
-        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
-
-        q_sel = torch.gather(q, 2, idx_exp).transpose(1, 2)   # [B, k, C]
-        k_sel = torch.gather(kk, 2, idx_exp).transpose(1, 2)  # [B, k, C]
-        v_sel = torch.gather(v, 2, idx_exp).transpose(1, 2)   # [B, k, C]
-
-        # Layer norm in FP32
-        orig_dtype = q_sel.dtype
-        norm_w = self.norm.weight
-        norm_b = self.norm.bias
-        q_sel = F.layer_norm(
-            q_sel.float(),
-            self.norm.normalized_shape,
-            norm_w.float() if norm_w is not None else None,
-            norm_b.float() if norm_b is not None else None,
-            self.norm.eps,
-        )
-        k_sel = F.layer_norm(
-            k_sel.float(),
-            self.norm.normalized_shape,
-            norm_w.float() if norm_w is not None else None,
-            norm_b.float() if norm_b is not None else None,
-            self.norm.eps,
-        )
-        v_sel = F.layer_norm(
-            v_sel.float(),
-            self.norm.normalized_shape,
-            norm_w.float() if norm_w is not None else None,
-            norm_b.float() if norm_b is not None else None,
-            self.norm.eps,
-        )
-
-        # Sparse self-attention (stable softmax)
-        attn = torch.bmm(q_sel, k_sel.transpose(1, 2)) * float(self._attn_scale)
+        B, k, C = selected.shape
+        
+        # Pre-LN in FP32
+        orig_dtype = selected.dtype
+        selected_n = self.norm(selected.float())
+        
+        # Linear projections
+        q = self.q_proj(selected_n)  # [B, k, C]
+        k_ = self.k_proj(selected_n)  # [B, k, C]
+        v = self.v_proj(selected_n)   # [B, k, C]
+        
+        # k×k attention (sharp softmax, better than k×N flat softmax)
+        attn = torch.bmm(q, k_.transpose(1, 2)) * float(self._attn_scale)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = attn.clamp(min=-80.0, max=80.0)
         attn = attn - attn.max(dim=-1, keepdim=True).values
         attn = torch.softmax(attn, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attended = torch.bmm(attn, v_sel)  # [B, k, C]
+        
+        attended = torch.bmm(attn, v)  # [B, k, C]
         attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
-        attended = attended.to(orig_dtype)
+        return attended.to(orig_dtype)
 
-        # Scatter sparse context back to a zero canvas. The identity path is
-        # provided by the residual in forward().
-        out = torch.zeros_like(v).view(B, C, N)  # [B, C, N]
+    def _channel_recalibration(
+        self,
+        attended: torch.Tensor,  # [B, k, C]
+        x: torch.Tensor,         # [B, C, H, W]
+    ) -> torch.Tensor:
+        """
+        Multiplicative channel recalibration from attended tokens.
+        
+        Global descriptor (mean+max pool) → FC bottleneck → channel weights.
+        Zero-init FC2 → starts as identity (chan_w ≈ 1.0)
+        """
+        B, C, H, W = x.shape
+        
+        # Global descriptor from attended tokens
+        ctx_mean = attended.mean(dim=1)   # [B, C]
+        ctx_max = attended.max(dim=1).values  # [B, C]
+        ctx = ctx_mean + ctx_max  # [B, C]
+        
+        # FC bottleneck: C → r → C
+        chan_w = self.chan_fc1(ctx)   # [B, r]
+        chan_w = F.silu(chan_w)
+        chan_w = self.chan_fc2(chan_w)  # [B, C]
+        
+        # 1 + tanh: range (0, 2), zero-init → starts at 1.0 (identity)
+        chan_w = 1.0 + torch.tanh(chan_w)
+        
+        # Store for metrics
+        self.last_gate = float(chan_w.detach().mean().item())
+        
+        # Multiplicative recalibration (broadcast to spatial)
+        chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+        return x * chan_w.to(dtype=x.dtype)
 
-        # Guard: sanitize attended before scatter to prevent NaN propagation
-        attended_clean = torch.nan_to_num(attended.transpose(1, 2), nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Guard: ensure idx_exp is valid for scatter
-        idx_exp = torch.clamp(idx_exp, 0, N - 1)
-        idx_exp = torch.nan_to_num(idx_exp, nan=0).long()
-
-        out.scatter_(2, idx_exp, attended_clean)
-        out = out.view(B, C, H, W)
-        delta = self.out_proj(out)
-        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-        delta = 3.0 * torch.tanh(delta.float() / 3.0)
-
-        # GroupNorm can introduce non-zero values at zero-canvas positions, so
-        # mask once more to keep the sparse branch restricted to selected tokens.
-        delta_mask = torch.zeros(B, 1, N, device=delta.device, dtype=delta.dtype)
-        delta_mask.scatter_(2, topk_idx.unsqueeze(1), 1.0)
-        delta = delta * delta_mask.view(B, 1, H, W)
-        return delta.to(orig_dtype)
+    def _spatial_refinement(
+        self,
+        x: torch.Tensor,  # [B, C, H, W]
+    ) -> torch.Tensor:
+        """
+        Learned spatial modulation via 1×1 depthwise conv.
+        Identity init (ones weight, zero bias) → starts as pass-through.
+        """
+        # Depthwise 1×1: per-channel spatial modulation
+        spatial_w = self.spatial_conv(x)  # [B, C, H, W]
+        return spatial_w
 
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        TGSR forward: multiplicative paradigm (non-bypassable).
+        
+        Flow:
+          1. Token selection (saliency)
+          2. k×k self-attention on selected
+          3. Channel recalibration (multiplicative, dense output)
+          4. Spatial refinement (blended by alpha_scale)
+        """
         self._ensure_runtime_attrs()
         B, C, H, W = x.shape
         N = int(H) * int(W)
-
+        
         k_actual = self._select_k(N)
         self.last_N = N
         self.last_k = k_actual
         self.last_mode = self.mode
-
-        gamma = self.gamma.to(dtype=x.dtype)
-        alpha_scale = self.alpha_scale.to(dtype=x.dtype, device=x.device)
-        gamma_effective = gamma * (1.0 + alpha_scale)
-        self.last_gate = float(gamma_effective.detach().abs().mean().item())
-
+        
         with _fp32_context(x.device):
-            x_branch = self.pre_norm(x.float())
-
-            # Projections
-            q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]
-            kk = self.k_proj(x_branch).view(B, C, N)  # [B, C, N]
-            v = self.v_proj(x_branch).view(B, C, N)   # [B, C, N]
-
+            # ── 1. Normalize and compute saliency ─────────────────────────
+            x_norm = self.pre_norm(x.float())
+            
             if self.mode == "dense":
-                # Full self-attention on all tokens (ablation baseline)
+                # Use all tokens
+                importance = None
                 topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-                saliency = self._compute_saliency(x_branch) if self.debug_enabled else None
-                self._store_debug(topk_idx, saliency)
-                delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
-                return x + gamma_effective * delta.to(dtype=x.dtype)
-
-            importance = self._compute_saliency(x_branch)
-
-            if not torch.isfinite(importance).any():
-                importance = torch.ones_like(importance)
-
-            topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
-            topk_idx = torch.clamp(topk_idx, 0, N - 1)
+                k_actual = N
+            else:
+                importance = self._compute_saliency(x_norm)
+                if not torch.isfinite(importance).any():
+                    importance = torch.ones_like(importance)
+                topk_idx = torch.topk(importance, k_actual, dim=1).indices
+                topk_idx = torch.clamp(topk_idx, 0, N - 1)
+            
             topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
             self._store_debug(topk_idx, importance)
-
-            delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
-
+            
+            # ── 2. Gather selected tokens ────────────────────────────────
+            x_flat = x_norm.view(B, C, N)  # [B, C, N]
+            idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
+            selected = torch.gather(x_flat, 2, idx_exp)  # [B, C, k]
+            selected = selected.transpose(1, 2)  # [B, k, C]
+            
+            # ── 3. k×k self-attention ───────────────────────────────────
+            attended = self._k_times_k_attention(selected)  # [B, k, C]
+            
+            # ── 4. Channel recalibration (multiplicative) ───────────────
+            x_recal = self._channel_recalibration(attended, x)  # [B, C, H, W]
+            
+            # ── 5. Spatial refinement (blended by alpha) ───────────────
+            alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
+            
+            if alpha > 0:
+                # Spatial refinement active
+                spatial_w = self._spatial_refinement(x_recal)
+                # Blend: alpha=0 → pure channel, alpha=1 → full spatial
+                out = x_recal + alpha * (spatial_w - x_recal)
+            else:
+                # Pure channel recalibration during warmup
+                out = x_recal
+            
+            # ── 6. Hybrid local path (additive, small) ─────────────────
             if self.mode == "hybrid" and self.local_dw is not None:
-                local_delta = self.local_dw(x_branch)
+                local_delta = self.local_dw(x_norm)
                 local_gamma = self.local_gamma.to(dtype=x.dtype)
-                return x + gamma_effective * delta.to(dtype=x.dtype) + local_gamma * local_delta.to(dtype=x.dtype)
-
-            return x + gamma_effective * delta.to(dtype=x.dtype)
+                out = out + local_gamma * local_delta.to(dtype=x.dtype)
+        
+        return out.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

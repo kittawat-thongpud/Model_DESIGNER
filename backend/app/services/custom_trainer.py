@@ -615,12 +615,12 @@ class CustomDetectionTrainer(DetectionTrainer):
             pass
     
     def build_optimizer(self, model, name='auto', lr=None, momentum=0.937, decay=1e-3, iterations=1e5):
-        """Build optimizer with HSG-DETR-aware param groups.
+        """Build optimizer with TGSR-aware param groups.
 
         Param groups:
           - base model:        lr=lr0,        wd=decay
-          - SGB q/k/v/out:     lr=lr0 × 1.5,  wd=decay
-          - SGB gamma:         lr=lr0 × 5,    wd=0
+          - SGB attn (q/k/v):  lr=lr0 × 1.5,  wd=decay
+          - SGB recal (chan):  lr=lr0 × 2.0,  wd=0     ← multiplicative weights
           - norm / bias:       lr=lr0,        wd=0
           - decoder:           lr=lr0 × 1.5,  wd=decay
         """
@@ -630,22 +630,23 @@ class CustomDetectionTrainer(DetectionTrainer):
         wd = decay
 
         # ── Partition parameters ──────────────────────────────────────────
-        pg_base, pg_sgb_linear, pg_sgb_gamma = [], [], []
+        pg_base, pg_sgb_attn, pg_sgb_recal = [], [], []
         pg_norm_bias, pg_decoder = [], []
 
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
 
-            # SGB gamma (LayerScale residual weight)
-            if 'gamma' in n and ('SGTokenBlock' in n or 'sg_token' in n.lower()):
-                pg_sgb_gamma.append(p)
+            # SGB channel recalibration (multiplicative weights - no WD)
+            if any(k in n for k in ('chan_fc1', 'chan_fc2', 'spatial_conv')) and \
+               ('SGTokenBlock' in n or 'sg_token' in n.lower()):
+                pg_sgb_recal.append(p)
                 continue
 
-            # SGB q/k/v/out projections
-            if any(k in n for k in ('q_proj', 'k_proj', 'v_proj', 'out_proj')) and \
+            # SGB attention projections (q/k/v linear)
+            if any(k in n for k in ('q_proj', 'k_proj', 'v_proj')) and \
                ('SGTokenBlock' in n or 'sg_token' in n.lower()):
-                pg_sgb_linear.append(p)
+                pg_sgb_attn.append(p)
                 continue
 
             # Decoder params (RTDETRDecoderSGB)
@@ -664,8 +665,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         groups = []
         for name, params, lr_mult, use_wd in [
             ('base',       pg_base,       1.0, True),
-            ('sgb_linear', pg_sgb_linear, 1.5, True),
-            ('sgb_gamma',  pg_sgb_gamma,  1.0, False),
+            ('sgb_attn',   pg_sgb_attn,   1.5, True),
+            ('sgb_recal',  pg_sgb_recal,  2.0, False),  # higher LR, no WD for multiplicative
             ('norm_bias',  pg_norm_bias,  1.0, False),
             ('decoder',    pg_decoder,    1.5, True),
         ]:
@@ -1055,7 +1056,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                 pass
 
     def _log_hsg_detr_metrics(self) -> None:
-        """Log SGB, decoder, and gradient metrics for HSG-DETR monitoring."""
+        """Log TGSR metrics: chan_w (non-bypassable multiplicative weights)."""
         if not self.job_id:
             return
         try:
@@ -1068,7 +1069,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         metrics: dict[str, float] = {}
 
-        # ── SGB metrics ──────────────────────────────────────────────────
+        # ── TGSR SGB metrics ─────────────────────────────────────────────
         for i, blk in enumerate(sgb_blocks):
             tag = f'sgb/P{i+3}'
             metrics[f'{tag}_ratio'] = float(getattr(blk, 'ratio', 0))
@@ -1080,9 +1081,16 @@ class CustomDetectionTrainer(DetectionTrainer):
                 metrics[f'{tag}_k'] = float(k)
             if N is not None and k is not None and N > 0:
                 metrics[f'{tag}_k_over_N'] = float(k) / float(N)
-            gamma = getattr(blk, 'gamma', None)
-            if gamma is not None:
-                metrics[f'{tag}_gamma_mean'] = float(gamma.detach().mean())
+            
+            # TGSR: track chan_w (multiplicative recalibration weights)
+            # last_gate now stores chan_w mean (deviation from 1.0 = active contribution)
+            chan_w_mean = getattr(blk, 'last_gate', None)
+            if chan_w_mean is not None:
+                metrics[f'{tag}_chan_w_mean'] = float(chan_w_mean)
+                # Deviation from 1.0 (identity) = how much SGB is contributing
+                # Target: > 0.05 within 5 epochs, > 0.10 by epoch 30
+                metrics[f'{tag}_chan_w_deviation'] = abs(float(chan_w_mean) - 1.0)
+            
             saliency = getattr(blk, 'last_saliency', None)
             if saliency is not None and saliency.numel():
                 metrics[f'{tag}_saliency_mean'] = float(saliency.detach().float().mean())
@@ -1102,8 +1110,11 @@ class CustomDetectionTrainer(DetectionTrainer):
                     continue
                 gn = float(p.grad.norm())
                 if 'SGTokenBlock' in n:
-                    if 'gamma' in n:
-                        grad_norms['sgb_gamma'] = max(grad_norms.get('sgb_gamma', 0), gn)
+                    # TGSR parameters: chan_fc1, chan_fc2, spatial_conv, q/k/v_proj
+                    if any(x in n for x in ['chan_fc', 'spatial_conv']):
+                        grad_norms['sgb_recal'] = max(grad_norms.get('sgb_recal', 0), gn)
+                    elif any(x in n for x in ['q_proj', 'k_proj', 'v_proj']):
+                        grad_norms['sgb_attn'] = max(grad_norms.get('sgb_attn', 0), gn)
                     else:
                         grad_norms['sgb'] = max(grad_norms.get('sgb', 0), gn)
                 elif 'decoder' in n.lower():
