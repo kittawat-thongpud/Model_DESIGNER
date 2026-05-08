@@ -361,6 +361,17 @@ def _terminate_worker_process(job_id: str, reason: str, timeout: float | None = 
             pass
     except Exception as exc:
         job_storage.append_job_log(job_id, "WARNING", f"Training process stop warning: {exc}")
+    
+    # Additional cleanup: kill any matching ultra_trainer processes by job_id
+    # This prevents CUDA context corruption from zombie processes
+    try:
+        _kill_ddp_processes(job_id)
+    except Exception:
+        pass
+    
+    # Give OS time to release GPU context
+    import time
+    time.sleep(0.5)
 
 
 def _training_process_supervisor(
@@ -1284,6 +1295,15 @@ def _training_worker(
                           [{'partition_id': 'p_xxx', 'train': True, 'val': False, 'test': True}, ...]
         model_scale: Scale char ('n', 's', 'm', 'l', 'x') for model scaling.
     """
+    # Clear any leftover CUDA context from previous runs (prevents "CUDA unknown error")
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    
     job = job_storage.load_job(job_id)
     if not job:
         return
