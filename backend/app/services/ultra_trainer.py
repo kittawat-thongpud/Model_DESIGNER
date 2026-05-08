@@ -895,8 +895,10 @@ def _restart_job(job_id: str, config: dict) -> None:
     _reconcile_training_queue()
     _finalize_existing_queue_task(job, "Cancelled due to job restart", admit_pending=False)
 
-    # Extract model scale and device for VRAM estimation
-    config = job.get("config", {})
+    # Merge passed config (may contain resume/pretrained) with job config
+    # Passed config takes priority (e.g., resume=checkpoint_path from resume_training)
+    job_config = job.get("config", {})
+    config = {**job_config, **config}  # passed config overrides job config
     # Use saved model_scale from job record (set during initial start_training)
     model_scale = str(job.get("model_scale") or "").strip().lower() or config.get("scale") or "n"
     device = config.get("device", "")
