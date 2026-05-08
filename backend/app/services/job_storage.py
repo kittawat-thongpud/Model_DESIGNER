@@ -150,10 +150,16 @@ def get_job_history(job_id: str) -> list[dict]:
                     # Timing — per-epoch (not cumulative)
                     "epoch_time": epoch_time,
                     "val_time_s": data.get("val_time_s"),
+                    
+                    # HSG-DETR TGSR metrics (persisted from training)
+                    "hsg_detr": data.get("hsg_detr"),
+                    
+                    # Gradient norms (persisted from training)
+                    "gradient_norms": data.get("gradient_norms"),
                 }
 
-                # Remove None values
-                epoch_metrics = {k: v for k, v in epoch_metrics.items() if v is not None}
+                # Remove None values (but keep hsg_detr/gradient_norms dicts even if empty)
+                epoch_metrics = {k: v for k, v in epoch_metrics.items() if v is not None or k in ('hsg_detr', 'gradient_norms')}
                 history.append(epoch_metrics)
 
             if history:

@@ -232,6 +232,35 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
     }
   }, [job?.status]);
 
+  // Merge TGSR metrics from job.history (persisted in extended_metrics.jsonl)
+  useEffect(() => {
+    if (!job?.history || job.history.length === 0) return;
+    
+    setHsgMetricsHistory(prev => {
+      const merged = new Map<number, HsgDetrMetricsEntry>();
+      
+      // Start with existing entries
+      for (const p of prev) {
+        merged.set(p.epoch, p);
+      }
+      
+      // Merge from job.history hsg_detr data
+      for (const h of job.history) {
+        const epoch = h.epoch;
+        const existing = merged.get(epoch) || { epoch };
+        const hsgData = (h as any).hsg_detr as Record<string, number> | undefined;
+        
+        if (hsgData) {
+          // Merge TGSR metrics
+          merged.set(epoch, { ...existing, ...hsgData, epoch });
+        }
+      }
+      
+      // Convert to sorted array
+      return Array.from(merged.values()).sort((a, b) => a.epoch - b.epoch);
+    });
+  }, [job?.history]);
+
   // SSE — real-time updates for progress, epoch summary, and terminal events
   const sseUrl = job?.status && LIVE_JOB_STATUSES.has(job.status) ? `/api/train/${jobId}/stream` : null;
   useSSE(sseUrl, (_event, data) => {

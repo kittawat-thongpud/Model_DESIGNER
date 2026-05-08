@@ -1139,11 +1139,46 @@ class CustomDetectionTrainer(DetectionTrainer):
         metrics['grad/has_inf'] = float(has_inf)
 
         if metrics:
+            epoch = getattr(self, 'epoch', 0) + 1
             job_storage.append_job_log(
                 self.job_id, 'METRICS',
-                f'HSG-DETR metrics epoch {getattr(self, "epoch", 0) + 1}',
-                {'type': 'hsg_detr_metrics', 'epoch': getattr(self, 'epoch', 0) + 1, **metrics}
+                f'HSG-DETR metrics epoch {epoch}',
+                {'type': 'hsg_detr_metrics', 'epoch': epoch, **metrics}
             )
+            
+            # Also save to extended_metrics.jsonl for persistence across sessions
+            try:
+                from ..config import JOBS_DIR
+                import json
+                job_dir = JOBS_DIR / self.job_id
+                extended_file = job_dir / "extended_metrics.jsonl"
+                
+                # Build TGSR epoch record
+                tgsr_record = {
+                    "epoch": epoch,
+                    "timestamp": time.time(),
+                    "hsg_detr": metrics,  # All TGSR metrics under hsg_detr key
+                }
+                
+                # Serialize and append
+                def to_serializable(v):
+                    import numpy as np
+                    import torch
+                    if isinstance(v, torch.Tensor):
+                        return float(v.detach().cpu())
+                    if isinstance(v, np.ndarray):
+                        return float(v)
+                    if isinstance(v, (np.integer, np.floating)):
+                        return int(v) if isinstance(v, np.integer) else float(v)
+                    return v
+                
+                tgsr_record = {k: to_serializable(v) for k, v in tgsr_record.items()}
+                tgsr_record = {k: v for k, v in tgsr_record.items() if v is not None}
+                
+                with open(extended_file, "a") as f:
+                    f.write(json.dumps(tgsr_record) + "\n")
+            except Exception:
+                pass  # Fail silently - job log is primary
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
