@@ -388,8 +388,15 @@ class SGTokenBlock(nn.Module):
         chan_w = F.silu(chan_w)
         chan_w = self.chan_fc2(chan_w)  # [B, C]
         
-        # 1 + tanh: range (0, 2), zero-init → starts at 1.0 (identity)
-        chan_w = 1.0 + torch.tanh(chan_w)
+        # 0.5 + sigmoid: range (0.5, 1.5), zero-init → starts at 1.0 (identity).
+        # The (0, 2) range from `1 + tanh` had an absorbing endpoint at 0 that
+        # the optimizer was driving chan_w into during warmup (observed
+        # chan_w_mean ≈ 0.04, deviation ≈ 0.95 at epoch 9). That collapse
+        # multiplicatively zeroed the SGB output and killed gradient flow
+        # through the encoder. The (0.5, 1.5) range cannot zero features and
+        # cannot 2× amplify them — it forces the gate to act as a true
+        # per-channel modulation rather than a learnable killswitch.
+        chan_w = 0.5 + torch.sigmoid(chan_w)
         
         # Store deviation from identity for metrics (0.0 = identity, >0 = learning)
         self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
