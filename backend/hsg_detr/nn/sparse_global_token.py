@@ -889,6 +889,8 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             
             for i, layer in enumerate(self.decoder.layers):
                 ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
+                # Cast MLPs to FP32 for forward pass (weights may be FP16 from AMP)
+                query_pos = self.query_pos_head.float()(ref_for_layer.float())
                 output = layer(
                     output,
                     ref_for_layer.to(dtype=output.dtype),
@@ -896,19 +898,21 @@ class RTDETRDecoderSGB(RTDETRDecoder):
                     shapes,
                     padding_mask,
                     attn_mask,
-                    self.query_pos_head(ref_for_layer.to(dtype=output.dtype)),
+                    query_pos,
                 )
 
                 head_input = F.layer_norm(output, (output.shape[-1],))
-                bbox = self.dec_bbox_head[i](head_input)
+                # Cast bbox head to FP32
+                bbox = self.dec_bbox_head[i].float()(head_input.float())
                 bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
                 refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
                 refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
 
                 if self.training:
-                    dec_cls.append(self.dec_score_head[i](head_input))
+                    # Cast score head to FP32
+                    dec_cls.append(self.dec_score_head[i].float()(head_input.float()))
                 else:
-                    dec_cls.append(self.dec_score_head[i](head_input).sigmoid())
+                    dec_cls.append(self.dec_score_head[i].float()(head_input.float()).sigmoid())
 
                 if i == 0:
                     last_refined_bbox = refined_bbox
