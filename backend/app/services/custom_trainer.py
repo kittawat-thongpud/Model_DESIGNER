@@ -1146,39 +1146,9 @@ class CustomDetectionTrainer(DetectionTrainer):
                 {'type': 'hsg_detr_metrics', 'epoch': epoch, **metrics}
             )
             
-            # Also save to extended_metrics.jsonl for persistence across sessions
-            try:
-                from ..config import JOBS_DIR
-                import json
-                job_dir = JOBS_DIR / self.job_id
-                extended_file = job_dir / "extended_metrics.jsonl"
-                
-                # Build TGSR epoch record
-                tgsr_record = {
-                    "epoch": epoch,
-                    "timestamp": time.time(),
-                    "hsg_detr": metrics,  # All TGSR metrics under hsg_detr key
-                }
-                
-                # Serialize and append
-                def to_serializable(v):
-                    import numpy as np
-                    import torch
-                    if isinstance(v, torch.Tensor):
-                        return float(v.detach().cpu())
-                    if isinstance(v, np.ndarray):
-                        return float(v)
-                    if isinstance(v, (np.integer, np.floating)):
-                        return int(v) if isinstance(v, np.integer) else float(v)
-                    return v
-                
-                tgsr_record = {k: to_serializable(v) for k, v in tgsr_record.items()}
-                tgsr_record = {k: v for k, v in tgsr_record.items() if v is not None}
-                
-                with open(extended_file, "a") as f:
-                    f.write(json.dumps(tgsr_record) + "\n")
-            except Exception:
-                pass  # Fail silently - job log is primary
+            # Cache for _save_extended_metrics to include in epoch record
+            # (prevents duplicate writes to extended_metrics.jsonl)
+            self._last_hsg_metrics = metrics
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
@@ -1809,6 +1779,10 @@ class CustomDetectionTrainer(DetectionTrainer):
             "val_box_loss": metrics.get('val_box_loss'),
             "val_cls_loss": metrics.get('val_cls_loss'),
             "val_dfl_loss": metrics.get('val_dfl_loss'),
+            
+            # TGSR/HSG-DETR metrics (cached from _log_hsg_detr_metrics)
+            "hsg_detr": getattr(self, '_last_hsg_metrics', None),
+            "gradient_norms": getattr(self, '_last_hsg_metrics', {}).get('grad', {}) if hasattr(self, '_last_hsg_metrics') else None,
             
             # Validation metrics (mAP, precision, recall)
             "map50": metrics.get('map50'),

@@ -114,6 +114,10 @@ class SGTokenBlock(nn.Module):
         self.q_proj = nn.Linear(c2, c2, bias=False)
         self.k_proj = nn.Linear(c2, c2, bias=False)
         self.v_proj = nn.Linear(c2, c2, bias=False)
+        # Xavier init for attention stability (lower variance than kaiming)
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
         self._attn_scale = c2 ** -0.5
 
         # ── Channel Recalibration ──────────────────────────────────────────
@@ -121,6 +125,9 @@ class SGTokenBlock(nn.Module):
         r = max(1, c2 // 16)
         self.chan_fc1 = nn.Linear(c2, r, bias=True)
         self.chan_fc2 = nn.Linear(r, c2, bias=True)
+        # Small init for chan_fc1 to reduce warmup lag (chan_fc2 zero-init for identity)
+        nn.init.normal_(self.chan_fc1.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.chan_fc1.bias)
         # Zero-init: start as identity (chan_w ≈ 1.0 from 1 + tanh(0) = 1)
         nn.init.zeros_(self.chan_fc2.weight)
         nn.init.zeros_(self.chan_fc2.bias)
@@ -144,8 +151,8 @@ class SGTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 _make_gn(c2),
             )
-            # Multiplicative blend weight: sigmoid(0) = 0.5 default blend
-            self.local_blend = nn.Parameter(torch.zeros((1, c2, 1, 1)))
+            # Multiplicative blend: sigmoid(-3) ≈ 0.047 → minimal local contribution at init
+            self.local_blend = nn.Parameter(torch.full((1, c2, 1, 1), -3.0))
         else:
             self.local_dw = None
             self.local_blend = None
@@ -193,6 +200,16 @@ class SGTokenBlock(nn.Module):
         ]
         for k in keys_to_remove:
             state_dict.pop(k, None)
+        
+        # Warn about dropped keys for operational visibility
+        if keys_to_remove:
+            import warnings
+            short_names = list(set(k.split('.')[-2] for k in keys_to_remove))[:5]
+            warnings.warn(
+                f"TGSR checkpoint load: dropped {len(keys_to_remove)} legacy keys "
+                f"(architecture changed). Re-initializing: {short_names}...",
+                UserWarning,
+            )
         
         # Call parent to load remaining keys (saliency_head, saliency_mix, etc.)
         super()._load_from_state_dict(
@@ -413,7 +430,8 @@ class SGTokenBlock(nn.Module):
                 topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
                 k_actual = N
             else:
-                importance = self._compute_saliency(x_norm)
+                # Saliency from RAW features (preserve L2 magnitude info, pre_norm destroys it)
+                importance = self._compute_saliency(x.float())
                 if not torch.isfinite(importance).any():
                     importance = torch.ones_like(importance)
                 topk_idx = torch.topk(importance, k_actual, dim=1).indices
