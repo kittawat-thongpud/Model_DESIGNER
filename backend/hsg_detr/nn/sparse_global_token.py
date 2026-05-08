@@ -393,8 +393,9 @@ class SGTokenBlock(nn.Module):
         Learned spatial modulation via 1×1 depthwise conv.
         Near-identity init (mean=1.0, std=0.02) → starts ~pass-through with diversity.
         """
-        # Depthwise 1×1: per-channel spatial modulation
-        spatial_w = self.spatial_conv(x)  # [B, C, H, W]
+        # Depthwise 1×1: per-channel spatial modulation (FP32 for AMP compatibility)
+        with _fp32_context(x.device):
+            spatial_w = self.spatial_conv(x.float())  # [B, C, H, W]
         return spatial_w
 
     # ------------------------------------------------------------------ #
