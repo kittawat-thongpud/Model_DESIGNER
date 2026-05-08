@@ -75,22 +75,36 @@ def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
 
 class SGTokenBlock(nn.Module):
     """
-    Token-Guided Spatial Recalibration (TGSR) block.
+    Sparse-Spatial Residual (SSR) block — evolution of TGSR.
 
-    Multiplicative paradigm replaces additive+gamma to prevent structural bypass:
-      - Token selection via saliency (L2 + learned blend)
-      - k×k self-attention on selected tokens (sharp softmax, better gradients)
-      - Channel recalibration: multiplicative (optimizer cannot bypass)
-      - Spatial refinement: learned per-channel modulation
+    True hybrid-sparse design: sparse selector AND sparse output.
 
-    Zero-initialized output layers → starts as identity (chan_w ≈ 1.0)
+      1. Saliency selects top-k spatial positions (L2 + learned blend).
+      2. k×k self-attention computes refined embeddings for those k tokens.
+      3. **Scatter-back**: the (attended − selected) residual is written
+         back to the original k positions only — never broadcast densely.
+      4. A 3×3 depthwise mix (`local_mix`) spreads each sparse delta to
+         its immediate neighborhood. Zero-init → no spread at start.
+      5. Auxiliary per-channel layer-scale (range [0.9, 1.1]) — at most
+         ±10 % magnitude tweak; cannot zero or amplify, cannot bypass.
+
+    Equation:
+        out = (x · chan_w_narrow) + alpha · spread( scatter( delta_topk ) )
+
+    Sparse property: at any block, only ~9·k positions (k attended + 3×3
+    spread) receive a non-trivial spatial update; remaining positions
+    pass through with at most ±10 % per-channel scaling.
+
+    Identity at init: alpha_scale starts at 0 and chan_w starts at 1.0,
+    so out == x exactly until warmup begins.
     """
 
     VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
     DENSE_TOKEN_LIMIT: int = 4096
-    # Bound the per-step spatial residual so fp16/bf16 AMP can't blow up:
-    # the tanh saturates the delta inside [-SPATIAL_DELTA_BOUND, +SPATIAL_DELTA_BOUND]
-    # while staying smooth and gradient-friendly near zero (identity at init).
+    # Bound the scatter-back residual (attended − selected) via tanh so
+    # |delta| ≤ SPATIAL_DELTA_BOUND. Smooth near zero (identity at init),
+    # finite under fp16/bf16 AMP, and contains early-training overshoot
+    # before the optimizer has shaped q/k/v projections.
     SPATIAL_DELTA_BOUND: float = 1.0
 
     def __init__(
@@ -138,24 +152,24 @@ class SGTokenBlock(nn.Module):
         nn.init.xavier_uniform_(self.v_proj.weight)
         self._attn_scale = c2 ** -0.5
 
-        # ── Channel Recalibration ──────────────────────────────────────────
-        # Two-stage: compress → expand with non-linearity
+        # ── Auxiliary per-channel layer scale (range [0.9, 1.1]) ──────────
+        # Demoted from "channel gate" to a tight fine-tune in the SSR
+        # design — the dominant signal is the sparse scatter residual.
         r = max(1, c2 // 16)
         self.chan_fc1 = nn.Linear(c2, r, bias=True)
         self.chan_fc2 = nn.Linear(r, c2, bias=True)
-        # Small init for chan_fc1 to reduce warmup lag (chan_fc2 zero-init for identity)
         nn.init.normal_(self.chan_fc1.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.chan_fc1.bias)
-        # Zero-init: start as identity (chan_w ≈ 1.0 from 1 + tanh(0) = 1)
+        # Zero-init fc2 → starts as identity (0.9 + 0.2·sigmoid(0) = 1.0)
         nn.init.zeros_(self.chan_fc2.weight)
         nn.init.zeros_(self.chan_fc2.bias)
 
-        # ── Spatial Refinement ───────────────────────────────────────────
-        # 1×1 depthwise for per-channel spatial modulation
-        self.spatial_conv = nn.Conv2d(c2, c2, 1, groups=c2, bias=True)
-        # Near-identity with diversity (std=0.02 gives small variance for learning)
-        nn.init.normal_(self.spatial_conv.weight, mean=1.0, std=0.02)
-        nn.init.zeros_(self.spatial_conv.bias)
+        # ── Local Mix (3×3 depthwise) — spreads sparse scatter to neighbors ─
+        # Zero-init → at start no spread (sparse update stays at k positions
+        # exactly). Learns to expand each k-position spike into a 3×3 patch
+        # as needed. Costs ~9 ops/channel/position, depthwise so cheap.
+        self.local_mix = nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False)
+        nn.init.zeros_(self.local_mix.weight)
 
         # Alpha for blending channel vs spatial (set by trainer during warmup)
         self.register_buffer("alpha_scale", torch.tensor(0.0), persistent=True)
@@ -209,6 +223,7 @@ class SGTokenBlock(nn.Module):
         legacy_keys_to_drop = [
             'gamma', 'out_proj', 'local_gamma', 'local_dw',
             'q_proj', 'k_proj', 'v_proj',  # Conv2d weight shape [C,C,1,1] ≠ Linear [C,C]
+            'spatial_conv',  # removed in SSR rewrite (replaced by local_mix 3×3)
         ]
         keys_to_remove = [
             k for k in list(state_dict.keys())
@@ -378,58 +393,36 @@ class SGTokenBlock(nn.Module):
         x: torch.Tensor,         # [B, C, H, W]
     ) -> torch.Tensor:
         """
-        Multiplicative channel recalibration from attended tokens.
-        
-        Global descriptor (mean+max pool) → FC bottleneck → channel weights.
-        Zero-init FC2 → starts as identity (chan_w ≈ 1.0)
-        All math in FP32 for AMP stability.
+        Auxiliary per-channel layer scale (range [0.9, 1.1]).
+
+        In the SSR design the dominant signal is the sparse scatter
+        residual; this layer is a small fine-tune, NOT a gate. It can
+        adjust per-channel magnitude by at most ±10 % — it cannot zero
+        features, cannot 2× amplify, and cannot act as a learnable
+        killswitch. Identity at init via zero-init `chan_fc2`.
         """
         B, C, H, W = x.shape
 
-        # Global descriptor from attended tokens (FP32 for stability).
-        # Sparse path captures the high-saliency tokens via attention.
+        # Sparse + dense ctx: top-k attended tokens contribute fine detail,
+        # full-map mean stabilises gradient flow through every position.
         attended_f = attended.float()
         ctx_sparse = attended_f.mean(dim=1) + attended_f.max(dim=1).values  # [B, C]
-        # Dense path: cheap C-dim descriptor over the full feature map.
-        # This gives a non-zero gradient through every (h, w) position so
-        # the channel gate is never starved when top-k drops them, which
-        # was a major contributor to slow convergence.
-        ctx_dense = x.float().mean(dim=(2, 3))  # [B, C]
-        ctx = ctx_sparse + ctx_dense  # [B, C]
+        ctx_dense = x.float().mean(dim=(2, 3))                              # [B, C]
+        ctx = ctx_sparse + ctx_dense
 
-        # FC bottleneck: C → r → C (FP32)
-        chan_w = self.chan_fc1(ctx)   # [B, r]
+        chan_w = self.chan_fc1(ctx)
         chan_w = F.silu(chan_w)
-        chan_w = self.chan_fc2(chan_w)  # [B, C]
-        
-        # 0.5 + sigmoid: range (0.5, 1.5), zero-init → starts at 1.0 (identity).
-        # The (0, 2) range from `1 + tanh` had an absorbing endpoint at 0 that
-        # the optimizer was driving chan_w into during warmup (observed
-        # chan_w_mean ≈ 0.04, deviation ≈ 0.95 at epoch 9). That collapse
-        # multiplicatively zeroed the SGB output and killed gradient flow
-        # through the encoder. The (0.5, 1.5) range cannot zero features and
-        # cannot 2× amplify them — it forces the gate to act as a true
-        # per-channel modulation rather than a learnable killswitch.
-        chan_w = 0.5 + torch.sigmoid(chan_w)
-        
-        # Store deviation from identity for metrics (0.0 = identity, >0 = learning)
-        self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
-        
-        # Multiplicative recalibration (broadcast to spatial)
-        chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
-        return x * chan_w.to(dtype=x.dtype)
+        chan_w = self.chan_fc2(chan_w)
 
-    def _spatial_refinement(
-        self,
-        x: torch.Tensor,  # [B, C, H, W]
-    ) -> torch.Tensor:
-        """
-        Learned spatial modulation via 1×1 depthwise conv.
-        Near-identity init (mean=1.0, std=0.02) → starts ~pass-through with diversity.
-        """
-        # Depthwise 1×1: per-channel spatial modulation
-        spatial_w = self.spatial_conv(x)  # [B, C, H, W]
-        return spatial_w
+        # Range [0.9, 1.1]: 0.9 + 0.2·sigmoid(0) = 1.0 at init.
+        # Tight bound enforces "fine-tune, not gate" semantics.
+        chan_w = 0.9 + 0.2 * torch.sigmoid(chan_w)
+
+        # Deviation from identity (0.0 = identity, max 0.1 by construction)
+        self.last_gate = float((chan_w.detach() - 1.0).abs().mean().item())
+
+        chan_w = chan_w.unsqueeze(-1).unsqueeze(-1)
+        return x * chan_w.to(dtype=x.dtype)
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -437,75 +430,98 @@ class SGTokenBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        TGSR forward: multiplicative paradigm (non-bypassable).
-        
+        Sparse-Spatial Residual (SSR) forward.
+
         Flow:
-          1. Token selection (saliency)
-          2. k×k self-attention on selected
-          3. Channel recalibration (multiplicative, dense output)
-          4. Spatial refinement (blended by alpha_scale)
+          1. Saliency → top-k token indices.
+          2. Gather, k×k self-attention on selected tokens.
+          3. SCATTER-BACK: tanh-bounded residual (attended − selected) is
+             written at the k original positions only — rest of the map
+             stays zero in delta.
+          4. 3×3 depthwise `local_mix` (zero-init) spreads each sparse
+             delta into its 3×3 neighborhood.
+          5. Apply alpha-scheduled sparse residual:
+                out = (x · chan_w_narrow) + alpha · spread(scatter(delta))
+          6. (Hybrid mode) blend with optional dense local_dw branch.
+
+        Identity at init: alpha_scale=0, chan_w=1.0, local_mix=0 →
+        out == x exactly until warmup begins. No dense gate output —
+        non-attended positions only see the ±10 % chan_w fine-tune.
         """
         self._ensure_runtime_attrs()
         B, C, H, W = x.shape
         N = int(H) * int(W)
-        
+
         k_actual = self._select_k(N)
         self.last_N = N
         self.last_k = k_actual
         self.last_mode = self.mode
-        
+
         with _fp32_context(x.device):
             # ── 1. Normalize and compute saliency ─────────────────────────
             x_norm = self.pre_norm(x.float())
-            
+
             if self.mode == "dense":
-                # Use all tokens
                 importance = None
                 topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
                 k_actual = N
             else:
-                # Saliency from RAW features (preserve L2 magnitude info, pre_norm destroys it)
+                # Saliency from RAW features (preserve L2 magnitude info,
+                # pre_norm destroys it).
                 importance = self._compute_saliency(x.float())
                 if not torch.isfinite(importance).any():
                     importance = torch.ones_like(importance)
                 topk_idx = torch.topk(importance, k_actual, dim=1).indices
                 topk_idx = torch.clamp(topk_idx, 0, N - 1)
-            
+
             topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
             self._store_debug(topk_idx, importance)
-            
-            # ── 2. Gather selected tokens ────────────────────────────────
-            x_flat = x_norm.view(B, C, N)  # [B, C, N]
-            idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
-            selected = torch.gather(x_flat, 2, idx_exp)  # [B, C, k]
-            selected = selected.transpose(1, 2)  # [B, k, C]
-            
-            # ── 3. k×k self-attention ───────────────────────────────────
-            attended = self._k_times_k_attention(selected)  # [B, k, C]
-            
-            # ── 4. Channel recalibration (multiplicative) ───────────────
-            x_recal = self._channel_recalibration(attended, x)  # [B, C, H, W]
-            
-            # ── 5. Spatial refinement (blended by alpha) ───────────────
-            # Always compute spatial path (no if branch) to ensure gradient flow
-            # alpha=0 → output = x_recal (spatial contribution zeroed).
-            # The raw delta (spatial_w - x_recal) is unbounded; squash it via
-            # tanh so that |delta| ≤ SPATIAL_DELTA_BOUND. This keeps the spatial
-            # update inside fp16/bf16 dynamic range during AMP and prevents
-            # early-training overshoot from a poorly initialised spatial_conv.
-            alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
-            spatial_w = self._spatial_refinement(x_recal)
+
+            # ── 2. Gather selected tokens (in normalized space) ──────────
+            x_flat_norm = x_norm.view(B, C, N)
+            idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)        # [B, C, k]
+            selected = torch.gather(x_flat_norm, 2, idx_exp)         # [B, C, k]
+            selected = selected.transpose(1, 2).contiguous()         # [B, k, C]
+
+            # ── 3. k×k self-attention ─────────────────────────────────
+            attended = self._k_times_k_attention(selected)           # [B, k, C]
+
+            # ── 4. SCATTER-BACK as bounded sparse residual ──────────────
+            # attended and selected are both in pre_norm/LN space; their
+            # difference is the per-token correction the attention block
+            # learned. Tanh-bound for AMP/early-train safety.
             bound = float(self.SPATIAL_DELTA_BOUND)
-            delta = bound * torch.tanh((spatial_w - x_recal) / bound)
-            out = x_recal + alpha * delta
-            
-            # ── 6. Hybrid local path (multiplicative blend, non-bypassable) ─
+            delta_kc = bound * torch.tanh(
+                (attended - selected) / bound
+            )                                                        # [B, k, C]
+            delta_ck = delta_kc.transpose(1, 2).contiguous()         # [B, C, k]
+
+            # Build dense delta tensor: zeros everywhere except top-k positions
+            delta_flat = torch.zeros(
+                B, C, N, dtype=delta_ck.dtype, device=delta_ck.device,
+            )
+            delta_flat.scatter_(2, idx_exp, delta_ck)
+            delta_dense = delta_flat.view(B, C, H, W)
+
+            # ── 5. Local 3×3 spread (zero-init: identity at start) ──────
+            # local_mix turns each k-position spike into a 3×3 patch as it
+            # learns. Output remains effectively sparse: ≤ 9·k non-zero
+            # positions per block, vs. all H·W in a dense gate.
+            delta_dense = delta_dense + self.local_mix(delta_dense)
+
+            # ── 6. Auxiliary per-channel layer scale (range [0.9, 1.1]) ─
+            x_recal = self._channel_recalibration(attended, x)        # [B,C,H,W]
+
+            # ── 7. Apply alpha-scheduled sparse residual ────────────────
+            alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
+            out = x_recal + alpha * delta_dense.to(dtype=x.dtype)
+
+            # ── 8. Hybrid local path (optional, unchanged) ──────────────
             if self.mode == "hybrid" and self.local_dw is not None:
                 local_feat = self.local_dw(x_norm)
-                # Multiplicative blend: sigmoid(0) = 0.5 default
                 blend = torch.sigmoid(self.local_blend).to(dtype=x.dtype)
                 out = out * (1.0 - blend) + local_feat.to(dtype=x.dtype) * blend
-        
+
         return out.to(dtype=x.dtype)
 
 
