@@ -770,7 +770,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         finally:
             done.set()
 
-        self._disable_amp_for_hsg_detr()
+        # Auto-disable removed - AMP enabled by default for HSG-DETR
         self._disable_deterministic_for_hsg_detr()
         self.log(
             f"Training setup complete - {self.train_loader.dataset.ni} train images, "
