@@ -74,6 +74,10 @@ class SGTokenBlock(nn.Module):
 
     VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
     DENSE_TOKEN_LIMIT: int = 4096
+    # Bound the per-step spatial residual so fp16/bf16 AMP can't blow up:
+    # the tanh saturates the delta inside [-SPATIAL_DELTA_BOUND, +SPATIAL_DELTA_BOUND]
+    # while staying smooth and gradient-friendly near zero (identity at init).
+    SPATIAL_DELTA_BOUND: float = 1.0
 
     def __init__(
         self,
@@ -338,10 +342,14 @@ class SGTokenBlock(nn.Module):
         k_ = self.k_proj(selected_n)  # [B, k, C]
         v = self.v_proj(selected_n)   # [B, k, C]
         
-        # k×k attention (sharp softmax, better than k×N flat softmax)
+        # k×k attention (sharp softmax, better than k×N flat softmax).
+        # Tighter logit clamp (±30) keeps softmax in a regime where it stays
+        # finite under fp16 / bf16 too — the prior ±80 only made sense in
+        # FP32. After the subtract-max trick the typical logit range is
+        # already <= 0, so −30 clipping costs no expressive power.
         attn = torch.bmm(q, k_.transpose(1, 2)) * float(self._attn_scale)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = attn.clamp(min=-80.0, max=80.0)
+        attn = attn.clamp(min=-30.0, max=30.0)
         attn = attn - attn.max(dim=-1, keepdim=True).values
         attn = torch.softmax(attn, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
@@ -363,7 +371,7 @@ class SGTokenBlock(nn.Module):
         All math in FP32 for AMP stability.
         """
         B, C, H, W = x.shape
-        
+
         # Global descriptor from attended tokens (FP32 for stability)
         attended_f = attended.float()
         ctx_mean = attended_f.mean(dim=1)   # [B, C]
@@ -454,10 +462,16 @@ class SGTokenBlock(nn.Module):
             
             # ── 5. Spatial refinement (blended by alpha) ───────────────
             # Always compute spatial path (no if branch) to ensure gradient flow
-            # alpha=0 → output = x_recal (spatial contribution zeroed)
+            # alpha=0 → output = x_recal (spatial contribution zeroed).
+            # The raw delta (spatial_w - x_recal) is unbounded; squash it via
+            # tanh so that |delta| ≤ SPATIAL_DELTA_BOUND. This keeps the spatial
+            # update inside fp16/bf16 dynamic range during AMP and prevents
+            # early-training overshoot from a poorly initialised spatial_conv.
             alpha = self.alpha_scale.to(dtype=x.dtype, device=x.device)
             spatial_w = self._spatial_refinement(x_recal)
-            out = x_recal + alpha * (spatial_w - x_recal)
+            bound = float(self.SPATIAL_DELTA_BOUND)
+            delta = bound * torch.tanh((spatial_w - x_recal) / bound)
+            out = x_recal + alpha * delta
             
             # ── 6. Hybrid local path (multiplicative blend, non-bypassable) ─
             if self.mode == "hybrid" and self.local_dw is not None:
