@@ -41,7 +41,8 @@ export const useJobsStore = create<JobsState>((set, get) => ({
     try {
       const jobs = await api.listJobs();
       set({ jobs, lastFetched: Date.now(), loading: false });
-    } catch {
+    } catch (error) {
+      console.error('Failed to load jobs', error);
       set({ loading: false });
     }
   },

@@ -40,7 +40,8 @@ export const useWeightsStore = create<WeightsState>((set, get) => ({
     try {
       const weights = await api.listWeights(modelId ?? undefined);
       set({ weights, lastFetched: Date.now(), loading: false });
-    } catch {
+    } catch (error) {
+      console.error('Failed to load weights', error);
       set({ loading: false });
     }
   },

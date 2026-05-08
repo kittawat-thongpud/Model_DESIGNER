@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from copy import deepcopy
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
@@ -84,7 +85,7 @@ class BaseJsonStorage:
         with self._lock:
             if record_id in self._cache:
                 self._cache.move_to_end(record_id)
-            self._cache[record_id] = data
+            self._cache[record_id] = deepcopy(data)
             self._cache_mtimes[record_id] = mtime
             while len(self._cache) > self._cache_max:
                 old_record_id, _ = self._cache.popitem(last=False)
@@ -103,7 +104,7 @@ class BaseJsonStorage:
                     self._cache_mtimes.pop(record_id, None)
                     return None
                 self._cache.move_to_end(record_id)
-                return self._cache[record_id]
+                return deepcopy(self._cache[record_id])
         return None
 
     def _cache_remove(self, record_id: str) -> None:
@@ -118,25 +119,8 @@ class BaseJsonStorage:
 
     # ── Index management ─────────────────────────────────────────────────────
 
-    def _load_index(self) -> dict[str, dict]:
-        """Load or rebuild the index. Index maps record_id → summary metadata."""
-        if self._index is not None:
-            return self._index
-
-        if self._index_path.exists():
-            try:
-                with open(self._index_path) as f:
-                    self._index = json.load(f)
-                return self._index
-            except Exception:
-                pass
-
-        # Rebuild index from disk
-        self._rebuild_index()
-        return self._index  # type: ignore[return-value]
-
-    def _rebuild_index(self) -> None:
-        """Scan all files and rebuild the index."""
+    def _scan_index(self) -> dict[str, dict]:
+        """Scan record files on disk and return a fresh record_id → metadata index."""
         idx: dict[str, dict] = {}
         if self.folder_mode:
             # Folder-per-record: scan subdirectories
@@ -163,7 +147,51 @@ class BaseJsonStorage:
                     idx[record_id] = {"mtime": mtime}
                 except Exception:
                     continue
-        self._index = idx
+        return idx
+
+    def _index_matches_disk(self, idx: dict[str, dict]) -> bool:
+        """Return True when the cached index still matches records on disk."""
+        try:
+            disk_idx = self._scan_index()
+        except Exception:
+            # If scanning fails, keep the loaded index rather than breaking reads.
+            return True
+
+        if set(idx.keys()) != set(disk_idx.keys()):
+            return False
+
+        for record_id, meta in disk_idx.items():
+            try:
+                if float(idx.get(record_id, {}).get("mtime", 0)) != float(meta.get("mtime", 0)):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _load_index(self) -> dict[str, dict]:
+        """Load or rebuild the index. Index maps record_id → summary metadata."""
+        if self._index is not None:
+            if not self._index_matches_disk(self._index):
+                self._rebuild_index()
+            return self._index
+
+        if self._index_path.exists():
+            try:
+                with open(self._index_path) as f:
+                    self._index = json.load(f)
+                if not self._index_matches_disk(self._index):
+                    self._rebuild_index()
+                return self._index
+            except Exception:
+                pass
+
+        # Rebuild index from disk
+        self._rebuild_index()
+        return self._index  # type: ignore[return-value]
+
+    def _rebuild_index(self) -> None:
+        """Scan all files and rebuild the index."""
+        self._index = self._scan_index()
         self._save_index()
 
     def _save_index(self) -> None:
@@ -216,7 +244,7 @@ class BaseJsonStorage:
         with open(path) as f:
             data = json.load(f)
         self._cache_put(record_id, data)
-        return data
+        return deepcopy(data)
 
     def list_all(self, **filters: Any) -> list[dict]:
         """

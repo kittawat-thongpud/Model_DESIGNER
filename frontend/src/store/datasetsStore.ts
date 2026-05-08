@@ -34,7 +34,8 @@ export const useDatasetsStore = create<DatasetsState>((set, get) => ({
     try {
       const datasets = await api.listDatasets();
       set({ datasets, lastFetched: Date.now(), loading: false });
-    } catch {
+    } catch (error) {
+      console.error('Failed to load datasets', error);
       set({ loading: false });
     }
   },
