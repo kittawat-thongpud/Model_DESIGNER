@@ -406,6 +406,10 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._hsg_alpha_last: float | None = None
         self._hsg_alpha_resume_base: float | None = None
         self._hsg_alpha_resume_epoch: int | None = None
+        
+        # TGSR metrics caches for extended_metrics.jsonl persistence
+        self._last_hsg_metrics: dict[str, float] | None = None
+        self._last_grad_norms: dict[str, float] = {}
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
@@ -1102,29 +1106,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                 metrics['decoder/alpha'] = float(alpha.detach())
             metrics['decoder/num_queries'] = int(getattr(dec, 'num_queries', 0))
 
-        # ── Gradient norms ───────────────────────────────────────────────
-        if hasattr(self, 'optimizer') and self.optimizer:
-            grad_norms: dict[str, float] = {}
-            for n, p in model.named_parameters():
-                if p.grad is None:
-                    continue
-                gn = float(p.grad.norm())
-                if 'SGTokenBlock' in n:
-                    # TGSR parameters: chan_fc1, chan_fc2, spatial_conv, q/k/v_proj
-                    if any(x in n for x in ['chan_fc', 'spatial_conv']):
-                        grad_norms['sgb_recal'] = max(grad_norms.get('sgb_recal', 0), gn)
-                    elif any(x in n for x in ['q_proj', 'k_proj', 'v_proj']):
-                        grad_norms['sgb_attn'] = max(grad_norms.get('sgb_attn', 0), gn)
-                    else:
-                        grad_norms['sgb'] = max(grad_norms.get('sgb', 0), gn)
-                elif 'decoder' in n.lower():
-                    grad_norms['decoder'] = max(grad_norms.get('decoder', 0), gn)
-                elif 'backbone' in n.lower():
-                    grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
-                elif 'neck' in n.lower() or 'head' in n.lower():
-                    grad_norms['neck'] = max(grad_norms.get('neck', 0), gn)
-            for k, v in grad_norms.items():
-                metrics[f'grad/{k}_norm'] = v
+        # ── Gradient norms (from cached _last_grad_norms) ───────────────
+        # Cached in optimizer_step() before zero_grad clears gradients
+        for k, v in getattr(self, '_last_grad_norms', {}).items():
+            metrics[f'grad/{k}_norm'] = v
 
         # ── NaN/Inf flags ────────────────────────────────────────────────
         has_nan = False
@@ -1171,6 +1156,8 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        # Cache grad norms BEFORE zero_grad clears them (for _log_hsg_detr_metrics)
+        self._cache_last_step_grad_norms()
         self.optimizer.zero_grad()
         self._nonfinite_grad_steps = 0
         self._assert_batchnorm_buffers_finite("before EMA update")
@@ -1217,6 +1204,40 @@ class CustomDetectionTrainer(DetectionTrainer):
             return
 
         raise NaNLossError(reason)
+
+    def _cache_last_step_grad_norms(self) -> None:
+        """Cache gradient norms before optimizer.zero_grad clears them.
+        
+        Called in optimizer_step() before zero_grad.
+        These cached values are used by _log_hsg_detr_metrics at epoch end.
+        """
+        try:
+            from ultralytics.utils.torch_utils import unwrap_model
+            model = unwrap_model(self.model)
+        except Exception:
+            return
+        
+        grad_norms: dict[str, float] = {}
+        for n, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            gn = float(p.grad.norm())
+            if 'SGTokenBlock' in n or 'sg_token' in n.lower():
+                # TGSR parameters: chan_fc, spatial_conv, q/k/v_proj
+                if any(x in n for x in ['chan_fc', 'spatial_conv']):
+                    grad_norms['sgb_recal'] = max(grad_norms.get('sgb_recal', 0), gn)
+                elif any(x in n for x in ['q_proj', 'k_proj', 'v_proj']):
+                    grad_norms['sgb_attn'] = max(grad_norms.get('sgb_attn', 0), gn)
+                else:
+                    grad_norms['sgb'] = max(grad_norms.get('sgb', 0), gn)
+            elif 'decoder' in n.lower():
+                grad_norms['decoder'] = max(grad_norms.get('decoder', 0), gn)
+            elif 'backbone' in n.lower():
+                grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
+            elif 'neck' in n.lower() or 'head' in n.lower():
+                grad_norms['neck'] = max(grad_norms.get('neck', 0), gn)
+        
+        self._last_grad_norms = grad_norms
 
     def _collect_nonfinite_grad_diagnostics(self, limit: int = 12) -> list[dict[str, Any]]:
         """Summarize the first parameters whose gradients contain NaN/Inf."""
@@ -1765,6 +1786,15 @@ class CustomDetectionTrainer(DetectionTrainer):
         job_dir = JOBS_DIR / self.job_id
         extended_metrics_file = job_dir / "extended_metrics.jsonl"
         
+        # Prepare TGSR metrics from cache
+        _hsg = getattr(self, '_last_hsg_metrics', None) or {}
+        # Filter grad/ prefixed keys and strip prefix for cleaner JSON
+        _grad_norms = {
+            k.replace('grad/', '').replace('_norm', ''): v
+            for k, v in _hsg.items()
+            if k.startswith('grad/') and k.endswith('_norm')
+        } or None  # None so it gets filtered if empty
+        
         # Build comprehensive epoch data with all metrics
         epoch_data = {
             "epoch": self.epoch + 1,
@@ -1781,8 +1811,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             "val_dfl_loss": metrics.get('val_dfl_loss'),
             
             # TGSR/HSG-DETR metrics (cached from _log_hsg_detr_metrics)
-            "hsg_detr": getattr(self, '_last_hsg_metrics', None),
-            "gradient_norms": getattr(self, '_last_hsg_metrics', {}).get('grad', {}) if hasattr(self, '_last_hsg_metrics') else None,
+            "hsg_detr": _hsg or None,
+            "gradient_norms": _grad_norms,
             
             # Validation metrics (mAP, precision, recall)
             "map50": metrics.get('map50'),

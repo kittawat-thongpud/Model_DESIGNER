@@ -151,7 +151,7 @@ class SGTokenBlock(nn.Module):
                 nn.Conv2d(c2, c2, 1, bias=False),
                 _make_gn(c2),
             )
-            # Multiplicative blend: sigmoid(-3) ≈ 0.047 → minimal local contribution at init
+            # Multiplicative blend: sigmoid(-3) ≈ 0.047 default (minimal local contribution at init)
             self.local_blend = nn.Parameter(torch.full((1, c2, 1, 1), -3.0))
         else:
             self.local_dw = None
