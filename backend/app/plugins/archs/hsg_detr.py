@@ -62,14 +62,17 @@ class HSGDetRPlugin(ModelArchPlugin):
     @property
     def description(self) -> str:
         return (
-            "HSG-DETR — TGSR (Token-Guided Spatial Recalibration) SGB encoder "
-            "feeding an RT-DETR decoder. Saliency top-k drives a k×k self-"
-            "attention head whose output multiplicatively recalibrates the "
-            "feature map: a tanh-bounded channel gate (always active, fast "
-            "warmup) and an alpha-scheduled spatial refinement. The "
-            "multiplicative paradigm has no `gamma → 0` bypass and stays in a "
-            "stable AMP/bf16 range. Scratch training recommended; legacy "
-            "additive/gamma checkpoints are auto-stripped on load."
+            "HSG-DETR — Sparse-Spatial Residual (SSR) SGB encoder feeding an "
+            "RT-DETR decoder. Saliency top-k drives a k×k self-attention head "
+            "whose (attended − selected) residual is **scatter-back**ed to "
+            "the original k positions only and spread to a 3×3 neighborhood "
+            "by a zero-init depthwise mix — a truly sparse spatial output, "
+            "not a dense channel gate. A tight per-channel layer-scale "
+            "(range [0.9, 1.1]) provides ±10 % auxiliary fine-tune. Sparse "
+            "at P3 / P4 / P5: ≤ 9·k non-zero positions per block. Identity "
+            "at init (alpha=0, local_mix=0, chan_w=1.0). AMP/bf16 native; "
+            "legacy TGSR / additive / gamma checkpoints are auto-stripped "
+            "on load."
         )
 
     def yaml_path(self) -> Path:
