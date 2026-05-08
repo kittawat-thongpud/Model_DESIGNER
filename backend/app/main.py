@@ -113,7 +113,7 @@ class SystemLogMiddleware(BaseHTTPMiddleware):
         duration_ms = round((time.time() - start) * 1000, 1)
 
         if path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private, max-age=0"
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
             if "etag" in response.headers:
