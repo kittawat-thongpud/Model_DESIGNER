@@ -372,12 +372,17 @@ class SGTokenBlock(nn.Module):
         """
         B, C, H, W = x.shape
 
-        # Global descriptor from attended tokens (FP32 for stability)
+        # Global descriptor from attended tokens (FP32 for stability).
+        # Sparse path captures the high-saliency tokens via attention.
         attended_f = attended.float()
-        ctx_mean = attended_f.mean(dim=1)   # [B, C]
-        ctx_max = attended_f.max(dim=1).values  # [B, C]
-        ctx = ctx_mean + ctx_max  # [B, C]
-        
+        ctx_sparse = attended_f.mean(dim=1) + attended_f.max(dim=1).values  # [B, C]
+        # Dense path: cheap C-dim descriptor over the full feature map.
+        # This gives a non-zero gradient through every (h, w) position so
+        # the channel gate is never starved when top-k drops them, which
+        # was a major contributor to slow convergence.
+        ctx_dense = x.float().mean(dim=(2, 3))  # [B, C]
+        ctx = ctx_sparse + ctx_dense  # [B, C]
+
         # FC bottleneck: C → r → C (FP32)
         chan_w = self.chan_fc1(ctx)   # [B, r]
         chan_w = F.silu(chan_w)
