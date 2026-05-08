@@ -702,8 +702,8 @@ def start_training(
 
     _reconcile_training_queue()
 
-    # Extract model scale from config for VRAM estimation
-    model_scale = config.get("scale", "n")
+    # Extract model scale (use passed value, fallback to config, default 'n')
+    model_scale = model_scale or config.get("scale") or "n"
     device = config.get("device", "")
 
     # Enqueue training task — respects VRAM-aware admission
@@ -885,7 +885,8 @@ def _restart_job(job_id: str, config: dict) -> None:
 
     # Extract model scale and device for VRAM estimation
     config = job.get("config", {})
-    model_scale = config.get("scale", "n")
+    # Use saved model_scale from job record (set during initial start_training)
+    model_scale = str(job.get("model_scale") or "").strip().lower() or config.get("scale") or "n"
     device = config.get("device", "")
 
     queue_task_id, admitted, admission_msg = task_queue.enqueue(
