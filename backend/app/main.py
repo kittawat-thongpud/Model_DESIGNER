@@ -76,6 +76,28 @@ class SafeJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
+# ─── Disable Conditional Request Middleware ─────────────────────────────────────
+
+class DisableConditionalRequestMiddleware(BaseHTTPMiddleware):
+    """Strip If-None-Match and If-Modified-Since headers to prevent 304 responses."""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Remove conditional request headers to force full response
+        headers = dict(request.headers)
+        headers.pop('if-none-match', None)
+        headers.pop('if-modified-since', None)
+        headers.pop('if-range', None)
+        
+        # Create new request with modified headers
+        scope = request.scope
+        scope['headers'] = [
+            (k.lower().encode(), v.encode())
+            for k, v in headers.items()
+        ]
+        
+        return await call_next(request)
+
+
 # ─── System Logging Middleware ────────────────────────────────────────────────
 
 class SystemLogMiddleware(BaseHTTPMiddleware):
@@ -149,6 +171,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Middleware ────────────────────────────────────────────────────────────
+    application.add_middleware(DisableConditionalRequestMiddleware)
     application.add_middleware(SystemLogMiddleware)
     application.add_middleware(
         CORSMiddleware,
