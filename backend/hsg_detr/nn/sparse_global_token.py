@@ -329,9 +329,9 @@ class SGTokenBlock(nn.Module):
         """
         B, k, C = selected.shape
         
-        # Pre-LN in FP32
+        # Pre-LN (match norm's dtype to avoid mixed dtype error)
         orig_dtype = selected.dtype
-        selected_n = self.norm(selected.float())
+        selected_n = self.norm(selected.to(self.norm.weight.dtype))
         
         # Linear projections
         q = self.q_proj(selected_n)  # [B, k, C]
@@ -436,7 +436,8 @@ class SGTokenBlock(nn.Module):
         
         with _fp32_context(x.device):
             # ── 1. Normalize and compute saliency ─────────────────────────
-            x_norm = self.pre_norm(x.float())
+            # Use pre_norm's dtype to avoid mixed dtype error during AMP
+            x_norm = self.pre_norm(x.to(self.pre_norm.weight.dtype))
             
             if self.mode == "dense":
                 # Use all tokens
