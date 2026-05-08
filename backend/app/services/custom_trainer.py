@@ -635,6 +635,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         # on fragile string paths emitted by Ultralytics parse_model.
         sgb_roles: dict[int, str] = {}
         decoder_ids: set[int] = set()
+
         for module in model.modules():
             cls_name = module.__class__.__name__
             if cls_name == "SGTokenBlock":
@@ -1233,6 +1234,28 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         sgb_roles: dict[int, str] = {}
         decoder_ids: set[int] = set()
+        region_roles: dict[int, str] = {}
+
+        # HSG-DETR parsed modules are named model.0, model.1, ... rather than
+        # backbone.* / neck.*. Use YAML layer boundaries for persistent debug
+        # metrics so Job Detail can show backbone and neck gradient health.
+        try:
+            backbone_count = len(getattr(model, "yaml", {}).get("backbone", []))
+        except Exception:
+            backbone_count = 0
+        parsed_layers = getattr(model, "model", None)
+        if isinstance(parsed_layers, torch.nn.Sequential) or isinstance(parsed_layers, torch.nn.ModuleList):
+            for layer_idx, module in enumerate(parsed_layers):
+                cls_name = module.__class__.__name__
+                if cls_name == "RTDETRDecoderSGB":
+                    region = "decoder"
+                elif backbone_count and layer_idx < backbone_count:
+                    region = "backbone"
+                else:
+                    region = "neck"
+                for _, param in module.named_parameters(recurse=True):
+                    region_roles.setdefault(id(param), region)
+
         for module in model.modules():
             cls_name = module.__class__.__name__
             if cls_name == "SGTokenBlock":
@@ -1259,6 +1282,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                 grad_norms[role] = max(grad_norms.get(role, 0), gn)
             elif id(p) in decoder_ids or 'decoder' in n.lower():
                 grad_norms['decoder'] = max(grad_norms.get('decoder', 0), gn)
+            elif region_roles.get(id(p)) == 'backbone':
+                grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
+            elif region_roles.get(id(p)) == 'neck':
+                grad_norms['neck'] = max(grad_norms.get('neck', 0), gn)
             elif 'backbone' in n.lower():
                 grad_norms['backbone'] = max(grad_norms.get('backbone', 0), gn)
             elif 'neck' in n.lower() or 'head' in n.lower():

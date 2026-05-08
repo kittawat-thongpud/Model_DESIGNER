@@ -135,7 +135,7 @@ def test_model_forward(torch, device: str, imgsz: int) -> None:
     print(f"PASS blocks={len(sgb_blocks)} output_shape={tuple(tensor_out.shape)}.")
 
 
-def test_optimizer_groups(torch, device: str) -> None:
+def test_optimizer_groups_and_grad_regions(torch, device: str, imgsz: int) -> None:
     import hsg_detr  # noqa: F401 - registers HSG-DETR modules with Ultralytics
     from ultralytics import RTDETR
     from app.services.custom_trainer import CustomDetectionTrainer
@@ -160,6 +160,23 @@ def test_optimizer_groups(torch, device: str) -> None:
     _require(gamma_group["weight_decay"] == 0.0, "sgb_gamma must not use weight decay")
     _require(abs(float(sparse_group["lr"]) - 1.5e-3) < 1e-12, "sgb_sparse lr multiplier should be 1.5x")
     print(f"PASS optimizer groups={sizes}.")
+
+    _print_step("Custom trainer grad region diagnostics")
+    trainer.model = model
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    x = torch.randn(1, 3, imgsz, imgsz, device=device)
+    out = model(x)
+    tensor_out = out[0] if isinstance(out, (tuple, list)) else out
+    loss = tensor_out.float().sum()
+    loss.backward()
+    trainer._cache_last_step_grad_norms()
+    norms = getattr(trainer, "_last_grad_norms", {})
+
+    for expected in ("backbone", "neck", "decoder", "sgb_sparse", "sgb_gamma"):
+        _require(expected in norms, f"missing grad diagnostic region: {expected}; got {norms}")
+        _require(float(norms[expected]) > 0.0, f"grad diagnostic region is zero: {expected}; got {norms}")
+    print(f"PASS grad diagnostics={norms}.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,7 +214,7 @@ def main() -> int:
         if not args.skip_model:
             test_model_forward(torch, args.device, args.imgsz)
         if not args.skip_trainer:
-            test_optimizer_groups(torch, args.device)
+            test_optimizer_groups_and_grad_regions(torch, args.device, args.imgsz)
     except Exception:
         traceback.print_exc()
         return 1

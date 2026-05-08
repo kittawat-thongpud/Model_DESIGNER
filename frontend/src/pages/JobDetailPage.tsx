@@ -47,6 +47,37 @@ const LOG_INTERVAL_OPTIONS = [
 
 const LIVE_JOB_STATUSES = new Set(['pending', 'running']);
 
+const mergeHsgMetricsEntries = (
+  current: HsgDetrMetricsEntry[],
+  incoming: HsgDetrMetricsEntry[],
+): HsgDetrMetricsEntry[] => {
+  const merged = new Map<number, HsgDetrMetricsEntry>();
+  for (const entry of current) {
+    if (typeof entry.epoch === 'number') {
+      merged.set(entry.epoch, entry);
+    }
+  }
+  for (const entry of incoming) {
+    if (typeof entry.epoch !== 'number') continue;
+    const existing = merged.get(entry.epoch) || { epoch: entry.epoch };
+    merged.set(entry.epoch, { ...existing, ...entry, epoch: entry.epoch });
+  }
+  return Array.from(merged.values()).sort((a, b) => a.epoch - b.epoch);
+};
+
+const hsgMetricsFromHistory = (history: EpochMetrics[] | undefined): HsgDetrMetricsEntry[] => {
+  if (!history || history.length === 0) return [];
+  const entries: HsgDetrMetricsEntry[] = [];
+  for (const h of history) {
+    const epoch = h.epoch;
+    const hsgData = (h as any).hsg_detr as Record<string, number> | undefined;
+    if (typeof epoch === 'number' && hsgData) {
+      entries.push({ ...hsgData, epoch });
+    }
+  }
+  return entries;
+};
+
 const StatBadge = ({ label, value, color, subtext }: { label: string, value: string | number, color: string, subtext?: string }) => (
   <div className="bg-slate-900 px-4 py-2 rounded border border-slate-800 min-w-[100px]">
     <span className="text-[10px] text-slate-500 block uppercase tracking-wider">{label}</span>
@@ -172,7 +203,8 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
           message: latest.message,
         }));
       }
-      // Parse HSG-DETR METRICS logs → build history for HsgDetrMetrics component
+      // Parse live HSG-DETR METRICS logs as an overlay. The persistent source is
+      // job.history / extended_metrics.jsonl, so this must never replace older epochs.
       const hsgLogs = l.filter(log => log.level === 'METRICS' && log.data?.type === 'hsg_detr_metrics');
       if (hsgLogs.length > 0) {
         // Logs are newest-first, reverse to get chronological order, deduplicate by epoch
@@ -186,7 +218,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
             entries.push(d as unknown as HsgDetrMetricsEntry);
           }
         }
-        setHsgMetricsHistory(entries);
+        setHsgMetricsHistory(prev => mergeHsgMetricsEntries(prev, entries));
       }
     }).catch(() => {});
   }, [jobId]);
@@ -234,31 +266,9 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
 
   // Merge HSG-DETR sparse debug metrics from job.history (persisted in extended_metrics.jsonl)
   useEffect(() => {
-    if (!job?.history || job.history.length === 0) return;
-    
-    setHsgMetricsHistory(prev => {
-      const merged = new Map<number, HsgDetrMetricsEntry>();
-      
-      // Start with existing entries
-      for (const p of prev) {
-        merged.set(p.epoch, p);
-      }
-      
-      // Merge from job.history hsg_detr data
-      for (const h of job.history) {
-        const epoch = h.epoch;
-        const existing = merged.get(epoch) || { epoch };
-        const hsgData = (h as any).hsg_detr as Record<string, number> | undefined;
-        
-        if (hsgData) {
-          // Merge selected-token SGB, decoder alpha, and gradient diagnostics.
-          merged.set(epoch, { ...existing, ...hsgData, epoch });
-        }
-      }
-      
-      // Convert to sorted array
-      return Array.from(merged.values()).sort((a, b) => a.epoch - b.epoch);
-    });
+    const entries = hsgMetricsFromHistory(job?.history);
+    if (entries.length === 0) return;
+    setHsgMetricsHistory(prev => mergeHsgMetricsEntries(prev, entries));
   }, [job?.history]);
 
   // SSE — real-time updates for progress, epoch summary, and terminal events
