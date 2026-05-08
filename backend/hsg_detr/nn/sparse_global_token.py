@@ -838,13 +838,22 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             dn_bbox = dn_bbox.clamp(-self.DN_LOGIT_LIMIT, self.DN_LOGIT_LIMIT)
 
         embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
+        # Decoder runs in FP32 (AMP disabled for stability)
+        # Cast inputs to FP32 for decoder
         dec_bboxes, dec_scores = self._safe_decoder_forward(
-            embed,
-            refer_bbox,
+            embed.float(),
+            refer_bbox.float(),
             feats,
             shapes,
             attn_mask=attn_mask,
         )
+        # Cast back to original dtype for AMP compatibility
+        orig_dtype = embed.dtype
+        dec_bboxes = dec_bboxes.to(dtype=orig_dtype)
+        dec_scores = dec_scores.to(dtype=orig_dtype)
+        enc_bboxes = enc_bboxes.to(dtype=orig_dtype)
+        enc_scores = enc_scores.to(dtype=orig_dtype)
+        
         out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return out
@@ -855,6 +864,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         y = torch.cat((dec_bboxes.squeeze(0), max_scores, labels.float()), -1)
         return y if self.export else (y, out)
 
+    @torch.cuda.amp.autocast(enabled=False)
     def _safe_decoder_forward(
         self,
         embed: torch.Tensor,
@@ -864,7 +874,11 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         attn_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mirror the base decoder but keep reference boxes in a safer numeric range."""
+        """Mirror the base decoder but keep reference boxes in a safer numeric range.
+        
+        AMP disabled: MLP and other components have dtype compatibility issues with FP16.
+        All computation runs in FP32 for numerical stability.
+        """
         output = embed
         dec_bboxes = []
         dec_cls = []
