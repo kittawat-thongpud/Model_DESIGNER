@@ -176,9 +176,6 @@ def _start_training_subprocess(
     env["MD_TRAINING_CHILD"] = "1"
     env["PYTHONFAULTHANDLER"] = "1"
 
-    # Clear any CUDA-related env vars that might cause context issues in subprocess
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-
     worker_log = job_dir / "worker_process.log"
     log_fh = open(worker_log, "ab", buffering=0)
     cmd = [
@@ -186,7 +183,7 @@ def _start_training_subprocess(
         "-X",
         "faulthandler",
         "-m",
-        __name__,
+        "app.services.ultra_trainer",
         "--worker",
         str(args_path),
     ]
@@ -198,6 +195,8 @@ def _start_training_subprocess(
     )
     proc = subprocess.Popen(
         cmd,
+        cwd=str(Path(__file__).resolve().parents[3]),
+        env=env,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -362,17 +361,6 @@ def _terminate_worker_process(job_id: str, reason: str, timeout: float | None = 
             pass
     except Exception as exc:
         job_storage.append_job_log(job_id, "WARNING", f"Training process stop warning: {exc}")
-    
-    # Additional cleanup: kill any matching ultra_trainer processes by job_id
-    # This prevents CUDA context corruption from zombie processes
-    try:
-        _kill_ddp_processes(job_id)
-    except Exception:
-        pass
-    
-    # Give OS time to release GPU context
-    import time
-    time.sleep(0.5)
 
 
 def _training_process_supervisor(
@@ -1298,15 +1286,6 @@ def _training_worker(
                           [{'partition_id': 'p_xxx', 'train': True, 'val': False, 'test': True}, ...]
         model_scale: Scale char ('n', 's', 'm', 'l', 'x') for model scaling.
     """
-    # Clear any leftover CUDA context from previous runs (prevents "CUDA unknown error")
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    except Exception:
-        pass
-    
     job = job_storage.load_job(job_id)
     if not job:
         return
@@ -1857,16 +1836,11 @@ def _training_worker(
         _avail = _torch.cuda.device_count()
         _device_val = str(train_kwargs.get("device", "")).strip()
 
-        # Log available hardware (with error handling for corrupted CUDA context)
+        # Log available hardware
         if _avail > 0:
-            try:
-                _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
-                job_storage.append_job_log(job_id, "INFO",
-                    f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
-            except Exception as e:
-                job_storage.append_job_log(job_id, "WARNING",
-                    f"Could not get GPU names (CUDA context may be corrupted): {e}")
-                # Continue with training - Ultralytics will handle device selection
+            _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
+            job_storage.append_job_log(job_id, "INFO",
+                f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
         else:
             job_storage.append_job_log(job_id, "INFO", "No CUDA GPUs detected — using CPU")
 
