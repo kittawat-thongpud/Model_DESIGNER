@@ -884,12 +884,15 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             last_refined_bbox = None
             refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
 
+            # Cast feats to FP32 for decoder layer compatibility (cross_attn expects FP32)
+            feats_f32 = feats.float() if feats.dtype != torch.float32 else feats
+            
             for i, layer in enumerate(self.decoder.layers):
                 ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
                 output = layer(
                     output,
                     ref_for_layer.to(dtype=output.dtype),
-                    feats,
+                    feats_f32,  # FP32 for decoder
                     shapes,
                     padding_mask,
                     attn_mask,
