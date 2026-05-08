@@ -864,7 +864,6 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         y = torch.cat((dec_bboxes.squeeze(0), max_scores, labels.float()), -1)
         return y if self.export else (y, out)
 
-    @torch.cuda.amp.autocast(enabled=False)
     def _safe_decoder_forward(
         self,
         embed: torch.Tensor,
@@ -876,47 +875,45 @@ class RTDETRDecoderSGB(RTDETRDecoder):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mirror the base decoder but keep reference boxes in a safer numeric range.
         
-        AMP disabled: MLP and other components have dtype compatibility issues with FP16.
-        All computation runs in FP32 for numerical stability.
+        Decoder runs in FP32 (_fp32_context) for MLP compatibility and numerical stability.
         """
-        output = embed
-        dec_bboxes = []
-        dec_cls = []
-        last_refined_bbox = None
-        refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
+        with _fp32_context(embed.device):
+            output = embed
+            dec_bboxes = []
+            dec_cls = []
+            last_refined_bbox = None
+            refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
 
-        for i, layer in enumerate(self.decoder.layers):
-            ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
-            output = layer(
-                output,
-                ref_for_layer.to(dtype=output.dtype),
-                feats,
-                shapes,
-                padding_mask,
-                attn_mask,
-                self.query_pos_head(ref_for_layer.to(dtype=output.dtype)),
-            )
+            for i, layer in enumerate(self.decoder.layers):
+                ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
+                output = layer(
+                    output,
+                    ref_for_layer.to(dtype=output.dtype),
+                    feats,
+                    shapes,
+                    padding_mask,
+                    attn_mask,
+                    self.query_pos_head(ref_for_layer.to(dtype=output.dtype)),
+                )
 
-            head_input = F.layer_norm(output, (output.shape[-1],))
-            bbox = self.dec_bbox_head[i](head_input)
-            bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
-            refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
-            refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
+                head_input = F.layer_norm(output, (output.shape[-1],))
+                bbox = self.dec_bbox_head[i](head_input)
+                bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
+                refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
+                refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
 
-            if self.training:
-                dec_cls.append(self.dec_score_head[i](head_input))
-                if i == 0:
-                    dec_bboxes.append(refined_bbox)
+                if self.training:
+                    dec_cls.append(self.dec_score_head[i](head_input))
                 else:
-                    prev_ref = _safe_unit_interval(last_refined_bbox, eps=self.REFINE_EPS)
-                    prev_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(prev_ref, eps=self.REFINE_EPS))
-                    dec_bboxes.append(_safe_unit_interval(prev_bbox, eps=self.REFINE_EPS))
-            elif i == self.decoder.eval_idx:
-                dec_cls.append(self.dec_score_head[i](head_input))
-                dec_bboxes.append(refined_bbox)
-                break
+                    dec_cls.append(self.dec_score_head[i](head_input).sigmoid())
 
-            last_refined_bbox = refined_bbox
-            refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+                if i == 0:
+                    last_refined_bbox = refined_bbox
+                    refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+                else:
+                    last_refined_bbox = refined_bbox
+                    refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
-        return torch.stack(dec_bboxes), torch.stack(dec_cls)
+                dec_bboxes.append(last_refined_bbox)
+
+            return torch.stack(dec_bboxes), torch.stack(dec_cls)
