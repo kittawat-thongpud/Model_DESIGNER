@@ -473,6 +473,7 @@ async def create_empty_weight(body: CreateEmptyRequest):
     }
 
 
+@router.get("", include_in_schema=False)
 @router.get("/", summary="List all saved weights")
 async def list_weights(model_id: str | None = None):
     """Return all weight metadata, optionally filtered by parent model."""

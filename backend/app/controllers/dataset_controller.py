@@ -78,6 +78,7 @@ def _get_plugin(name: str):
 
 # ── List / Info endpoints ────────────────────────────────────────────────────
 
+@router.get("", response_model=list[DatasetInfo], include_in_schema=False)
 @router.get("/", response_model=list[DatasetInfo], summary="List available datasets")
 async def list_datasets():
     """Return info about all supported datasets."""

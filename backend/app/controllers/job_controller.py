@@ -12,6 +12,7 @@ router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
 _TRAINING_API_DEFAULTS = get_training_config().get("api_defaults", {})
 
 
+@router.get("", include_in_schema=False)
 @router.get("/", summary="List all training jobs")
 async def list_jobs(status: str | None = None, model_id: str | None = None):
     """Return all training jobs with optional filters."""
