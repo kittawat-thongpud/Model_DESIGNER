@@ -1864,12 +1864,9 @@ class CustomDetectionTrainer(DetectionTrainer):
                 extended_metrics['train_cls_loss'] = round(float(li[1]), 6) if len(li) > 1 else None
                 extended_metrics['train_dfl_loss'] = round(float(li[2]), 6) if len(li) > 2 else None
             
-            # Add validation losses from metrics
-            if hasattr(self, 'metrics') and self.metrics:
-                m = self.metrics
-                extended_metrics['val_box_loss'] = m.get('val/box_loss')
-                extended_metrics['val_cls_loss'] = m.get('val/cls_loss')
-                extended_metrics['val_dfl_loss'] = m.get('val/dfl_loss')
+            # Add validation losses from metrics. HSG-DETR/RT-DETR validators use
+            # giou/l1 names, while YOLO validators use box/dfl names.
+            extended_metrics.update(self._extract_validation_losses(metrics))
             
             # Add learning rate
             if hasattr(self, 'optimizer') and self.optimizer:
@@ -1926,6 +1923,11 @@ class CustomDetectionTrainer(DetectionTrainer):
                     'val_map75': round(extended_metrics.get('map75', 0) or 0, 4),
                     'val_precision': round(extended_metrics.get('mp', 0) or 0, 4),
                     'val_recall': round(extended_metrics.get('mr', 0) or 0, 4),
+                    'val_box_loss': extended_metrics.get('val_box_loss'),
+                    'val_cls_loss': extended_metrics.get('val_cls_loss'),
+                    'val_dfl_loss': extended_metrics.get('val_dfl_loss'),
+                    'val_giou_loss': extended_metrics.get('val_giou_loss'),
+                    'val_l1_loss': extended_metrics.get('val_l1_loss'),
                     'val_time_s': round(val_time, 1),
                     'device': device_info.get('device'),
                     'ram_gb': round(device_info.get('ram_gb', 0), 2),
@@ -2052,6 +2054,79 @@ class CustomDetectionTrainer(DetectionTrainer):
                 metrics[name] = to_list(val)
         
         return metrics
+
+    def _extract_validation_losses(self, metrics: Any) -> dict[str, float]:
+        """Normalize validation loss names for chart/history consumers."""
+
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+            results_dict = getattr(value, 'results_dict', None)
+            if isinstance(results_dict, dict):
+                return results_dict
+            return None
+
+        sources: list[dict[str, Any]] = []
+        for source in (
+            metrics,
+            getattr(self, 'metrics', None),
+            getattr(getattr(self, 'validator', None), 'metrics', None),
+        ):
+            mapping = as_mapping(source)
+            if mapping:
+                sources.append(mapping)
+
+        def to_float(value: Any) -> float | None:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 0:
+                        return None
+                    return float(value.detach().float().reshape(-1)[0].cpu().item())
+                if isinstance(value, np.ndarray):
+                    if value.size == 0:
+                        return None
+                    return float(value.reshape(-1)[0])
+                if isinstance(value, (list, tuple)):
+                    if not value:
+                        return None
+                    return to_float(value[0])
+                return float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        def pick(*keys: str) -> float | None:
+            for source in sources:
+                for key in keys:
+                    if key in source:
+                        parsed = to_float(source.get(key))
+                        if parsed is not None:
+                            return round(parsed, 6)
+            return None
+
+        val_giou = pick('val/giou_loss', 'val_giou_loss', 'giou_loss', 'val/loss_giou', 'loss_giou')
+        val_l1 = pick('val/l1_loss', 'val_l1_loss', 'l1_loss', 'val/loss_bbox', 'loss_bbox')
+        val_box = pick(
+            'val/box_loss',
+            'val_box_loss',
+            'box_loss',
+            'val/bbox_loss',
+            'val_bbox_loss',
+            'bbox_loss',
+        )
+        val_dfl = pick('val/dfl_loss', 'val_dfl_loss', 'dfl_loss')
+
+        losses = {
+            # Keep the UI's existing chart keys stable.
+            'val_box_loss': val_box if val_box is not None else val_giou,
+            'val_cls_loss': pick('val/cls_loss', 'val_cls_loss', 'cls_loss'),
+            'val_dfl_loss': val_dfl if val_dfl is not None else val_l1,
+            # Preserve DETR-native names for debugging and future UI labels.
+            'val_giou_loss': val_giou,
+            'val_l1_loss': val_l1,
+        }
+        return {key: value for key, value in losses.items() if value is not None}
     
     def _save_extended_metrics(self, metrics: dict[str, Any]) -> None:
         """Save comprehensive extended metrics to JSONL file.
@@ -2095,6 +2170,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             "val_box_loss": metrics.get('val_box_loss'),
             "val_cls_loss": metrics.get('val_cls_loss'),
             "val_dfl_loss": metrics.get('val_dfl_loss'),
+            "val_giou_loss": metrics.get('val_giou_loss'),
+            "val_l1_loss": metrics.get('val_l1_loss'),
             
             # HSG-DETR metrics (cached from _log_hsg_detr_metrics)
             "hsg_detr": _hsg or None,

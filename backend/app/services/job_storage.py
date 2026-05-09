@@ -94,6 +94,12 @@ def get_job_history(job_id: str) -> list[dict]:
 
             history = []
             prev_ts: float | None = None
+            def first_present(data: dict, *keys: str):
+                for key in keys:
+                    if key in data and data.get(key) is not None:
+                        return data.get(key)
+                return None
+
             for data in raw_rows:
                 ts = data.get("timestamp")
                 # Compute per-epoch time from timestamp diff
@@ -116,6 +122,8 @@ def get_job_history(job_id: str) -> list[dict]:
                     "val_box_loss": data.get("val_box_loss"),
                     "val_cls_loss": data.get("val_cls_loss"),
                     "val_dfl_loss": data.get("val_dfl_loss"),
+                    "val_giou_loss": data.get("val_giou_loss"),
+                    "val_l1_loss": data.get("val_l1_loss"),
 
                     # Validation metrics
                     "mAP50": data.get("map50"),
@@ -215,9 +223,11 @@ def get_job_history(job_id: str) -> list[dict]:
                     "recall": epoch_data.get("metrics/recall(B)"),
                     "mAP50": epoch_data.get("metrics/mAP50(B)"),
                     "mAP50_95": epoch_data.get("metrics/mAP50-95(B)"),
-                    "val_box_loss": epoch_data.get("val/box_loss"),
+                    "val_box_loss": first_present(epoch_data, "val/box_loss", "val/giou_loss"),
                     "val_cls_loss": epoch_data.get("val/cls_loss"),
-                    "val_dfl_loss": epoch_data.get("val/dfl_loss"),
+                    "val_dfl_loss": first_present(epoch_data, "val/dfl_loss", "val/l1_loss"),
+                    "val_giou_loss": epoch_data.get("val/giou_loss"),
+                    "val_l1_loss": epoch_data.get("val/l1_loss"),
                     "epoch_time": per_epoch,
                     "lr": epoch_data.get("lr/pg0"),
                 }
