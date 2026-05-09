@@ -717,7 +717,12 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return out
-        y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
+        # Eval/export: convert the selected decoder layer to the format expected
+        # by the RT-DETR validator: [bbox(4), max_score(1), label(1)].
+        layer_idx = int(getattr(self, "eval_idx", -1))
+        scores = dec_scores[layer_idx].sigmoid()
+        max_scores, labels = scores.max(-1, keepdim=True)
+        y = torch.cat((dec_bboxes[layer_idx], max_scores, labels.float()), -1)
         return y if self.export else (y, out)
 
     def _safe_decoder_forward(
