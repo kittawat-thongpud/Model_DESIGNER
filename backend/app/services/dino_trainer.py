@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import psutil
 import re
 import shutil
 import subprocess
@@ -290,6 +291,20 @@ def _append_output_log(job_id: str, line: str) -> None:
         total = int(m.group(2))
         _set_job(job_id, epoch=epoch, total_epochs=total, message=f"DINO epoch {epoch}/{total}")
 
+
+def _get_system_resources() -> dict[str, Any]:
+    """Get current system resource usage."""
+    try:
+        mem = psutil.virtual_memory()
+        ram_used_gb = mem.used / (1024**3)
+        ram_total_gb = mem.total / (1024**3)
+        return {
+            "ram_used_gb": round(ram_used_gb, 1),
+            "ram_total_gb": round(ram_total_gb, 1),
+        }
+    except Exception:
+        return {"ram_used_gb": 0, "ram_total_gb": 0}
+
 def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
     """Parse DINO log line for metrics."""
     try:
@@ -327,6 +342,12 @@ def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
         metrics["weight_decay"] = float(m.group(1))
         metrics["weight_decay_avg"] = float(m.group(2))
     
+    # Parse iterations (for epoch time calculation)
+    m = re.search(r"\[(\d+)/(\d+)\]", line)
+    if m:
+        metrics["iteration"] = int(m.group(1))
+        metrics["total_iterations"] = int(m.group(2))
+    
     # Parse time per iteration
     m = re.search(r"time:\s*([\d.]+)", line)
     if m:
@@ -350,11 +371,14 @@ def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
     # Return metrics if we found at least epoch
     return metrics if "epoch" in metrics else None
 
-def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
+def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, start_time: float) -> None:
     """Update job with training metrics."""
     job = job_storage.load_job(job_id)
     if not job:
         return
+    
+    # Get system resources
+    system_res = _get_system_resources()
     
     # Parse metrics
     epoch = metrics.get("epoch", job.get("epoch", 0))
@@ -366,7 +390,37 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
     max_mem_mb = metrics.get("max_mem_mb")
     eta = metrics.get("eta")
     
-    updates = {"epoch": epoch}
+    # Calculate derived metrics
+    elapsed = time.time() - start_time
+    total_minutes = elapsed / 60
+    
+    # Calculate speed (img/s) from batch size and time per iteration
+    speed_img_s = 0
+    if time_per_iter and time_per_iter > 0:
+        speed_img_s = batch_size / time_per_iter
+    
+    # Calculate epoch time (if we have iterations per epoch)
+    epoch_time = None
+    if time_per_iter:
+        # Use parsed iterations if available, otherwise default
+        iterations = metrics.get("total_iterations", 373)  # Default from DINO log
+        epoch_time = time_per_iter * iterations
+    
+    # Update average epoch time
+    avg_epoch_time = job.get("avg_epoch_time")
+    if epoch_time:
+        if avg_epoch_time is None:
+            avg_epoch_time = epoch_time
+        else:
+            # Running average
+            avg_epoch_time = (avg_epoch_time * 0.9) + (epoch_time * 0.1)
+    
+    updates = {
+        "epoch": epoch,
+        "ram_used_gb": system_res["ram_used_gb"],
+        "ram_total_gb": system_res["ram_total_gb"],
+        "total_minutes": round(total_minutes, 1),
+    }
     if train_loss is not None:
         updates["loss"] = float(train_loss)
     if train_lr is not None:
@@ -381,6 +435,12 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
         updates["max_mem_mb"] = int(max_mem_mb)
     if eta is not None:
         updates["eta"] = eta
+    if speed_img_s > 0:
+        updates["speed_img_s"] = round(speed_img_s)
+    if epoch_time is not None:
+        updates["epoch_time"] = round(epoch_time)
+    if avg_epoch_time is not None:
+        updates["avg_epoch_time"] = round(avg_epoch_time)
     
     # Update history with all basic metrics
     history = list(job.get("history") or [])
@@ -393,6 +453,10 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
         "data_time": data_time,
         "max_mem_mb": max_mem_mb,
         "eta": eta,
+        "ram_used_gb": system_res["ram_used_gb"],
+        "ram_total_gb": system_res["ram_total_gb"],
+        "speed_img_s": speed_img_s if speed_img_s > 0 else None,
+        "epoch_time": epoch_time,
         "timestamp": time.time(),
         "metrics": metrics,
     })
@@ -609,7 +673,7 @@ def run_worker(payload: dict[str, Any]) -> None:
                         for log_line in f.readlines():
                             metrics = _parse_dino_metrics(log_line)
                             if metrics:
-                                _update_job_metrics(job_id, metrics)
+                                _update_job_metrics(job_id, metrics, batch, started)
                                 
                                 # Track best checkpoint
                                 train_loss = metrics.get("train_loss")
