@@ -18,6 +18,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("ultralytics")
 
 from hsg_detr.nn.sparse_global_token import SGTokenBlock  # noqa: E402
+from hsg_detr.nn.sparse_global_token_v2 import SGTokenBlockV2  # noqa: E402
 
 
 def _selected_mask(indices: torch.Tensor, channels: int, height: int, width: int) -> torch.Tensor:
@@ -43,6 +44,21 @@ def test_sg_token_block_shape_and_gamma_init():
     state = block.get_debug_state()
     assert state["k"] == 16
     assert state["gate"] == pytest.approx(1e-4)
+
+
+def test_sg_token_block_v2_shape_gamma_and_score_std():
+    block = SGTokenBlockV2(16, 16, ratio=0.25, debug_enabled=True)
+    assert block.gamma.shape == (1, 16, 1, 1)
+    assert float(block.gamma.detach().mean()) == pytest.approx(1e-4)
+
+    x = torch.randn(2, 16, 8, 8)
+    y = block(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    state = block.get_debug_state()
+    assert state["k"] == 16
+    assert state["gate"] == pytest.approx(1e-4)
+    assert state["score_std"] is not None
 
 
 def test_sparse_delta_is_zero_on_nonselected_positions():

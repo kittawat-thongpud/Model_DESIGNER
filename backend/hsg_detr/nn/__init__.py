@@ -17,6 +17,10 @@ from .sparse_global_token import (
     SGDown,
     RTDETRDecoderSGB,
 )
+from .sparse_global_token_v2 import (
+    SGTokenBlockV2,
+    RTDETRDecoderV2,
+)
 
 # Also include hsg_det's SparseGlobalTokenBlock so that when hsg_detr
 # rebuilds parse_model via source-patch, SparseGlobalTokenBlock stays
@@ -40,6 +44,8 @@ _MODULES: dict[str, type] = {
     "SGStem": SGStem,
     "SGDown": SGDown,
     "RTDETRDecoderSGB": RTDETRDecoderSGB,
+    "SGTokenBlockV2": SGTokenBlockV2,
+    "RTDETRDecoderV2": RTDETRDecoderV2,
     **_HSG_DET_MODULES,
 }
 
@@ -85,9 +91,10 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
     except Exception:
         return False
 
-    # RTDETRDecoderSGB must NOT be in base_modules — it needs the special
-    # RTDETRDecoder channel-injection path (args.insert(1, [ch[x] for x in f]))
-    base_names = [n for n in modules.keys() if n != "RTDETRDecoderSGB"]
+    # RTDETRDecoderSGB and RTDETRDecoderV2 must NOT be in base_modules — they
+    # need the special RTDETRDecoder channel-injection path.
+    _rtdetr_variants = {"RTDETRDecoderSGB", "RTDETRDecoderV2"}
+    base_names = [n for n in modules.keys() if n not in _rtdetr_variants]
 
     # ── 1. Insert into base_modules frozenset ────────────────────────────
     base_marker = "\n        }\n    )\n    repeat_modules"
@@ -96,12 +103,12 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
         return False
     src = src.replace(base_marker, base_insert + base_marker, 1)
 
-    # ── 2. Patch RTDETRDecoder special-case to include RTDETRDecoderSGB ───
+    # ── 2. Patch RTDETRDecoder special-case to include both variants ──────
     rtdetr_check = "        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1"
-    rtdetr_patch = "        elif m is RTDETRDecoder or m is RTDETRDecoderSGB:  # special case, channels arg must be passed in index 1"
+    rtdetr_patch = "        elif m is RTDETRDecoder or m is RTDETRDecoderSGB or m is RTDETRDecoderV2:  # special case, channels arg must be passed in index 1"
     if rtdetr_check in src:
         src = src.replace(rtdetr_check, rtdetr_patch, 1)
-        print("[HSG-DETR] Patched RTDETRDecoder special case for RTDETRDecoderSGB")
+        print("[HSG-DETR] Patched RTDETRDecoder special case for RTDETRDecoderSGB + RTDETRDecoderV2")
     else:
         print("[HSG-DETR] WARNING: RTDETRDecoder check NOT FOUND in parse_model source!")
 

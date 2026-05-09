@@ -20,7 +20,8 @@ router = APIRouter(prefix="/api/plugins")
 @router.get("/archs")
 def list_arch_plugins():
     """Return model architecture families (each family = one model entry with selectable scales)."""
-    from ..plugins.loader import arch_families
+    from ..plugins.loader import arch_families, discover_plugins
+    discover_plugins()
     return arch_families()
 
 

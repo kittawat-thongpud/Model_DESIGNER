@@ -461,7 +461,7 @@ class CustomDetectionTrainer(DetectionTrainer):
     def _is_hsg_detr_model(self) -> bool:
         try:
             model = unwrap_model(self.model)
-            return any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+            return any(m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} for m in model.modules())
         except Exception:
             return False
 
@@ -641,7 +641,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name == "SGTokenBlock":
+            if cls_name in {"SGTokenBlock", "SGTokenBlockV2"}:
                 for local_name, param in module.named_parameters(recurse=True):
                     if not param.requires_grad:
                         continue
@@ -656,7 +656,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
                         sgb_roles[id(param)] = "norm_bias"
-            elif cls_name == "RTDETRDecoderSGB":
+            elif cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
                 for _, param in module.named_parameters(recurse=True):
                     if param.requires_grad:
                         decoder_ids.add(id(param))
@@ -826,7 +826,7 @@ class CustomDetectionTrainer(DetectionTrainer):
     def _disable_deterministic_for_hsg_detr(self) -> None:
         """Avoid deterministic CUDA paths that RT-DETR/HSG-DETR cannot fully support."""
         model = unwrap_model(self.model)
-        has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+        has_hsg_decoder = any(m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} for m in model.modules())
         if not has_hsg_decoder:
             return
 
@@ -848,7 +848,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             return
         try:
             model = unwrap_model(self.model)
-            has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+            has_hsg_decoder = any(m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} for m in model.modules())
             if not has_hsg_decoder:
                 return
             self.scaler = self._new_grad_scaler(
@@ -975,7 +975,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             model = unwrap_model(self.model)
             capture_sparse_debug = bool(getattr(self, "record_gradients", False))
             for m in model.modules():
-                if m.__class__.__name__ == 'SGTokenBlock' and hasattr(m, 'set_debug'):
+                if m.__class__.__name__ in {'SGTokenBlock', 'SGTokenBlockV2'} and hasattr(m, 'set_debug'):
                     m.set_debug(capture_sparse_debug, cpu=True)
         except Exception:
             pass
@@ -993,7 +993,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         decoders = [
             m for m in model.modules()
-            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "set_alpha")
+            if m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} and hasattr(m, "set_alpha")
         ]
         if not decoders:
             return
@@ -1104,11 +1104,11 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         model_decoders = [
             m for m in model.modules()
-            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "alpha")
+            if m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} and hasattr(m, "alpha")
         ]
         ema_decoders = [
             m for m in ema_model.modules()
-            if m.__class__.__name__ == "RTDETRDecoderSGB" and hasattr(m, "set_alpha")
+            if m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} and hasattr(m, "set_alpha")
         ]
         for src, dst in zip(model_decoders, ema_decoders):
             try:
@@ -1127,9 +1127,9 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         sgb_blocks = [
             m for m in model.modules()
-            if m.__class__.__name__ == 'SGTokenBlock'
+            if m.__class__.__name__ in {'SGTokenBlock', 'SGTokenBlockV2'}
         ]
-        decoder_modules = [m for m in model.modules() if m.__class__.__name__ == 'RTDETRDecoderSGB']
+        decoder_modules = [m for m in model.modules() if m.__class__.__name__ in {'RTDETRDecoderSGB', 'RTDETRDecoderV2'}]
 
         metrics: dict[str, float] = {}
 
@@ -1202,6 +1202,9 @@ class CustomDetectionTrainer(DetectionTrainer):
             finite_guard_count = getattr(blk, 'last_finite_guard_count', None)
             if finite_guard_count is not None:
                 metrics[f'{tag}_finite_guard_count'] = float(finite_guard_count)
+            score_std = getattr(blk, 'last_score_std', None)
+            if score_std is not None:
+                metrics[f'{tag}_score_std'] = float(score_std)
 
             saliency = getattr(blk, 'last_saliency', None)
             if saliency is not None and saliency.numel():
@@ -1275,14 +1278,24 @@ class CustomDetectionTrainer(DetectionTrainer):
         
         self._assert_batchnorm_buffers_finite("before optimizer step")
         try:
+            clip_max_norm = 5.0
+            try:
+                model_unwrapped = unwrap_model(self.model)
+                if any(m.__class__.__name__ == "RTDETRDecoderV2" for m in model_unwrapped.modules()):
+                    # V2's Look-Forward-Twice decoder keeps gradients chained
+                    # across refinement layers, so it needs a tighter clip.
+                    clip_max_norm = 0.1
+            except Exception:
+                pass
+
             # Keep clipping conservative for the sparse CNN/DETR hybrid.
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
-                max_norm=5.0,
+                max_norm=clip_max_norm,
                 error_if_nonfinite=True,
             )
         except TypeError:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_max_norm)
             if not torch.isfinite(total_norm):
                 self._handle_nonfinite_gradients(
                     f"NaN/Inf gradient norm detected: {float(total_norm)}",
@@ -1392,7 +1405,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         if isinstance(parsed_layers, torch.nn.Sequential) or isinstance(parsed_layers, torch.nn.ModuleList):
             for layer_idx, module in enumerate(parsed_layers):
                 cls_name = module.__class__.__name__
-                if cls_name == "RTDETRDecoderSGB":
+                if cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
                     region = "decoder"
                 elif backbone_count and layer_idx < backbone_count:
                     region = "backbone"
@@ -1403,7 +1416,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name == "SGTokenBlock":
+            if cls_name in {"SGTokenBlock", "SGTokenBlockV2"}:
                 for local_name, param in module.named_parameters(recurse=True):
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
@@ -1418,7 +1431,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         sgb_roles[id(param)] = "sgb_norm"
                     else:
                         sgb_roles[id(param)] = "sgb"
-            elif cls_name == "RTDETRDecoderSGB":
+            elif cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
                 for _, param in module.named_parameters(recurse=True):
                     decoder_ids.add(id(param))
 

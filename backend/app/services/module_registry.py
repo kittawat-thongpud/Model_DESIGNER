@@ -1027,6 +1027,44 @@ _HSG_DETR_MODULES: list[dict[str, Any]] = [
         "source": "hsg_detr",
     },
     {
+        "name": "SGTokenBlockV2",
+        "category": "attention",
+        "description": (
+            "HSG-DETR V2 AMP-safe sparse-token block. Keeps the legacy "
+            "parameter-free L2 top-k selector and Conv2d Q/K/V topology, while "
+            "making GroupNorm/Conv dtype handling safe under AMP and exposing "
+            "score_std for token-budget analysis."
+        ),
+        "args": [
+            {"name": "out_channels", "type": "int", "default": 256,
+             "help": "Number of channels (channel-preserving; auto-injected by parse_model)"},
+            {"name": "ratio", "type": "float", "default": 0.12,
+             "help": "Fraction of spatial tokens to retain"},
+            {"name": "mode", "type": "str", "default": "topk",
+             "help": "topk or dense ablation mode; hybrid aliases to topk in V2"},
+            {"name": "gamma_init", "type": "float", "default": 1e-4,
+             "help": "Initial per-channel LayerScale value"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
+        "name": "RTDETRDecoderV2",
+        "category": "head",
+        "description": (
+            "HSG-DETR V2 RT-DETR decoder with Look-Forward-Twice refinement "
+            "and uncertainty-minimal query selection."
+        ),
+        "args": [
+            {"name": "num_classes", "type": "int", "default": 80,
+             "help": "Number of classes"},
+            {"name": "hidden_dim", "type": "int", "default": 128,
+             "help": "Decoder hidden dimension"},
+            {"name": "num_queries", "type": "int", "default": 100,
+             "help": "Number of object queries"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
         "name": "SparseGlobalTokenBlock",
         "category": "attention",
         "description": (

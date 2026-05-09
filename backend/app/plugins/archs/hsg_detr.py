@@ -26,24 +26,33 @@ _SCALE_DESCRIPTIONS = {
 class HSGDetRPlugin(ModelArchPlugin):
     """Plugin for one HSG-DETR scale variant (N, S, M, or L)."""
 
-    def __init__(self, scale: str):
+    def __init__(self, scale: str, variant: str = "legacy"):
         self._scale = scale.lower()
+        self._variant = variant.lower()
 
     @property
     def name(self) -> str:
+        if self._variant == "v2":
+            return f"hsg_detr_v2_{self._scale}"
         return f"hsg_detr_{self._scale}"
 
     @property
     def display_name(self) -> str:
         label, params, flops, queries = _SCALE_DESCRIPTIONS[self._scale]
+        if self._variant == "v2":
+            return f"HSG-DETR V2 {label} ({params}, {flops})"
         return f"HSG-DETR {label} ({params}, {flops})"
 
     @property
     def family(self) -> str:
+        if self._variant == "v2":
+            return "hsg_detr_v2"
         return "hsg_detr"
 
     @property
     def family_display_name(self) -> str:
+        if self._variant == "v2":
+            return "HSG-DETR V2"
         return "HSG-DETR"
 
     @property
@@ -61,6 +70,12 @@ class HSGDetRPlugin(ModelArchPlugin):
 
     @property
     def description(self) -> str:
+        if self._variant == "v2":
+            return (
+                "HSG-DETR V2 — AMP-safe sparse-token encoder with the legacy "
+                "topology plus RT-DETR decoder changes: Look-Forward-Twice box "
+                "refinement and uncertainty-minimal query selection. N-scale only."
+            )
         return (
             "HSG-DETR — legacy Sparse-Token SGB encoder feeding RT-DETR decoder. "
             "Uses parameter-free L2 top-k token selection, sparse global "
@@ -69,6 +84,8 @@ class HSGDetRPlugin(ModelArchPlugin):
         )
 
     def yaml_path(self) -> Path:
+        if self._variant == "v2":
+            return _CONFIGS_DIR / f"hsg_detr_v2_{self._scale}.yaml"
         return _CONFIGS_DIR / f"hsg_detr_{self._scale}.yaml"
 
     def register_modules(self) -> None:
@@ -104,3 +121,6 @@ class HSGDetRPlugin(ModelArchPlugin):
 # ── Auto-register all four scales ──────────────────────────────────────────
 for _scale in ("n", "s", "m", "l"):
     register_arch(HSGDetRPlugin(_scale))
+
+# V2 is currently installed for N-scale only while it is being validated.
+register_arch(HSGDetRPlugin("n", variant="v2"))

@@ -119,6 +119,21 @@ const CACHE_OPTIONS = [
   { value: 'none', label: 'None', hint: 'Disable dataset cache entirely' },
 ] as const;
 
+const HSG_DETR_V2_FALLBACK: ArchFamily = {
+  family: 'hsg_detr_v2',
+  display_name: 'HSG-DETR V2',
+  task_type: 'detect',
+  description: 'AMP-safe HSG-DETR V2 sparse-token encoder with Look-Forward-Twice decoder and uncertainty-minimal query selection.',
+  supported_scales: [
+    { scale: 'n', label: 'Nano (~5.9 M, ~9.6 GFLOPs) — 100 queries', plugin_name: 'hsg_detr_v2_n' },
+  ],
+};
+
+function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
+  const hasHsgDetrV2 = families.some(f => f.family === HSG_DETR_V2_FALLBACK.family);
+  return hasHsgDetrV2 ? families : [...families, HSG_DETR_V2_FALLBACK];
+}
+
 export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: Props) {
   const [customModels, setCustomModels] = useState<ModelSummary[]>([]);
   const [archFamilies, setArchFamilies] = useState<ArchFamily[]>([]);
@@ -218,7 +233,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
           setCustomModels(m ?? []);
           setDatasets(d ?? []);
           setWeights(w ?? []);
-          setArchFamilies(archs ?? []);
+          setArchFamilies(withFrontendArchFallbacks(archs ?? []));
         })
         .finally(() => setLoading(false));
     }

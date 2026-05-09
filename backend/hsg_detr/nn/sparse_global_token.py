@@ -305,7 +305,7 @@ class SGTokenBlock(nn.Module):
         delta = self.out_proj(out)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
         delta = 6.0 * torch.tanh(delta.float() / 6.0)
-        delta = self.delta_norm(delta)
+        delta = self.delta_norm(delta.to(dtype=self.delta_norm.weight.dtype))
 
         # GroupNorm can introduce non-zero values at zero-canvas positions, so
         # mask once more to keep the sparse branch restricted to selected tokens.
@@ -332,7 +332,7 @@ class SGTokenBlock(nn.Module):
         self.last_gate = float(gamma.detach().abs().mean().item())
 
         with _fp32_context(x.device):
-            x_branch = self.pre_norm(x.float())
+            x_branch = self.pre_norm(x.to(dtype=self.pre_norm.weight.dtype))
 
             # Projections
             q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]

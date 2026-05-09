@@ -41,7 +41,11 @@ const isReferenceGuided = (entry: HsgDetrMetricsEntry, scale: string) =>
   Number(entry[metricKey(scale, 'reference_guided')] ?? 0) >= 0.5;
 
 const blockLabel = (entry: HsgDetrMetricsEntry, scale: string) =>
-  isReferenceGuided(entry, scale) ? 'Ref-guided local' : 'Selected-token';
+  isReferenceGuided(entry, scale)
+    ? 'Ref-guided local'
+    : entry[metricKey(scale, 'score_std')] != null
+      ? 'V2 selected-token'
+      : 'Selected-token';
 
 const blockSubLabel = (entry: HsgDetrMetricsEntry, scale: string) => {
   const windowSize = entry[metricKey(scale, 'window_size')];
@@ -139,7 +143,12 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
   const hasGammaFloorMetrics = SCALES.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
   const hasScaledDeltaMetrics = SCALES.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
   const referenceGuidedCount = SCALES.filter(scale => isReferenceGuided(latest, scale)).length;
-  const sparseVariant = referenceGuidedCount > 0 ? 'reference-guided local aggregation' : 'legacy selected-token sparse attention';
+  const hasV2ScoreStats = SCALES.some(scale => latest[metricKey(scale, 'score_std')] != null);
+  const sparseVariant = referenceGuidedCount > 0
+    ? 'reference-guided local aggregation'
+    : hasV2ScoreStats
+      ? 'V2 AMP-safe selected-token sparse attention'
+      : 'legacy selected-token sparse attention';
 
   return (
     <div className="space-y-6">
@@ -159,7 +168,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
               : 'bg-violet-500/10 text-violet-300 border-violet-500/20'
           }`}>
-            {referenceGuidedCount > 0 ? 'Local sparse' : 'Legacy token'}
+            {referenceGuidedCount > 0 ? 'Local sparse' : hasV2ScoreStats ? 'V2 token' : 'Legacy token'}
           </span>
           <StatusBadge ok={!hasNan} label={hasNan ? 'NaN' : 'No NaN'} />
           <StatusBadge ok={!hasInf} label={hasInf ? 'Inf' : 'No Inf'} />
