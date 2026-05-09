@@ -74,6 +74,48 @@ _TRAINING_RESUME_EXISTING_WORKER_JOIN_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAUL
 _TRAINING_CHILD_CLEANUP_WAIT_TIMEOUT_S = float(_TRAINING_RUNTIME_DEFAULTS.get("child_cleanup_wait_timeout_s", 3.0))
 
 
+def _collect_cuda_diagnostics(torch_module=None) -> dict[str, Any]:
+    """Collect CUDA environment details without letting diagnostics crash training."""
+    diag: dict[str, Any] = {
+        "pid": os.getpid(),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        "NVIDIA_VISIBLE_DEVICES": os.environ.get("NVIDIA_VISIBLE_DEVICES", "<unset>"),
+        "PYTORCH_NVML_BASED_CUDA_CHECK": os.environ.get("PYTORCH_NVML_BASED_CUDA_CHECK", "<unset>"),
+    }
+    try:
+        torch = torch_module
+        if torch is None:
+            import torch  # type: ignore
+        diag["torch_version"] = getattr(torch, "__version__", "<unknown>")
+        diag["torch_cuda_version"] = getattr(getattr(torch, "version", None), "cuda", "<unknown>")
+        try:
+            diag["cuda_is_available"] = bool(torch.cuda.is_available())
+        except Exception as e:
+            diag["cuda_is_available_error"] = f"{type(e).__name__}: {e}"
+        try:
+            diag["cuda_device_count"] = int(torch.cuda.device_count())
+        except Exception as e:
+            diag["cuda_device_count_error"] = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        diag["torch_import_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        diag["nvidia_smi_L_rc"] = proc.returncode
+        diag["nvidia_smi_L_stdout"] = proc.stdout.strip()[:1000]
+        diag["nvidia_smi_L_stderr"] = proc.stderr.strip()[:1000]
+    except Exception as e:
+        diag["nvidia_smi_L_error"] = f"{type(e).__name__}: {e}"
+
+    return diag
+
+
 # ── Active jobs tracking ─────────────────────────────────────────────────────
 
 _active_jobs: dict[str, dict] = {}
@@ -1814,6 +1856,7 @@ def _training_worker(
         # These are handled manually below rather than passed to model.train().
         _use_ema = config.pop('ema', True)
         _pin_memory = config.pop('pin_memory', False)
+        _allow_cuda_cpu_fallback = bool(config.pop('allow_cuda_cpu_fallback', False))
         config.pop('dataset_name', None)       # internal tracking field — not a YOLO arg
         config.pop('use_yolo_pretrained', None)  # handled above, not a YOLO arg
         config.pop('yolov8_backbone', None)      # handled above, not a YOLO arg
@@ -1833,6 +1876,7 @@ def _training_worker(
         # Strip GPU indices that exceed the actual device count so Ultralytics
         # doesn't raise ValueError (e.g. user set "0,1,2" but only 1 GPU exists).
         import torch as _torch
+        _cuda_diagnostics = _collect_cuda_diagnostics(_torch)
         _cuda_probe_error = None
         try:
             _avail = int(_torch.cuda.device_count())
@@ -1849,18 +1893,38 @@ def _training_worker(
                     _gpu_names.append(_torch.cuda.get_device_name(i))
                 except Exception as _e:
                     _cuda_probe_error = _e
+                    _cuda_diagnostics["cuda_get_device_name_error"] = f"{type(_e).__name__}: {_e}"
+                    _cuda_diagnostics["cuda_get_device_name_index"] = i
                     _avail = 0
                     break
 
         if _cuda_probe_error is not None:
+            _cuda_diagnostics["probe_error"] = f"{type(_cuda_probe_error).__name__}: {_cuda_probe_error}"
+            try:
+                (job_dir / "cuda_diagnostics.json").write_text(
+                    json.dumps(_cuda_diagnostics, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except Exception as _diag_write_err:
+                _cuda_diagnostics["diagnostics_write_error"] = f"{type(_diag_write_err).__name__}: {_diag_write_err}"
+
+            job_storage.append_job_log(job_id, "ERROR", f"CUDA diagnostics: {_cuda_diagnostics}")
+            if not _allow_cuda_cpu_fallback:
+                raise RuntimeError(
+                    "CUDA probe failed before training. "
+                    "This usually means the backend/worker process has a broken CUDA runtime state. "
+                    "Restart the backend/worker container, then retry the job. "
+                    "Set allow_cuda_cpu_fallback=true only if you intentionally want CPU training. "
+                    f"Original CUDA error: {_cuda_probe_error}"
+                )
+
             train_kwargs["device"] = "cpu"
             train_kwargs["amp"] = False
             _device_val = "cpu"
             job_storage.append_job_log(
                 job_id,
                 "WARNING",
-                "CUDA probe failed; falling back to CPU for this job. "
-                "Restart the backend/worker container before retrying GPU training. "
+                "CUDA probe failed; allow_cuda_cpu_fallback=true so this job will run on CPU with AMP disabled. "
                 f"Reason: {_cuda_probe_error}"
             )
         elif _avail > 0:
@@ -2582,6 +2646,12 @@ def _training_worker(
                 else "<unset>"
             ),
             "yaml_path": locals().get("yaml_path", "<unset>"),
+            "device": (
+                locals().get("train_kwargs", {}).get("device", "<unset>")
+                if isinstance(locals().get("train_kwargs", {}), dict)
+                else "<unset>"
+            ),
+            "cuda_diagnostics": locals().get("_cuda_diagnostics", _collect_cuda_diagnostics()),
         }
         job_storage.append_job_log(job_id, "ERROR", f"Failure context: {failure_context}")
         job_storage.append_job_log(job_id, "ERROR", f"Traceback:\n{traceback.format_exc()}")
