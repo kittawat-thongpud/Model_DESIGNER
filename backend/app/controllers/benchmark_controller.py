@@ -810,6 +810,7 @@ def _prepare_dino_detector_coco(data_yaml: Path, out_dir: Path) -> tuple[Path, P
         images = []
         annotations = []
         ann_id = 1
+        skipped = 0
         for img_id, src in enumerate(_images(split), start=1):
             dst_name = f"{img_id:012d}{src.suffix.lower() or '.jpg'}"
             dst = img_dir / dst_name
@@ -820,8 +821,13 @@ def _prepare_dino_detector_coco(data_yaml: Path, out_dir: Path) -> tuple[Path, P
                     import shutil
 
                     shutil.copy2(src, dst)
-            with Image.open(src) as im:
-                width, height = im.size
+            try:
+                with Image.open(src) as im:
+                    width, height = im.size
+            except Exception as e:
+                logger.log("system", "WARNING", f"DINO benchmark: skipping corrupted image {src}: {str(e)}")
+                skipped += 1
+                continue
             images.append({"id": img_id, "file_name": dst_name, "width": width, "height": height})
             label_path = _label_for_image(src)
             if not label_path.exists():
@@ -846,6 +852,8 @@ def _prepare_dino_detector_coco(data_yaml: Path, out_dir: Path) -> tuple[Path, P
                     "iscrowd": 0,
                 })
                 ann_id += 1
+        if skipped > 0:
+            logger.log("system", "INFO", f"DINO benchmark: skipped {skipped} corrupted images in {split} split")
         categories = [
             {"id": _COCO_INDEX_TO_ID.get(i, i), "name": names.get(i, str(i))}
             for i in sorted(names)
