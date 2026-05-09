@@ -67,6 +67,7 @@ logs/
 # ── Backend runtime data (jobs, weights, models stored locally) ───────────────
 backend/data/*
 !backend/data/config.json
+!backend/data/vendor/DINO/main_dino.py
 
 # ── Secrets / env ─────────────────────────────────────────────────────────────
 .env
