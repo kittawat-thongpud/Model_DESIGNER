@@ -65,9 +65,15 @@ Desktop.ini
 logs/
 
 # ── Backend runtime data (jobs, weights, models stored locally) ───────────────
-backend/data/*
+backend/data/datasets/
+backend/data/jobs/
+backend/data/models/
+backend/data/weights/
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.log
 !backend/data/config.json
-!backend/data/vendor/DINO/main_dino.py
+!backend/data/vendor/
 
 # ── Secrets / env ─────────────────────────────────────────────────────────────
 .env
