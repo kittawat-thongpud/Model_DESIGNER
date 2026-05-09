@@ -2,7 +2,7 @@ import React from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
-import { Brain, Activity, AlertTriangle, Zap, Layers, ShieldCheck } from 'lucide-react';
+import { Brain, Activity, AlertTriangle, Zap, Layers, ShieldCheck, Crosshair } from 'lucide-react';
 
 export interface HsgDetrMetricsEntry {
   epoch: number;
@@ -34,9 +34,21 @@ const SCALE_HELP: Record<string, string> = {
 const EPS = 1e-8;
 
 const metricKey = (scale: string, name: string) => `sgb/${scale}_${name}`;
-
 const fmt = (v: number | undefined, digits = 4) =>
   v != null ? (Math.abs(v) < 0.001 && v !== 0 ? v.toExponential(2) : v.toFixed(digits)) : '-';
+
+const isReferenceGuided = (entry: HsgDetrMetricsEntry, scale: string) =>
+  Number(entry[metricKey(scale, 'reference_guided')] ?? 0) >= 0.5;
+
+const blockLabel = (entry: HsgDetrMetricsEntry, scale: string) =>
+  isReferenceGuided(entry, scale) ? 'Ref-guided local' : 'Selected-token';
+
+const blockSubLabel = (entry: HsgDetrMetricsEntry, scale: string) => {
+  const windowSize = entry[metricKey(scale, 'window_size')];
+  return isReferenceGuided(entry, scale)
+    ? `local ${fmt(windowSize, 0)}x${fmt(windowSize, 0)}`
+    : 'all-pairs sparse';
+};
 
 const metricColor = (v: number | undefined, threshold = EPS) =>
   v != null && Math.abs(v) > threshold ? 'text-emerald-400' : 'text-amber-400';
@@ -126,6 +138,8 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
   const alphaMax = Math.max(0.55, ...history.map(h => Number(h['decoder/alpha'] ?? 0) * 1.1));
   const hasGammaFloorMetrics = SCALES.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
   const hasScaledDeltaMetrics = SCALES.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
+  const referenceGuidedCount = SCALES.filter(scale => isReferenceGuided(latest, scale)).length;
+  const sparseVariant = referenceGuidedCount > 0 ? 'v3 reference-guided local aggregation' : 'v2 selected-token sparse attention';
 
   return (
     <div className="space-y-6">
@@ -135,9 +149,18 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
         </div>
         <div>
           <h3 className="text-white font-semibold text-sm">HSG-DETR Sparse Debug</h3>
-          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Stride-labeled SGB, gamma floor, decoder alpha, gradient contract</p>
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider">
+            {sparseVariant} | stride-labeled blocks, gamma floor, decoder alpha, gradient contract
+          </p>
         </div>
         <div className="ml-auto flex gap-2">
+          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border ${
+            referenceGuidedCount > 0
+              ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
+              : 'bg-violet-500/10 text-violet-300 border-violet-500/20'
+          }`}>
+            {referenceGuidedCount > 0 ? 'V3 local' : 'V2 token'}
+          </span>
           <StatusBadge ok={!hasNan} label={hasNan ? 'NaN' : 'No NaN'} />
           <StatusBadge ok={!hasInf} label={hasInf ? 'Inf' : 'No Inf'} />
           <StatusBadge ok={!anyFiniteGuard} label={anyFiniteGuard ? 'Guard hit' : 'Finite'} />
@@ -182,7 +205,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               label={`${scale} selected`}
               value={fmt(selected, 4)}
               color={metricColor(delta)}
-              sub={`${SCALE_HELP[scale]} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`}
+              sub={`${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`}
             />
           );
         })}
@@ -232,7 +255,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           </ResponsiveContainer>
         </ChartPanel>
 
-        <ChartPanel title="Selected-token Sparse Grad" icon={<Activity size={14} className="text-blue-400" />}>
+        <ChartPanel title={referenceGuidedCount > 0 ? 'Reference Sparse Grad' : 'Selected-token Sparse Grad'} icon={<Activity size={14} className="text-blue-400" />}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
@@ -257,6 +280,21 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
             </LineChart>
           </ResponsiveContainer>
         </ChartPanel>
+
+        {referenceGuidedCount > 0 && (
+          <ChartPanel title="Local Window Size" icon={<Crosshair size={14} className="text-cyan-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} allowDecimals={false} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('window_size')}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
 
         <ChartPanel title="Optimizer Grad Groups" icon={<ShieldCheck size={14} className="text-cyan-400" />}>
           <ResponsiveContainer width="100%" height="100%">
@@ -285,7 +323,9 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
             <thead>
               <tr className="text-slate-500 uppercase tracking-wider border-b border-slate-800">
                 <th className="px-4 py-2 text-left">Block</th>
+                <th className="px-4 py-2 text-left">Mode</th>
                 <th className="px-4 py-2 text-right">Ratio</th>
+                <th className="px-4 py-2 text-right">Window</th>
                 <th className="px-4 py-2 text-right">k / N</th>
                 <th className="px-4 py-2 text-right">Gamma raw</th>
                 <th className="px-4 py-2 text-right">Gamma eff</th>
@@ -308,13 +348,25 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 const selectedGrad = latest[metricKey(scale, 'selected_grad_norm')];
                 const guardHits = latest[metricKey(scale, 'finite_guard_count')] ?? 0;
                 const contractOk = (deltaNon ?? 0) <= EPS && (sparseNon ?? 0) <= EPS && guardHits === 0;
+                const refGuided = isReferenceGuided(latest, scale);
+                const windowSize = latest[metricKey(scale, 'window_size')];
                 return (
                   <tr key={scale} className="border-b border-slate-800/50 hover:bg-slate-800/20">
                     <td className="px-4 py-2 font-bold" style={{ color: SCALE_COLORS[scale] }}>
                       {scale}
                       <span className="block text-[9px] font-normal text-slate-500">{SCALE_HELP[scale]}</span>
                     </td>
+                    <td className="px-4 py-2">
+                      <span className={`inline-flex items-center px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                        refGuided
+                          ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
+                          : 'bg-violet-500/10 text-violet-300 border-violet-500/20'
+                      }`}>
+                        {blockLabel(latest, scale)}
+                      </span>
+                    </td>
                     <td className="px-4 py-2 text-right font-mono text-slate-300">{fmt(latest[metricKey(scale, 'ratio')], 3)}</td>
+                    <td className="px-4 py-2 text-right font-mono text-slate-300">{refGuided ? fmt(windowSize, 0) : '-'}</td>
                     <td className="px-4 py-2 text-right font-mono text-slate-300">
                       {fmt(latest[metricKey(scale, 'k_over_N')], 4)}
                       <span className="text-slate-600 ml-1">({fmt(latest[metricKey(scale, 'k')], 0)}/{fmt(latest[metricKey(scale, 'N')], 0)})</span>

@@ -1173,6 +1173,12 @@ class CustomDetectionTrainer(DetectionTrainer):
             if N is not None and k is not None and N > 0:
                 metrics[f'{tag}_k_over_N'] = float(k) / float(N)
 
+            is_reference_guided = blk.__class__.__name__ == 'ReferenceGuidedSparseBlock'
+            metrics[f'{tag}_reference_guided'] = 1.0 if is_reference_guided else 0.0
+            window_size = getattr(getattr(blk, 'aggregator', None), 'window_size', None)
+            if window_size is not None:
+                metrics[f'{tag}_window_size'] = float(window_size)
+
             selected_ratio = getattr(blk, 'last_selected_ratio', None)
             if selected_ratio is not None:
                 metrics[f'{tag}_selected_ratio'] = float(selected_ratio)
