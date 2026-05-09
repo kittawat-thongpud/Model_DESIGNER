@@ -780,6 +780,7 @@ def run_worker(payload: dict[str, Any]) -> None:
     started = time.time()
     best_loss = float('inf')
     best_checkpoint: Path | None = None
+    seen_epochs = set()  # Track seen epochs for dedup
     
     proc = subprocess.Popen(
         cmd,
@@ -793,36 +794,50 @@ def run_worker(payload: dict[str, Any]) -> None:
     
     # Track log.txt for metrics parsing
     log_path = out_dir / "log.txt"
+    ext_metrics_path = job_dir / "extended_metrics.jsonl"
     last_log_size = 0
     
     for line in proc.stdout or []:
         _append_output_log(job_id, line)
         
-        # Parse metrics from log.txt when it updates
-        if log_path.exists():
-            current_size = log_path.stat().st_size
-            if current_size > last_log_size:
-                last_log_size = current_size
-                # Parse new lines from log.txt
+        # Parse metrics from stdout directly (like RT-DETRv2)
+        metrics = _parse_dino_metrics(line)
+        if metrics:
+            _update_job_metrics(job_id, metrics, batch, started)
+            
+            # Write to extended_metrics.jsonl (like RT-DETRv2)
+            epoch = metrics.get("epoch")
+            if epoch is not None and epoch not in seen_epochs:
+                seen_epochs.add(epoch)
+                epoch_data = {
+                    "epoch": epoch,
+                    "timestamp": time.time(),
+                    "loss": metrics.get("train_loss"),
+                    "lr": metrics.get("train_lr"),
+                    "weight_decay": metrics.get("weight_decay"),
+                    "time_per_iter": metrics.get("time_per_iter"),
+                    "data_time": metrics.get("data_time"),
+                    "max_mem_mb": metrics.get("max_mem_mb"),
+                    "eta": metrics.get("eta"),
+                }
+                # Remove None values
+                epoch_data = {k: v for k, v in epoch_data.items() if v is not None}
                 try:
-                    with open(log_path, 'r') as f:
-                        for log_line in f.readlines():
-                            metrics = _parse_dino_metrics(log_line)
-                            if metrics:
-                                _update_job_metrics(job_id, metrics, batch, started)
-                                
-                                # Track best checkpoint
-                                train_loss = metrics.get("train_loss")
-                                if train_loss is not None and isinstance(train_loss, (int, float)):
-                                    if train_loss < best_loss:
-                                        best_loss = train_loss
-                                        # Copy current checkpoint to best.pth
-                                        current_ckpt = out_dir / "checkpoint.pth"
-                                        if current_ckpt.exists():
-                                            best_ckpt = out_dir / "best.pth"
-                                            shutil.copy2(current_ckpt, best_ckpt)
+                    with ext_metrics_path.open("a") as mf:
+                        mf.write(json.dumps(epoch_data) + "\n")
                 except Exception:
                     pass
+            
+            # Track best checkpoint
+            train_loss = metrics.get("train_loss")
+            if train_loss is not None and isinstance(train_loss, (int, float)):
+                if train_loss < best_loss:
+                    best_loss = train_loss
+                    # Copy current checkpoint to best.pth
+                    current_ckpt = out_dir / "checkpoint.pth"
+                    if current_ckpt.exists():
+                        best_ckpt = out_dir / "best.pth"
+                        shutil.copy2(current_ckpt, best_ckpt)
     
     returncode = proc.wait()
     if returncode != 0:
