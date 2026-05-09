@@ -272,6 +272,13 @@ def create_app() -> FastAPI:
     counts = discover_plugins()
     logger.log("system", "INFO", f"Plugins discovered: {counts}")
 
+    # ── Startup: RunPod GPU keepalive ───────────────────────────────────────
+    try:
+        from .services.gpu_keepalive import start_keepalive
+        start_keepalive()
+    except Exception as e:
+        logger.log("system", "WARNING", f"GPU keepalive startup failed: {e}")
+
     # ── Startup: clean up stale running jobs ────────────────────────────────
     try:
         from .services.ultra_trainer import cleanup_stale_jobs
@@ -314,6 +321,11 @@ def create_app() -> FastAPI:
                 logger.log("system", "WARNING", "Training workers stopped for shutdown", stopped)
         except Exception as e:
             logger.log("system", "WARNING", f"Training worker shutdown failed: {e}")
+        try:
+            from .services.gpu_keepalive import stop_keepalive
+            stop_keepalive(timeout=stop_timeout)
+        except Exception as e:
+            logger.log("system", "WARNING", f"GPU keepalive shutdown failed: {e}")
 
     # ── Frontend static files (production) ───────────────────────────────────
     from pathlib import Path as _Path

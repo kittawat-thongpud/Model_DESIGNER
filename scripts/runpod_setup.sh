@@ -25,6 +25,10 @@ fi
 REQ="${REPO_DIR}/requirements.txt"
 PYTHON="${MODEL_DESIGNER_PYTHON:-$(which python3)}"
 LOG_PREFIX="[runpod_setup]"
+CUDA_WAIT_SECONDS="${RUNPOD_CUDA_WAIT_SECONDS:-120}"
+CUDA_WAIT_STEP_SECONDS="${RUNPOD_CUDA_WAIT_STEP_SECONDS:-5}"
+GPU_KEEPALIVE="${RUNPOD_GPU_KEEPALIVE:-0}"
+GPU_KEEPALIVE_INTERVAL="${RUNPOD_GPU_KEEPALIVE_INTERVAL:-60}"
 
 echo "=================================================="
 echo " Model DESIGNER — RunPod Setup"
@@ -43,6 +47,7 @@ if [ "${NVIDIA_VISIBLE_DEVICES:-}" = "void" ] || [ "${NVIDIA_VISIBLE_DEVICES:-}"
         echo "${LOG_PREFIX} Normalized NVIDIA_VISIBLE_DEVICES=all for RunPod GPU access."
     fi
 fi
+export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}"
 
 # ── 1. Sanity check ───────────────────────────────────────────────────────────
 if [ ! -f "${REQ}" ]; then
@@ -65,6 +70,70 @@ echo "${LOG_PREFIX} Installing Python dependencies from ${REQ} ..."
     --no-warn-script-location
 
 echo "${LOG_PREFIX} Python dependencies ready."
+
+# ── 2.5. Wait for RunPod GPU handoff ─────────────────────────────────────────
+# RunPod can expose nvidia-smi before CUDA is usable from torch. Starting the
+# backend too early can poison the long-lived process with a broken CUDA state.
+echo "${LOG_PREFIX} Waiting for CUDA readiness (timeout ${CUDA_WAIT_SECONDS}s) ..."
+cuda_wait_deadline=$((SECONDS + CUDA_WAIT_SECONDS))
+while true; do
+    if "${PYTHON}" - <<'PYCHECK' >/tmp/model_designer_cuda_check.log 2>&1
+import torch
+if not torch.cuda.is_available():
+    raise SystemExit("torch.cuda.is_available() is False")
+count = torch.cuda.device_count()
+if count <= 0:
+    raise SystemExit("torch.cuda.device_count() is 0")
+print(f"torch={torch.__version__}, cuda={torch.version.cuda}, gpu_count={count}, gpu0={torch.cuda.get_device_name(0)}")
+PYCHECK
+    then
+        sed "s/^/${LOG_PREFIX} CUDA ready: /" /tmp/model_designer_cuda_check.log
+        break
+    fi
+
+    if [ "${SECONDS}" -ge "${cuda_wait_deadline}" ]; then
+        echo "${LOG_PREFIX} ERROR: CUDA did not become ready within ${CUDA_WAIT_SECONDS}s."
+        sed "s/^/${LOG_PREFIX} CUDA check: /" /tmp/model_designer_cuda_check.log || true
+        echo "${LOG_PREFIX} NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-<unset>}"
+        echo "${LOG_PREFIX} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L | sed "s/^/${LOG_PREFIX} nvidia-smi: /" || true
+        fi
+        echo "${LOG_PREFIX} Restart the RunPod pod or verify the pod was launched with a GPU attached."
+        exit 1
+    fi
+
+    echo "${LOG_PREFIX} CUDA not ready yet; retrying in ${CUDA_WAIT_STEP_SECONDS}s ..."
+    sleep "${CUDA_WAIT_STEP_SECONDS}"
+done
+
+start_gpu_keepalive() {
+    if [ "${GPU_KEEPALIVE}" != "1" ]; then
+        return
+    fi
+
+    echo "${LOG_PREFIX} Starting RunPod GPU keepalive every ${GPU_KEEPALIVE_INTERVAL}s."
+    (
+        while true; do
+            # Do not touch CUDA while a training worker is active. The pulse is
+            # short-lived so it releases its CUDA context before training starts.
+            if find "${REPO_DIR}/backend/data/jobs" -name worker_process.pid -type f 2>/dev/null | grep -q .; then
+                sleep "${GPU_KEEPALIVE_INTERVAL}"
+                continue
+            fi
+
+            "${PYTHON}" - <<'PYCHECK' >/tmp/model_designer_gpu_keepalive.log 2>&1 || true
+import torch
+if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    x = torch.empty((1,), device="cuda")
+    x.fill_(1.0)
+    torch.cuda.synchronize()
+PYCHECK
+            sleep "${GPU_KEEPALIVE_INTERVAL}"
+        done
+    ) &
+    echo "$!" > /tmp/model_designer_gpu_keepalive.pid
+}
 
 # ── 3. Verify critical imports ────────────────────────────────────────────────
 echo "${LOG_PREFIX} Verifying critical imports ..."
@@ -102,4 +171,5 @@ echo "${LOG_PREFIX} Data directories ready at ${DATA_DIR}"
 # ── 5. Start server ───────────────────────────────────────────────────────────
 echo "${LOG_PREFIX} Starting Model DESIGNER server ..."
 export MODEL_DESIGNER_PYTHON="${PYTHON}"
+start_gpu_keepalive
 exec bash "${REPO_DIR}/run.sh"
