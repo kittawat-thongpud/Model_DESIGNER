@@ -124,3 +124,35 @@ for _scale in ("n", "s", "m", "l"):
 
 # V2 is currently installed for N-scale only while it is being validated.
 register_arch(HSGDetRPlugin("n", variant="v2"))
+
+# V2B-N: gamma_init=0.01 debug variant
+class HSGDetRV2BPlugin(HSGDetRPlugin):
+    """V2B variant with gamma_init=0.01 for gamma convergence debugging."""
+    
+    def __init__(self):
+        super().__init__("n", variant="v2")
+    
+    @property
+    def name(self) -> str:
+        return "hsg_detr_v2b_n"
+    
+    @property
+    def scale(self) -> str:
+        return "v2b-n"
+    
+    @property
+    def scale_label(self) -> str:
+        return "V2B-N (gamma_init=0.01 debug)"
+    
+    @property
+    def description(self) -> str:
+        return (
+            "HSG-DETR V2B-N — gamma_init=0.01 debug variant for gamma convergence testing. "
+            "Same architecture as V2-N but starts gamma at 0.01 instead of 1e-4 to test "
+            "whether gamma can grow beyond the 0.02 saturation point observed in V2 runs."
+        )
+    
+    def yaml_path(self) -> Path:
+        return _CONFIGS_DIR / "hsg_detr_v2b_n.yaml"
+
+register_arch(HSGDetRV2BPlugin())

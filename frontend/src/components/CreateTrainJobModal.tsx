@@ -126,7 +126,6 @@ const HSG_DETR_V2_FALLBACK: ArchFamily = {
   description: 'AMP-safe HSG-DETR V2 sparse-token encoder with Look-Forward-Twice decoder and uncertainty-minimal query selection.',
   supported_scales: [
     { scale: 'n', label: 'Nano (~5.9 M, ~9.6 GFLOPs) — 100 queries', plugin_name: 'hsg_detr_v2_n' },
-    { scale: 'v2b-n', label: 'V2B-N (gamma_init=0.01 debug)', plugin_name: 'hsg_detr_v2b_n' },
   ],
 };
 
