@@ -753,22 +753,44 @@ def run_worker(payload: dict[str, Any]) -> None:
         class_dir = imagefolder_dir / "all"
         class_dir.mkdir(parents=True, exist_ok=True)
         seen: set[str] = set()
+        valid_count = 0
+        skipped_count = 0
         for idx, image_path in enumerate(image_paths):
+            # Validate that source file exists
+            if not image_path.exists():
+                skipped_count += 1
+                continue
             suffix = image_path.suffix.lower() or ".jpg"
             name = f"{idx:08d}_{image_path.stem}{suffix}"
             while name in seen:
                 name = f"{idx:08d}_{uuid.uuid4().hex[:8]}{suffix}"
             seen.add(name)
-            _safe_link_or_copy(image_path.resolve(), class_dir / name)
+            try:
+                _safe_link_or_copy(image_path.resolve(), class_dir / name)
+                valid_count += 1
+            except Exception as e:
+                skipped_count += 1
+                job_storage.append_job_log(
+                    job_id,
+                    "WARNING",
+                    f"Failed to create symlink for {image_path}: {e}",
+                )
+        
+        if skipped_count > 0:
+            job_storage.append_job_log(
+                job_id,
+                "WARNING",
+                f"DINO ImageFolder: skipped {skipped_count} invalid/broken files out of {len(image_paths)} total",
+            )
         
         job_storage.append_job_log(
             job_id,
             "INFO",
-            f"DINO ImageFolder export: train={len(image_paths)} images, class_folder=all",
-            {"imagefolder": str(imagefolder_dir), "source": "partition_txt_files"},
+            f"DINO ImageFolder export: train={valid_count} valid images, class_folder=all",
+            {"imagefolder": str(imagefolder_dir), "source": "partition_txt_files", "skipped": skipped_count},
         )
         imagefolder = imagefolder_dir
-        image_count = len(image_paths)
+        image_count = valid_count
     else:
         # Fallback: use data.yaml method (no partition_configs)
         data_yaml_path = job_dir / "data.yaml"
