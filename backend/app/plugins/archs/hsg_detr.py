@@ -134,15 +134,15 @@ class HSGDetRV2BPlugin(HSGDetRPlugin):
     
     @property
     def name(self) -> str:
-        return "hsg_detr_v2b_n"
+        return "hsg_detr_v2_v2b"
     
     @property
     def scale(self) -> str:
-        return "v2b-n"
+        return "v2b"
     
     @property
     def scale_label(self) -> str:
-        return "V2B-N (gamma_init=0.01 debug)"
+        return "V2B (gamma_init=0.01 debug)"
     
     @property
     def family(self) -> str:
@@ -151,7 +151,7 @@ class HSGDetRV2BPlugin(HSGDetRPlugin):
     @property
     def description(self) -> str:
         return (
-            "HSG-DETR V2B-N — gamma_init=0.01 debug variant for gamma convergence testing. "
+            "HSG-DETR V2B — gamma_init=0.01 debug variant for gamma convergence testing. "
             "Same architecture as V2-N but starts gamma at 0.01 instead of 1e-4 to test "
             "whether gamma can grow beyond the 0.02 saturation point observed in V2 runs."
         )
