@@ -306,41 +306,85 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
             bufsize=1,
         )
         
-        # Parse k-NN results from output
         knn_accuracy = None
-        for line in proc.stdout or []:
-            _append_output_log(job_id, line)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            job_storage.append_job_log(job_id, "INFO", f"k-NN eval: {line}")
             # Parse k-NN accuracy from output
-            m = re.search(r"k-NN\s*accuracy:\s*([\d.]+)", line)
-            if m:
-                knn_accuracy = float(m.group(1))
+            if "k-NN classifier" in line and "%" in line:
+                try:
+                    # Expected format: "k-NN classifier @k=200: 75.23%"
+                    accuracy_str = line.split(":")[1].strip().replace("%", "")
+                    knn_accuracy = float(accuracy_str) / 100.0
+                except (IndexError, ValueError):
+                    pass
         
-        returncode = proc.wait()
+        proc.wait()
         
-        if returncode == 0 and knn_accuracy is not None:
-            # Update job with k-NN accuracy as validation metric
-            job = job_storage.load_job(job_id)
-            if job:
-                history = list(job.get("history") or [])
-                # Add k-NN accuracy to last history entry or create new entry
-                if history:
-                    history[-1]["knn_accuracy"] = knn_accuracy
-                else:
-                    history.append({
-                        "knn_accuracy": knn_accuracy,
-                        "timestamp": time.time(),
-                    })
-                
-                job_storage.save_job({**job, "history": history, "knn_accuracy": knn_accuracy})
-                job_storage.append_job_log(job_id, "INFO", f"k-NN evaluation complete: accuracy = {knn_accuracy:.2%}")
-                
-                # Publish update with k-NN accuracy
-                _publish(job_id, {**job, "knn_accuracy": knn_accuracy})
+        if proc.returncode != 0:
+            job_storage.append_job_log(job_id, "WARNING", f"k-NN evaluation failed with code {proc.returncode}")
         else:
-            job_storage.append_job_log(job_id, "WARNING", "k-NN evaluation failed or did not produce accuracy")
+            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation completed")
             
+            # Update job with k-NN accuracy
+            if knn_accuracy is not None:
+                job = job_storage.load_job(job_id)
+                if job:
+                    history = list(job.get("history") or [])
+                    if history:
+                        history[-1]["knn_accuracy"] = knn_accuracy
+                    job["knn_accuracy"] = knn_accuracy
+                    job["history"] = history
+                    job_storage.save_job(job)
+                    job_storage.append_job_log(job_id, "INFO", f"k-NN accuracy: {knn_accuracy:.4f}")
+                    
+                    # Publish update
+                    event_bus.publish_sync(job_channel(job_id), {"type": "job_update", "job_id": job_id, "knn_accuracy": knn_accuracy})
+        
     except Exception as e:
         job_storage.append_job_log(job_id, "WARNING", f"k-NN evaluation error: {str(e)}")
+
+
+def _checkpoint_candidates(out_dir: Path) -> list[Path]:
+    """Return list of checkpoint file paths to try, in priority order."""
+    return [
+        out_dir / "checkpoint.pth",
+        *sorted(out_dir.rglob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True),
+    ]
+
+
+def _save_weight(job_id: str, out_dir: Path) -> str | None:
+    """Find and save DINO checkpoint to weight storage."""
+    checkpoint = next((p for p in _checkpoint_candidates(out_dir) if p.exists()), None)
+    if checkpoint is None:
+        return None
+    
+    from . import weight_storage
+    
+    job = job_storage.load_job(job_id) or {}
+    weight_id = uuid.uuid4().hex[:12]
+    dest_dir = WEIGHTS_DIR / weight_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    
+    shutil.copy2(checkpoint, dest_dir / "weight.pt")
+    
+    cfg = job.get("config", {})
+    weight_storage.save_weight_meta(
+        model_id=job.get("model_id", ""),
+        model_name=job.get("model_name", "DINO"),
+        model_scale=job.get("model_scale", ""),
+        job_id=job_id,
+        dataset=cfg.get("dataset_name") or cfg.get("data", ""),
+        epochs_trained=job.get("total_epochs", 0),
+        final_accuracy=job.get("knn_accuracy"),
+        checkpoint_path=str(checkpoint),
+        weight_id=weight_id,
+    )
+    
+    job_storage.append_job_log(job_id, "INFO", f"Saved weight: {weight_id}")
+    return weight_id
 
 
 def _append_history_from_log(job_id: str, out_dir: Path) -> None:
@@ -805,7 +849,7 @@ def run_worker(payload: dict[str, Any]) -> None:
         _run_knn_evaluation(job_id, root, imagefolder, final_ckpt, spec, batch, workers, out_dir)
     
     _append_history_from_log(job_id, out_dir)
-    weight_id = _save_weight(job_id, out_dir, elapsed)
+    weight_id = _save_weight(job_id, out_dir)
     _set_job(
         job_id,
         status="completed",
