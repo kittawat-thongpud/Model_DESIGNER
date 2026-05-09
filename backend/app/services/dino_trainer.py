@@ -293,13 +293,62 @@ def _append_output_log(job_id: str, line: str) -> None:
 def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
     """Parse DINO log line for metrics."""
     try:
-        # DINO outputs JSON lines with metrics
+        # Try JSON format first (DINO log.txt outputs JSON)
         data = json.loads(line.strip())
         if isinstance(data, dict):
             return data
     except json.JSONDecodeError:
         pass
-    return None
+    
+    # Parse text format from stdout (e.g., "Epoch: [8/300]  [372/373]  eta: 0:00:00  loss: 4.870012 (5.043951)  lr: 0.000006 (0.000006)  wd: 0.050772 (0.050693)  time: 0.086712  data: 0.000046  max mem: 4157")
+    metrics = {}
+    
+    # Parse epoch
+    m = re.search(r"Epoch:\s*\[(\d+)/(\d+)\]", line)
+    if m:
+        metrics["epoch"] = int(m.group(1))
+        metrics["total_epochs"] = int(m.group(2))
+    
+    # Parse loss (current and average)
+    m = re.search(r"loss:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["train_loss"] = float(m.group(1))
+        metrics["train_loss_avg"] = float(m.group(2))
+    
+    # Parse learning rate
+    m = re.search(r"lr:\s*([\d.e-]+)\s*\(([\d.e-]+)\)", line)
+    if m:
+        metrics["train_lr"] = float(m.group(1))
+        metrics["train_lr_avg"] = float(m.group(2))
+    
+    # Parse weight decay
+    m = re.search(r"wd:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["weight_decay"] = float(m.group(1))
+        metrics["weight_decay_avg"] = float(m.group(2))
+    
+    # Parse time per iteration
+    m = re.search(r"time:\s*([\d.]+)", line)
+    if m:
+        metrics["time_per_iter"] = float(m.group(1))
+    
+    # Parse data loading time
+    m = re.search(r"data:\s*([\d.]+)", line)
+    if m:
+        metrics["data_time"] = float(m.group(1))
+    
+    # Parse max memory
+    m = re.search(r"max mem:\s*(\d+)", line)
+    if m:
+        metrics["max_mem_mb"] = int(m.group(1))
+    
+    # Parse ETA
+    m = re.search(r"eta:\s*([\d:]+)", line)
+    if m:
+        metrics["eta"] = m.group(1)
+    
+    # Return metrics if we found at least epoch
+    return metrics if "epoch" in metrics else None
 
 def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
     """Update job with training metrics."""
@@ -311,19 +360,39 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
     epoch = metrics.get("epoch", job.get("epoch", 0))
     train_loss = metrics.get("train_loss")
     train_lr = metrics.get("train_lr")
+    weight_decay = metrics.get("weight_decay")
+    time_per_iter = metrics.get("time_per_iter")
+    data_time = metrics.get("data_time")
+    max_mem_mb = metrics.get("max_mem_mb")
+    eta = metrics.get("eta")
     
     updates = {"epoch": epoch}
     if train_loss is not None:
         updates["loss"] = float(train_loss)
     if train_lr is not None:
         updates["lr"] = float(train_lr)
+    if weight_decay is not None:
+        updates["weight_decay"] = float(weight_decay)
+    if time_per_iter is not None:
+        updates["time_per_iter"] = float(time_per_iter)
+    if data_time is not None:
+        updates["data_time"] = float(data_time)
+    if max_mem_mb is not None:
+        updates["max_mem_mb"] = int(max_mem_mb)
+    if eta is not None:
+        updates["eta"] = eta
     
-    # Update history
+    # Update history with all basic metrics
     history = list(job.get("history") or [])
     history.append({
         "epoch": epoch,
         "loss": train_loss,
         "lr": train_lr,
+        "weight_decay": weight_decay,
+        "time_per_iter": time_per_iter,
+        "data_time": data_time,
+        "max_mem_mb": max_mem_mb,
+        "eta": eta,
         "timestamp": time.time(),
         "metrics": metrics,
     })
