@@ -821,6 +821,33 @@ def run_worker(payload: dict[str, Any]) -> None:
         if metrics:
             _update_job_metrics(job_id, metrics, batch, started)
             
+            # Publish SSE progress event (like Ultralytics)
+            epoch = metrics.get("epoch")
+            iteration = metrics.get("iteration")
+            total_iterations = metrics.get("total_iterations")
+            if epoch is not None:
+                system_res = _get_system_resources()
+                progress_data = {
+                    'type': 'progress',
+                    'phase': 'train',
+                    'epoch': f"{epoch}/{epochs}",
+                    'batch': f"{iteration}/{total_iterations}" if iteration and total_iterations else "0/0",
+                    'percent': int((iteration / total_iterations) * 100) if iteration and total_iterations else 0,
+                    'losses': {
+                        'box': metrics.get("train_loss"),  # DINO uses single loss, map to box loss
+                    },
+                    'device': device if device else 'cuda:0' if config.get("device") != 'cpu' else 'cpu',
+                    'ram_gb': system_res["ram_used_gb"],
+                    'ram_total_gb': system_res["ram_total_gb"],
+                    'gpu_mem_gb': metrics.get("max_mem_mb", 0) / 1024 if metrics.get("max_mem_mb") else None,
+                    'total_elapsed_s': time.time() - started,
+                    'epoch_elapsed_s': None,  # DINO doesn't track epoch start time
+                    'avg_epoch_s': job.get("avg_epoch_time"),
+                    'eta_s': None,  # DINO provides eta as string, not seconds
+                    'imgs_per_sec': batch / metrics.get("time_per_iter", 1) if metrics.get("time_per_iter") else None,
+                }
+                event_bus.publish_sync(job_channel(job_id), progress_data)
+            
             # Write to extended_metrics.jsonl (like RT-DETRv2)
             # Field names MUST match Ultralytics-style names for frontend compatibility
             epoch = metrics.get("epoch")
