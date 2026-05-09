@@ -354,6 +354,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
 
   const progress = job.total_epochs ? (job.epoch / job.total_epochs) * 100 : 0;
   const isDetection = job.task === 'detect' || true; // Default to true for now
+  const isSelfSupervised = (job as any).model === 'dino' || false;
   const bestMap = job.best_mAP50 ?? (job.history.length > 0 ? Math.max(...job.history.map(h => Number(h.mAP50 || 0))) : 0);
   const timeElapsed = job.total_time ? `${(job.total_time / 60).toFixed(0)}m` : (job.history.length > 0 ? `${(job.history.reduce((s, h) => s + (h.epoch_time || 0), 0) / 60).toFixed(0)}m` : '-');
 
@@ -564,7 +565,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
         })()}
 
         {/* Charts */}
-        <JobCharts history={job.history} isDetection={isDetection} />
+        <JobCharts history={job.history} isDetection={isDetection} isSelfSupervised={isSelfSupervised} />
 
         {/* HSG-DETR Internals (SGB, Decoder, Gradients) */}
         {hsgMetricsHistory.length > 0 && (

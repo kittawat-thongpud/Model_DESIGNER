@@ -188,6 +188,7 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
 
   const totalParams = job?.model_params ?? job?.trainable_params ?? null;
   const isDetection = (job?.task ?? weight.dataset_name ?? '').toLowerCase().includes('detect');
+  const isSelfSupervised = (job as any)?.model === 'dino' || false;
   const hasHistory = history.length > 0;
 
   // Usage code snippet
@@ -410,7 +411,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
               {job ? (
                 <>
                   {/* Training Charts */}
-                  <JobCharts history={history} isDetection={isDetection} />
+                  <JobCharts history={history} isDetection={isDetection} isSelfSupervised={isSelfSupervised} />
 
                   {/* HSG-DETR Internals */}
                   {(() => {

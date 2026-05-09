@@ -27,6 +27,7 @@ import { EpochMetrics } from '../types';
 interface JobChartsProps {
   history: EpochMetrics[];
   isDetection: boolean;
+  isSelfSupervised?: boolean;
 }
 
 // ─── 1. Custom Tooltip ───────────────────────────────────────────────────────
@@ -166,7 +167,7 @@ const SmallLossChart: React.FC<SmallLossChartProps> = ({ title, data, trainKey, 
 
 // ─── 4. Main Charts Component ────────────────────────────────────────────────
 
-const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection }) => {
+const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSupervised }) => {
   if (!history || history.length === 0) return null;
 
   const latest = history[history.length - 1];
@@ -184,6 +185,41 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection }) => {
     <div className="space-y-6 animate-in fade-in duration-500">
       
       {/* SECTION 1: PERFORMANCE METRICS */}
+      {isSelfSupervised && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* k-NN Accuracy Chart */}
+          <ChartCard 
+            title="k-NN Accuracy" 
+            icon={<Target size={18} className="text-emerald-400" />}
+            latestValue={latest.knn_accuracy ? `${(Number(latest.knn_accuracy) * 100).toFixed(2)}%` : '-'}
+            trend={getTrend('knn_accuracy')}
+          >
+            <AreaChart data={history.filter(h => h.knn_accuracy)} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="colorkNN" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+              <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
+              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => Number(v).toFixed(4)} />
+              <Tooltip content={<CustomTooltip />} />
+              <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
+              <Area type="monotone" dataKey="knn_accuracy" name="k-NN Accuracy" stroke="#10b981" strokeWidth={2} fillOpacity={1} fill="url(#colorkNN)" />
+              <Brush 
+                dataKey="epoch" 
+                height={20} 
+                stroke="#475569" 
+                fill="#0f1117" 
+                tickFormatter={() => ''}
+                travellerWidth={10}
+              />
+            </AreaChart>
+          </ChartCard>
+        </div>
+      )}
+      
       {isDetection && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* mAP Chart */}
