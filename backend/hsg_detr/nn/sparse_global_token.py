@@ -179,7 +179,6 @@ class SGTokenBlock(nn.Module):
     ) -> None:
         """Drop obsolete sparse-block keys and incompatible legacy Conv2d projections."""
         legacy_roots = {
-            "saliency_head",
             "saliency_mix",
             "chan_fc1",
             "chan_fc2",
@@ -325,6 +324,12 @@ class SGTokenBlock(nn.Module):
         B, C, H, W = x_norm.shape
         scores = self.saliency_head(x_norm.to(dtype=sal_dtype))   # (B, 1, H, W)
         scores_flat = scores.view(B, H * W)                        # (B, N)
+        # Keep the old activation-energy selector as a non-learnable prior so
+        # a zero-initialized saliency head does not make top-k pick fixed
+        # arbitrary positions at the start of training.
+        energy_prior = x_norm.detach().float().view(B, C, H * W).pow(2).mean(dim=1)
+        energy_prior = energy_prior / energy_prior.mean(dim=1, keepdim=True).clamp(min=1e-6)
+        scores_flat = scores_flat + energy_prior.to(dtype=scores_flat.dtype)
         return torch.nan_to_num(scores_flat, nan=0.0, posinf=0.0, neginf=0.0)
 
     @staticmethod
@@ -356,7 +361,11 @@ class SGTokenBlock(nn.Module):
             torch.cos(x_f.unsqueeze(-1) * freq),
             torch.sin(y_f.unsqueeze(-1) * freq),
             torch.cos(y_f.unsqueeze(-1) * freq),
-        ], dim=-1)                                    # (B, k, dim)
+        ], dim=-1)                                    # (B, k, 4*d)
+        if enc.shape[-1] < dim:
+            enc = F.pad(enc, (0, dim - enc.shape[-1]))
+        elif enc.shape[-1] > dim:
+            enc = enc[..., :dim]
         return enc * (dim ** -0.5)                    # normalise magnitude
 
     def _select_k(self, N: int) -> int:

@@ -40,7 +40,7 @@ def _selected_mask(torch, indices, channels: int, height: int, width: int):
 
 
 def _sparse_params(block):
-    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj):
+    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj, block.saliency_head):
         yield from module.parameters()
 
 
@@ -66,7 +66,7 @@ def test_sg_token_contract(torch, device: str) -> None:
 
     _require(y.shape == x.shape, f"shape changed: {tuple(x.shape)} -> {tuple(y.shape)}")
     _require(torch.isfinite(y).all().item(), "forward output contains NaN/Inf")
-    _require(abs(float(block.gamma.detach().mean()) - 0.05) < 1e-6, "gamma_init is not 0.05")
+    _require(abs(float(block.gamma.detach().mean()) - 0.10) < 1e-6, "gamma_init is not 0.10")
     _require(state["k"] == 4 and state["N"] == 16, f"unexpected top-k metadata: {state}")
 
     diff = y - x
@@ -121,7 +121,7 @@ def test_model_forward(torch, device: str, imgsz: int) -> None:
     model = RTDETR(str(cfg)).model.to(device).eval()
     sgb_blocks = [m for m in model.modules() if m.__class__.__name__ == "SGTokenBlock"]
     _require(len(sgb_blocks) > 0, "model has no SGTokenBlock modules")
-    _require(all(abs(float(b.gamma.detach().mean()) - 0.05) < 1e-6 for b in sgb_blocks), "some SGB gamma values are not initialized to 0.05")
+    _require(all(abs(float(b.gamma.detach().mean()) - 0.10) < 1e-6 for b in sgb_blocks), "some SGB gamma values are not initialized to 0.10")
 
     x = torch.randn(1, 3, imgsz, imgsz, device=device)
     amp_device = "cuda" if device.startswith("cuda") else "cpu"

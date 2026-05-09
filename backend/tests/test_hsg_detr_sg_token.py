@@ -27,14 +27,14 @@ def _selected_mask(indices: torch.Tensor, channels: int, height: int, width: int
 
 
 def _sparse_params(block: SGTokenBlock):
-    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj):
+    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj, block.saliency_head):
         yield from module.parameters()
 
 
 def test_sg_token_block_shape_and_gamma_init():
     block = SGTokenBlock(16, 16, ratio=0.25, debug_enabled=True)
     assert block.gamma.shape == (1, 16, 1, 1)
-    assert float(block.gamma.detach().mean()) == pytest.approx(0.05)
+    assert float(block.gamma.detach().mean()) == pytest.approx(0.10)
 
     x = torch.randn(2, 16, 8, 8)
     y = block(x)
@@ -43,8 +43,8 @@ def test_sg_token_block_shape_and_gamma_init():
     state = block.get_debug_state()
     assert state["k"] == 16
     assert state["selected_ratio"] == pytest.approx(0.25)
-    assert state["gamma_raw_abs_mean"] == pytest.approx(0.05)
-    assert state["gamma_abs_mean"] == pytest.approx(0.05)
+    assert state["gamma_raw_abs_mean"] == pytest.approx(0.10)
+    assert state["gamma_abs_mean"] == pytest.approx(0.10)
     assert state["gamma_floor"] == pytest.approx(0.01)
     assert state["delta_scaled_norm_selected"] is not None
 
@@ -96,3 +96,23 @@ def test_sparse_params_receive_selected_token_gradients():
     assert sparse_grad.item() > 0
     assert block.get_debug_state()["selected_grad_norm"] is not None
     assert block.get_debug_state()["nonselected_sparse_grad"] == pytest.approx(0.0)
+
+
+def test_saliency_head_round_trips_in_state_dict():
+    source = SGTokenBlock(8, 8, ratio=0.25)
+    target = SGTokenBlock(8, 8, ratio=0.25)
+    with torch.no_grad():
+        source.saliency_head[-1].bias.fill_(3.14)
+
+    target.load_state_dict(source.state_dict(), strict=True)
+
+    assert float(target.saliency_head[-1].bias.detach().mean()) == pytest.approx(3.14)
+
+
+def test_positional_encoding_handles_non_multiple_of_four_channels():
+    block = SGTokenBlock(10, 10, ratio=0.25)
+    x = torch.randn(1, 10, 4, 4)
+    y = block(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
