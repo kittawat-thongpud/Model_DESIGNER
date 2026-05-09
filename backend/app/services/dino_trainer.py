@@ -704,26 +704,92 @@ def run_worker(payload: dict[str, Any]) -> None:
     if not dataset_registry.is_image_dataset(data_arg):
         raise RuntimeError(f"DINO requires a registered image dataset, got: {data_arg!r}")
 
-    data_yaml_path = job_dir / "data.yaml"
-    dataset_yaml.write_data_yaml(
-        data_arg,
-        data_yaml_path,
-        partition_configs=partition_configs if partition_configs else None,
-    )
-    config["data"] = str(data_yaml_path)
-    config["dataset_name"] = data_arg
-    job = job_storage.load_job(job_id)
-    if job:
-        job["config"] = config.copy()
-        job_storage.save_job(job)
-
+    # Prepare imagefolder directly from partition TXT files (one source of truth)
+    # Skip data.yaml generation for DINO since it's not needed
     max_images = int(config.get("dino_max_images") or config.get("max_images") or 0) or None
-    imagefolder, image_count = _prepare_imagefolder(
-        job_id,
-        data_yaml_path,
-        job_dir / "dino_imagefolder",
-        max_images=max_images,
-    )
+    
+    # If partition_configs provided, read image paths directly from TXT files
+    if partition_configs:
+        # Generate partition TXT files (same as dataset_yaml.write_data_yaml does)
+        txt_splits = dataset_yaml.generate_partition_txt_splits(
+            data_arg,
+            partition_configs
+        )
+        
+        image_paths = []
+        if "train" in txt_splits:
+            txt_path = txt_splits["train"]
+            if txt_path.exists():
+                image_paths.extend([
+                    Path(line.strip())
+                    for line in txt_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ])
+        
+        if not image_paths:
+            # Fallback: use data.yaml method
+            data_yaml_path = job_dir / "data.yaml"
+            dataset_yaml.write_data_yaml(
+                data_arg,
+                data_yaml_path,
+                partition_configs=partition_configs,
+            )
+            config["data"] = str(data_yaml_path)
+            config["dataset_name"] = data_arg
+            job = job_storage.load_job(job_id)
+            if job:
+                job["config"] = config.copy()
+                job_storage.save_job(job)
+            
+            data = _read_data_yaml(data_yaml_path)
+            image_paths = _resolve_split_paths(data, "train")
+        
+        # Limit images if max_images set
+        if max_images and max_images > 0:
+            image_paths = image_paths[:max_images]
+        
+        # Create symlinks in dino_imagefolder/all/
+        imagefolder_dir = job_dir / "dino_imagefolder"
+        class_dir = imagefolder_dir / "all"
+        class_dir.mkdir(parents=True, exist_ok=True)
+        seen: set[str] = set()
+        for idx, image_path in enumerate(image_paths):
+            suffix = image_path.suffix.lower() or ".jpg"
+            name = f"{idx:08d}_{image_path.stem}{suffix}"
+            while name in seen:
+                name = f"{idx:08d}_{uuid.uuid4().hex[:8]}{suffix}"
+            seen.add(name)
+            _safe_link_or_copy(image_path.resolve(), class_dir / name)
+        
+        job_storage.append_job_log(
+            job_id,
+            "INFO",
+            f"DINO ImageFolder export: train={len(image_paths)} images, class_folder=all",
+            {"imagefolder": str(imagefolder_dir), "source": "partition_txt_files"},
+        )
+        imagefolder = imagefolder_dir
+        image_count = len(image_paths)
+    else:
+        # Fallback: use data.yaml method (no partition_configs)
+        data_yaml_path = job_dir / "data.yaml"
+        dataset_yaml.write_data_yaml(
+            data_arg,
+            data_yaml_path,
+            partition_configs=None,
+        )
+        config["data"] = str(data_yaml_path)
+        config["dataset_name"] = data_arg
+        job = job_storage.load_job(job_id)
+        if job:
+            job["config"] = config.copy()
+            job_storage.save_job(job)
+        
+        imagefolder, image_count = _prepare_imagefolder(
+            job_id,
+            data_yaml_path,
+            job_dir / "dino_imagefolder",
+            max_images=max_images,
+        )
     if image_count < int(config.get("batch", 1)):
         job_storage.append_job_log(
             job_id,
