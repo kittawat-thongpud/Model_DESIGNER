@@ -957,10 +957,12 @@ def run_worker(payload: dict[str, Any]) -> None:
                 time_per_iter = metrics.get("time_per_iter")
                 imgs_per_sec = round(batch / time_per_iter, 1) if time_per_iter and time_per_iter > 0 else None
                 pct = round((iteration / total_iterations) * 100, 1) if iteration and total_iterations else 0.0
-                # Compute avg_epoch_s and eta_s from elapsed + epoch count
+                # Compute avg_epoch_s and total ETA for entire training
                 avg_epoch_s = round(total_elapsed_s / epoch, 1) if epoch > 0 else None
-                eta_s = metrics.get("eta_s")  # parsed from log string
-                if eta_s is None and avg_epoch_s:
+                # DINO log eta is per-epoch (time remaining in current epoch)
+                # We need total ETA for all remaining epochs
+                eta_s = None
+                if avg_epoch_s:
                     eta_s = round(avg_epoch_s * (epochs - epoch), 0)
                 progress_data: dict[str, Any] = {
                     "type": "progress",
