@@ -245,25 +245,23 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           </ResponsiveContainer>
         </ChartPanel>
 
-        {!hasV2ScoreStats && (
-          <ChartPanel title="Sparse LayerScale Gamma" icon={<Layers size={14} className="text-violet-400" />}>
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
-                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines('gamma_abs_mean')}
-                {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
-                  strokeDasharray: '3 3',
-                  strokeWidth: 1,
-                  name: `${line.props.name} floor`,
-                }))}
-              </LineChart>
-            </ResponsiveContainer>
-          </ChartPanel>
-        )}
+        <ChartPanel title="Sparse LayerScale Gamma" icon={<Layers size={14} className="text-violet-400" />}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+              <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+              <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+              <Tooltip content={<CustomTooltip />} />
+              <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+              {scaleLines('gamma_abs_mean')}
+              {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
+                strokeDasharray: '3 3',
+                strokeWidth: 1,
+                name: `${line.props.name} floor`,
+              }))}
+            </LineChart>
+          </ResponsiveContainer>
+        </ChartPanel>
 
         {hasV2ScoreStats && (
           <ChartPanel title="Score Std (Budget Formula)" icon={<Activity size={14} className="text-violet-400" />}>
