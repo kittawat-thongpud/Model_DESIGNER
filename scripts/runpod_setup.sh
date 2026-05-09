@@ -24,6 +24,17 @@ echo " PYTHON   : ${PYTHON}"
 echo " DATE     : $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "=================================================="
 
+# RunPod sometimes leaves NVIDIA_VISIBLE_DEVICES=void even when nvidia-smi can
+# see the GPU. Normalize this before importing torch so the backend worker
+# inherits a CUDA-visible environment.
+if [ "${NVIDIA_VISIBLE_DEVICES:-}" = "void" ] || [ "${NVIDIA_VISIBLE_DEVICES:-}" = "none" ] || [ -z "${NVIDIA_VISIBLE_DEVICES:-}" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        export NVIDIA_VISIBLE_DEVICES=all
+        export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
+        echo "${LOG_PREFIX} Normalized NVIDIA_VISIBLE_DEVICES=all for RunPod GPU access."
+    fi
+fi
+
 # ── 1. Sanity check ───────────────────────────────────────────────────────────
 if [ ! -f "${REQ}" ]; then
     echo "${LOG_PREFIX} ERROR: requirements.txt not found at ${REQ}"
