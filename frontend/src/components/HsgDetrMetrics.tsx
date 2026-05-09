@@ -203,7 +203,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           sub="LayerScale update"
         />
         {SCALES.map(scale => {
-          const selected = latest[metricKey(scale, 'selected_ratio')] ?? latest[metricKey(scale, 'k_over_N')];
+          const selected = latest[metricKey(scale, 'selected_ratio')];
           const gamma = latest[metricKey(scale, 'gamma_abs_mean')];
           const gammaRaw = latest[metricKey(scale, 'gamma_raw_abs_mean')];
           const gammaFloor = latest[metricKey(scale, 'gamma_floor')];
@@ -211,17 +211,21 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           const scoreStd = latest[metricKey(scale, 'score_std')];
           const isV2 = scoreStd != null;
 
-          // V2 shows different sub-label
+          // V2 shows different sub-label and value
           const subLabel = isV2
             ? `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | score_std=${fmt(scoreStd, 2)} | gamma=${fmt(gamma, 3)}`
             : `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`;
 
+          const cardValue = isV2 ? fmt(scoreStd, 3) : fmt(selected, 4);
+          const cardColor = isV2 ? '#a78bfa' : metricColor(delta);
+          const cardLabel = isV2 ? `${scale} score_std` : `${scale} selected`;
+
           return (
             <MetricCard
               key={scale}
-              label={`${scale} selected`}
-              value={fmt(selected, 4)}
-              color={metricColor(delta)}
+              label={cardLabel}
+              value={cardValue}
+              color={cardColor}
               sub={subLabel}
             />
           );
@@ -241,26 +245,8 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           </ResponsiveContainer>
         </ChartPanel>
 
-        <ChartPanel title="Sparse LayerScale Gamma" icon={<Layers size={14} className="text-violet-400" />}>
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
-              <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-              <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
-              <Tooltip content={<CustomTooltip />} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('gamma_abs_mean')}
-              {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
-                strokeDasharray: '3 3',
-                strokeWidth: 1,
-                name: `${line.props.name} floor`,
-              }))}
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartPanel>
-
         {!hasV2ScoreStats && (
-          <ChartPanel title={hasScaledDeltaMetrics ? 'Selected Delta After Gamma' : 'Selected Delta Norm'} icon={<Activity size={14} className="text-rose-400" />}>
+          <ChartPanel title="Sparse LayerScale Gamma" icon={<Layers size={14} className="text-violet-400" />}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
@@ -268,7 +254,12 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
+                {scaleLines('gamma_abs_mean')}
+                {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
+                  strokeDasharray: '3 3',
+                  strokeWidth: 1,
+                  name: `${line.props.name} floor`,
+                }))}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -284,6 +275,21 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
                 {scaleLines('score_std')}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        {!hasV2ScoreStats && (
+          <ChartPanel title={hasScaledDeltaMetrics ? 'Selected Delta After Gamma' : 'Selected Delta Norm'} icon={<Activity size={14} className="text-rose-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -344,6 +350,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <Line type="monotone" dataKey="grad/neck_norm" name="Neck" stroke="#fb923c" strokeWidth={1.5} dot={false} connectNulls />
               <Line type="monotone" dataKey="grad/sgb_sparse_norm" name="SGB Sparse" stroke="#f43f5e" strokeWidth={2} dot={false} connectNulls />
               <Line type="monotone" dataKey="grad/sgb_gamma_norm" name="SGB Gamma" stroke="#a78bfa" strokeWidth={2} dot={false} connectNulls />
+              <Line type="monotone" dataKey="grad/sgb_norm_norm" name="SGB Norm" stroke="#8b5cf6" strokeWidth={2} dot={false} connectNulls />
               <Line type="monotone" dataKey="grad/decoder_norm" name="Decoder" stroke="#10b981" strokeWidth={1.5} dot={false} connectNulls />
             </LineChart>
           </ResponsiveContainer>
