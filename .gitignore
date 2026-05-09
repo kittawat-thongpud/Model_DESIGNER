@@ -78,15 +78,7 @@ Desktop.ini
 logs/
 
 # ── Backend runtime data (jobs, weights, models stored locally) ───────────────
-backend/data/datasets/
-backend/data/jobs/
-backend/data/models/
-backend/data/weights/
-backend/data/*.db
-backend/data/*.sqlite
-backend/data/*.log
-!backend/data/config.json
-!backend/data/vendor/
+backend/data/
 
 # ── Secrets / env ─────────────────────────────────────────────────────────────
 .env
