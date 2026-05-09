@@ -29,8 +29,6 @@ runs/
 *.tflite
 *.torchscript
 data/
-backend/data/vendor/DINO/
-backend/data/vendor/DINO-DETR/
 benchmarks/
 jobs/
 inference/
