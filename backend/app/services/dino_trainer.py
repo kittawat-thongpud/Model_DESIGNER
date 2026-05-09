@@ -406,10 +406,10 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     spec = _SCALE_TO_SPEC[model_scale]
     batch = int(config["batch"] if config.get("batch") is not None else config.get("batch_size", 64))
-    workers = int(config["workers") if config.get("workers") is not None else 4)
+    workers = int(config["workers"]) if config.get("workers") is not None else 4
     epochs = int(config["epochs"] if config.get("epochs") is not None else 100)
     use_fp16 = bool(config.get("amp", True))
-    save_period = int(config["save_period") if config.get("save_period") is not None else 20)
+    save_period = int(config["save_period"]) if config.get("save_period") is not None else 20
     warmup_epochs = int(float(config.get("warmup_epochs", 10)))
     lr = float(config.get("lr0", config.get("lr", 0.0005)))
     min_lr = float(config.get("min_lr", 1e-6))
