@@ -20,7 +20,7 @@ from typing import Any
 import yaml
 
 from ..config import DATASETS_DIR, JOBS_DIR, WEIGHTS_DIR
-from ..constants import train_channel
+from ..constants import job_channel
 from . import dataset_registry, dataset_yaml, event_bus, job_storage
 
 
@@ -59,7 +59,15 @@ _SCALE_TO_SPEC = {
 
 
 def _publish(job_id: str, job: dict) -> None:
-    event_bus.publish_sync(train_channel(job_id), {"type": "status", **job})
+    event_bus.publish_sync(job_channel(job_id), {
+        "type": "job_update",
+        "job_id": job_id,
+        "status": job.get("status"),
+        "epoch": job.get("epoch", 0),
+        "total_epochs": job.get("total_epochs", 0),
+        "message": job.get("message", ""),
+        "best_fitness": job.get("best_fitness"),
+    })
 
 
 def _set_job(job_id: str, **updates: Any) -> dict | None:
