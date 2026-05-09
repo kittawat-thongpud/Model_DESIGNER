@@ -578,12 +578,28 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, s
     if avg_epoch_time is not None:
         updates["avg_epoch_time"] = round(avg_epoch_time)
     
-    # Update history with all basic metrics
+    # Update history with metrics matching EpochMetrics interface (frontend compatibility)
+    # Map DINO metrics to Ultralytics-style field names
     history = list(job.get("history") or [])
     history.append({
         "epoch": epoch,
-        "loss": train_loss,
+        # Loss: map DINO train_loss → Ultralytics box_loss (self-supervised loss)
+        "box_loss": train_loss,
+        "cls_loss": None,  # DINO doesn't have classification loss
+        "dfl_loss": None,  # DINO doesn't have distribution focal loss
+        # Learning rate
         "lr": train_lr,
+        # Epoch time
+        "epoch_time": epoch_time,
+        # GPU memory: map max_mem_mb → gpu_memory_mb
+        "gpu_memory_mb": max_mem_mb,
+        # Validation metrics: DINO is self-supervised, no mAP/Precision/Recall
+        "precision": None,
+        "recall": None,
+        "mAP50": None,
+        "mAP50_95": None,
+        "fitness": None,
+        # Additional DINO-specific metrics (frontend will ignore if not needed)
         "weight_decay": weight_decay,
         "time_per_iter": time_per_iter,
         "data_time": data_time,
@@ -592,7 +608,7 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, s
         "ram_used_gb": system_res["ram_used_gb"],
         "ram_total_gb": system_res["ram_total_gb"],
         "speed_img_s": speed_img_s if speed_img_s > 0 else None,
-        "epoch_time": epoch_time,
+        "avg_epoch_time": avg_epoch_time,
         "timestamp": time.time(),
         "metrics": metrics,
     })
@@ -806,14 +822,18 @@ def run_worker(payload: dict[str, Any]) -> None:
             _update_job_metrics(job_id, metrics, batch, started)
             
             # Write to extended_metrics.jsonl (like RT-DETRv2)
+            # Field names MUST match Ultralytics-style names for frontend compatibility
             epoch = metrics.get("epoch")
             if epoch is not None and epoch not in seen_epochs:
                 seen_epochs.add(epoch)
                 epoch_data = {
                     "epoch": epoch,
                     "timestamp": time.time(),
-                    "loss": metrics.get("train_loss"),
+                    # Training loss (map DINO → Ultralytics-style)
+                    "train_box_loss": metrics.get("train_loss"),
+                    # Learning rate
                     "lr": metrics.get("train_lr"),
+                    # Other metrics
                     "weight_decay": metrics.get("weight_decay"),
                     "time_per_iter": metrics.get("time_per_iter"),
                     "data_time": metrics.get("data_time"),
