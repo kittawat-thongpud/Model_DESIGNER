@@ -145,6 +145,10 @@ class HSGDetRV2BPlugin(HSGDetRPlugin):
         return "V2B-N (gamma_init=0.01 debug)"
     
     @property
+    def family(self) -> str:
+        return "hsg_detr_v2"
+    
+    @property
     def description(self) -> str:
         return (
             "HSG-DETR V2B-N — gamma_init=0.01 debug variant for gamma convergence testing. "
