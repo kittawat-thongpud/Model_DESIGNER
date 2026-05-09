@@ -401,6 +401,9 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._last_batch_time: float = _time.time()
         self._nonfinite_grad_steps: int = 0
         self._max_nonfinite_grad_skips: int = 8
+        self._amp_initial_scale: float = 512.0
+        self._amp_growth_interval: int = 2000
+        self._amp_backoff_factor: float = 0.25
         self._target_sanitize_logs: int = 0
         self._last_train_batch_summary: dict[str, Any] | None = None
         self._hsg_alpha_last: float | None = None
@@ -807,6 +810,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         # Auto-disable removed - AMP enabled by default for HSG-DETR
         self._disable_deterministic_for_hsg_detr()
+        self._lower_amp_initial_scale_for_hsg_detr()
         self.log(
             f"Training setup complete - {self.train_loader.dataset.ni} train images, "
             f"{self.test_loader.dataset.ni} val images",
@@ -832,6 +836,50 @@ class CustomDetectionTrainer(DetectionTrainer):
         except Exception:
             pass
         self.log("HSG-DETR deterministic CUDA mode disabled for training stability", "WARNING")
+
+    def _lower_amp_initial_scale_for_hsg_detr(self) -> None:
+        """Use a smaller AMP GradScaler scale for HSG-DETR to avoid early overflows."""
+        if not bool(getattr(self, "amp", False)):
+            return
+        try:
+            model = unwrap_model(self.model)
+            has_hsg_decoder = any(m.__class__.__name__ == "RTDETRDecoderSGB" for m in model.modules())
+            if not has_hsg_decoder:
+                return
+            self.scaler = self._new_grad_scaler(
+                enabled=True,
+                init_scale=self._amp_initial_scale,
+                growth_interval=self._amp_growth_interval,
+                backoff_factor=self._amp_backoff_factor,
+            )
+            self.log(
+                "HSG-DETR AMP pre-check: "
+                f"GradScaler init_scale={self._amp_initial_scale:g}, "
+                f"growth_interval={self._amp_growth_interval}, "
+                f"backoff_factor={self._amp_backoff_factor:g}",
+                "WARNING",
+            )
+        except Exception as e:
+            self.log(f"HSG-DETR AMP scaler pre-check failed: {e}", "WARNING")
+
+    def _new_grad_scaler(
+        self,
+        enabled: bool,
+        init_scale: float | None = None,
+        growth_interval: int | None = None,
+        backoff_factor: float | None = None,
+    ):
+        kwargs = {"enabled": enabled}
+        if init_scale is not None:
+            kwargs["init_scale"] = float(init_scale)
+        if growth_interval is not None:
+            kwargs["growth_interval"] = int(growth_interval)
+        if backoff_factor is not None:
+            kwargs["backoff_factor"] = float(backoff_factor)
+        try:
+            return torch.amp.GradScaler("cuda", **kwargs)
+        except Exception:
+            return torch.cuda.amp.GradScaler(**kwargs)
 
     def _load_checkpoint_state(self, ckpt):
         """Load resume state with backward-compatible EMA state_dict handling."""
@@ -1270,6 +1318,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             "amp_scale_before_unscale": amp_scale_before,
             "amp_scale": amp_scale,
             "amp_scale_after_update": amp_scale_after_update,
+            "amp_kept_enabled": bool(getattr(self, "amp", False)),
             "loss_items": self._safe_loss_items(),
             "batch_summary": getattr(self, "_last_train_batch_summary", None),
             "diagnostics": diagnostics,
@@ -1292,7 +1341,9 @@ class CustomDetectionTrainer(DetectionTrainer):
                 job_storage.append_job_log(
                     self.job_id,
                     "WARNING",
-                    f"Skipped optimizer step due to non-finite gradients ({self._nonfinite_grad_steps}/{self._max_nonfinite_grad_skips})",
+                    "Skipped optimizer step due to non-finite gradients "
+                    f"({self._nonfinite_grad_steps}/{self._max_nonfinite_grad_skips}); "
+                    "AMP remains enabled and GradScaler was backed off",
                 )
             return
 
