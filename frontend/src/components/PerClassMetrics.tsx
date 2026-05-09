@@ -413,7 +413,7 @@ const PerClassMetrics: React.FC<Props> = ({ history, classNames }) => {
                   <LineChart data={graphData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
                     <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-                    <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={yAxisDomain} />
+                    <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={yAxisDomain} tickFormatter={(v) => Number(v).toFixed(4)} />
                     <Tooltip
                       content={({ active, payload, label }) => {
                         if (!active || !payload?.length) return null;

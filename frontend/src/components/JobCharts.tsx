@@ -202,7 +202,7 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection }) => {
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
               <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => v.toFixed(2)} />
+              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => Number(v).toFixed(4)} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
               <Area type="monotone" dataKey="mAP50" name="mAP@50" stroke="#10b981" strokeWidth={2} fillOpacity={1} fill="url(#colormAP)" />
@@ -228,7 +228,7 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection }) => {
             <LineChart data={history} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
               <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => v.toFixed(2)} />
+              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => Number(v).toFixed(4)} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="plainline" wrapperStyle={{fontSize: '12px'}} />
               <Line type="monotone" dataKey="precision" name="Precision" stroke="#6366f1" strokeWidth={2} dot={false} />
@@ -314,7 +314,7 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection }) => {
               <BarChart data={history} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
                 <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-                <YAxis stroke="#475569" tick={{fontSize: 10}} domain={['auto', 'auto']} />
+                <YAxis stroke="#475569" tick={{fontSize: 10}} domain={['auto', 'auto']} tickFormatter={(v) => Number(v).toFixed(4)} />
                 <Tooltip content={<CustomTooltip />} />
                 <Bar dataKey="epoch_time" fill="#475569" radius={[2, 2, 0, 0]} />
               </BarChart>
