@@ -325,8 +325,11 @@ class SGTokenBlock(nn.Module):
         k_raw = self.k_proj(selected_proj)
         v_raw = self.v_proj(selected_proj)
 
-        norm_w = self.norm.weight.float() if self.norm.weight is not None else None
-        norm_b = self.norm.bias.float() if self.norm.bias is not None else None
+        # Cast weight/bias through to() so autocast keeps them as the same
+        # storage object rather than creating a temporary that breaks the
+        # autograd connection back to the original parameter.
+        norm_w = self.norm.weight.to(dtype=torch.float32) if self.norm.weight is not None else None
+        norm_b = self.norm.bias.to(dtype=torch.float32) if self.norm.bias is not None else None
         q = F.layer_norm(
             q_raw.float(),
             self.norm.normalized_shape,
@@ -367,13 +370,21 @@ class SGTokenBlock(nn.Module):
         return grad
 
     def _effective_gamma(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Return signed LayerScale with a small floor so sparse contribution cannot vanish."""
+        """Return signed LayerScale with a small floor so sparse contribution cannot vanish.
+
+        Uses softplus instead of clamp_min so the gradient is never zero-killed when
+        gamma.abs() < floor. clamp_min has zero gradient in the clamped region, which
+        causes gamma to freeze permanently once it descends below the floor.
+        """
         gamma = self.gamma.to(dtype=dtype, device=device)
         floor = float(getattr(self, "gamma_floor", 0.0))
         if floor <= 0.0:
             return gamma
         sign = torch.where(gamma.detach() >= 0, torch.ones_like(gamma), -torch.ones_like(gamma))
-        mag = gamma.abs().clamp_min(floor)
+        # softplus(x) smoothly approaches x for x >> 0 and 0 for x << 0,
+        # so floor + softplus(|gamma| - floor) is always >= floor and has a
+        # non-zero gradient everywhere (sigmoid(|gamma| - floor)).
+        mag = floor + torch.nn.functional.softplus(gamma.abs() - floor)
         return sign * mag
 
     # ------------------------------------------------------------------ #

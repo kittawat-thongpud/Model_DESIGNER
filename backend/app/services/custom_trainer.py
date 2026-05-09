@@ -1015,8 +1015,14 @@ class CustomDetectionTrainer(DetectionTrainer):
                 except Exception:
                     pass
 
+        # Only trigger the resume ramp on actual training resumes (start_epoch > 0).
+        # Without this guard, the ramp fires at epoch 2 of every fresh training run
+        # because the model's alpha (set at epoch 1) is non-zero but less than
+        # the scheduled value at epoch 2 — producing a false-positive resume signal.
+        is_actual_resume = int(getattr(self, "start_epoch", 0)) > 0
         if (
-            self._hsg_alpha_resume_base is None
+            is_actual_resume
+            and self._hsg_alpha_resume_base is None
             and checkpoint_alpha > 0.0
             and checkpoint_alpha < scheduled_alpha
         ):
