@@ -1833,12 +1833,37 @@ def _training_worker(
         # Strip GPU indices that exceed the actual device count so Ultralytics
         # doesn't raise ValueError (e.g. user set "0,1,2" but only 1 GPU exists).
         import torch as _torch
-        _avail = _torch.cuda.device_count()
+        _cuda_probe_error = None
+        try:
+            _avail = int(_torch.cuda.device_count())
+        except Exception as _e:
+            _avail = 0
+            _cuda_probe_error = _e
         _device_val = str(train_kwargs.get("device", "")).strip()
 
         # Log available hardware
-        if _avail > 0:
-            _gpu_names = [_torch.cuda.get_device_name(i) for i in range(_avail)]
+        if _avail > 0 and _cuda_probe_error is None:
+            _gpu_names = []
+            for i in range(_avail):
+                try:
+                    _gpu_names.append(_torch.cuda.get_device_name(i))
+                except Exception as _e:
+                    _cuda_probe_error = _e
+                    _avail = 0
+                    break
+
+        if _cuda_probe_error is not None:
+            train_kwargs["device"] = "cpu"
+            train_kwargs["amp"] = False
+            _device_val = "cpu"
+            job_storage.append_job_log(
+                job_id,
+                "WARNING",
+                "CUDA probe failed; falling back to CPU for this job. "
+                "Restart the backend/worker container before retrying GPU training. "
+                f"Reason: {_cuda_probe_error}"
+            )
+        elif _avail > 0:
             job_storage.append_job_log(job_id, "INFO",
                 f"Available GPUs ({_avail}): " + ", ".join(f"[{i}] {n}" for i, n in enumerate(_gpu_names)))
         else:
