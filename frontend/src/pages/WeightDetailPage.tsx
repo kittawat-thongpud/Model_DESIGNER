@@ -424,10 +424,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
 
                   {/* Per-Class Metrics */}
                   {history.length > 0 && (history[history.length - 1] as any).ap_per_class && (
-                    <PerClassMetrics
-                      epochData={history[history.length - 1] as any}
-                      epoch={(history[history.length - 1] as any).epoch}
-                    />
+                    <PerClassMetrics history={history as any} />
                   )}
 
                   {/* Training Config */}

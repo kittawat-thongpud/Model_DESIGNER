@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
-import { BarChart2, ChevronDown, ChevronUp, ArrowUpDown, Search } from 'lucide-react';
+import { BarChart2, ChevronDown, ChevronUp, ArrowUpDown, Search, LineChart as LineChartIcon, ToggleLeft, ToggleRight, Eye, EyeOff } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 interface EpochData {
   ap_per_class?: number[];
@@ -7,12 +8,12 @@ interface EpochData {
   precision_per_class?: number[];
   recall_per_class?: number[];
   f1_per_class?: number[];
+  epoch?: number;
   [key: string]: unknown;
 }
 
 interface Props {
-  epochData: EpochData;
-  epoch: number;
+  history: EpochData[];
   classNames?: string[];
 }
 
@@ -51,11 +52,23 @@ function MetricBar({ value, color, max = 1.0 }: { value: number; color: string; 
   );
 }
 
-const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
+const PerClassMetrics: React.FC<Props> = ({ history, classNames }) => {
   const [expanded, setExpanded] = useState(false);
+  const [viewMode, setViewMode] = useState<'table' | 'graph'>('table');
+  const [selectedEpoch, setSelectedEpoch] = useState<number>(-1); // -1 = latest
   const [sortKey, setSortKey] = useState<SortKey>('mAP50_95');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [searchTerm, setSearchTerm] = useState('');
+  const [visibleClasses, setVisibleClasses] = useState<Set<number>>(new Set());
+  const [metricType, setMetricType] = useState<'mAP50_95' | 'mAP50' | 'precision' | 'recall' | 'f1'>('mAP50_95');
+
+  // Get selected epoch data
+  const epochData = useMemo(() => {
+    if (selectedEpoch === -1) {
+      return history[history.length - 1] || {};
+    }
+    return history.find(e => e.epoch === selectedEpoch) || history[history.length - 1] || {};
+  }, [history, selectedEpoch]);
 
   const ap = epochData.ap_per_class as number[] | undefined;
   const ap50 = epochData.ap50_per_class as number[] | undefined;
@@ -71,6 +84,17 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
     : nc === 80
       ? COCO_NAMES
       : Array.from({ length: nc }, (_, i) => `class_${i}`);
+
+  // Initialize visible classes (show top 10 by mAP50_95)
+  useMemo(() => {
+    if (visibleClasses.size === 0 && ap) {
+      const top10 = Array.from({ length: nc }, (_, i) => ({ index: i, value: ap[i] }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 10)
+        .map(x => x.index);
+      setVisibleClasses(new Set(top10));
+    }
+  }, [ap, nc, visibleClasses.size]);
 
   const rows = useMemo(() => {
     const data = Array.from({ length: nc }, (_, i) => ({
@@ -105,6 +129,54 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
   const meanRec = rec ? rec.reduce((s, v) => s + v, 0) / rec.length : 0;
   const meanF1 = f1 ? f1.reduce((s, v) => s + v, 0) / f1.length : 0;
 
+  // Prepare graph data
+  const graphData = useMemo(() => {
+    return history.map(epoch => {
+      const epochAp = epoch.ap_per_class as number[] | undefined;
+      const epochAp50 = epoch.ap50_per_class as number[] | undefined;
+      const epochPrec = epoch.precision_per_class as number[] | undefined;
+      const epochRec = epoch.recall_per_class as number[] | undefined;
+      const epochF1 = epoch.f1_per_class as number[] | undefined;
+
+      const data: any = { epoch: epoch.epoch };
+
+      // Add visible classes
+      visibleClasses.forEach(classIndex => {
+        data[`class_${classIndex}`] = (() => {
+          switch (metricType) {
+            case 'mAP50_95': return epochAp?.[classIndex] ?? 0;
+            case 'mAP50': return epochAp50?.[classIndex] ?? 0;
+            case 'precision': return epochPrec?.[classIndex] ?? 0;
+            case 'recall': return epochRec?.[classIndex] ?? 0;
+            case 'f1': return epochF1?.[classIndex] ?? 0;
+            default: return 0;
+          }
+        })();
+      });
+
+      return data;
+    });
+  }, [history, visibleClasses, metricType]);
+
+  // Toggle class visibility
+  const toggleClass = (classIndex: number) => {
+    const newSet = new Set(visibleClasses);
+    if (newSet.has(classIndex)) {
+      newSet.delete(classIndex);
+    } else {
+      newSet.add(classIndex);
+    }
+    setVisibleClasses(newSet);
+  };
+
+  const toggleAllClasses = () => {
+    if (visibleClasses.size === nc) {
+      setVisibleClasses(new Set());
+    } else {
+      setVisibleClasses(new Set(Array.from({ length: nc }, (_, i) => i)));
+    }
+  };
+
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
       setSortDir(d => d === 'desc' ? 'asc' : 'desc');
@@ -130,6 +202,8 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
     </th>
   );
 
+  const currentEpoch = epochData.epoch ?? history[history.length - 1]?.epoch ?? 0;
+
   return (
     <div className="bg-[#0f1117] border border-slate-800 rounded-xl overflow-hidden">
       {/* Header */}
@@ -139,7 +213,7 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
       >
         <BarChart2 size={16} className="text-cyan-400" />
         <span className="text-sm font-semibold text-slate-200">Per-Class Metrics</span>
-        <span className="text-[10px] text-slate-500 uppercase">Epoch {epoch} &middot; {nc} classes</span>
+        <span className="text-[10px] text-slate-500 uppercase">{nc} classes &middot; {history.length} epochs</span>
         <div className="ml-auto flex items-center gap-4">
           {/* Summary chips */}
           <div className="hidden sm:flex gap-2 text-[10px]">
@@ -159,6 +233,58 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
 
       {expanded && (
         <div className="p-4 space-y-3">
+          {/* Controls */}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* View toggle */}
+            <button
+              onClick={() => setViewMode(viewMode === 'table' ? 'graph' : 'table')}
+              className="flex items-center gap-2 px-3 py-1.5 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white hover:bg-slate-800 transition-colors"
+            >
+              {viewMode === 'table' ? <BarChart2 size={14} className="text-cyan-400" /> : <LineChartIcon size={14} className="text-violet-400" />}
+              {viewMode === 'table' ? 'Table' : 'Graph'}
+            </button>
+
+            {/* Epoch selector (table mode only) */}
+            {viewMode === 'table' && (
+              <select
+                value={selectedEpoch}
+                onChange={e => setSelectedEpoch(parseInt(e.target.value))}
+                className="px-3 py-1.5 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white"
+              >
+                <option value={-1}>Latest (Epoch {currentEpoch})</option>
+                {history.slice().reverse().map(e => (
+                  <option key={e.epoch} value={e.epoch}>Epoch {e.epoch}</option>
+                ))}
+              </select>
+            )}
+
+            {/* Metric type selector (graph mode only) */}
+            {viewMode === 'graph' && (
+              <select
+                value={metricType}
+                onChange={e => setMetricType(e.target.value as any)}
+                className="px-3 py-1.5 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white"
+              >
+                <option value="mAP50_95">mAP50-95</option>
+                <option value="mAP50">mAP50</option>
+                <option value="precision">Precision</option>
+                <option value="recall">Recall</option>
+                <option value="f1">F1</option>
+              </select>
+            )}
+
+            {/* Toggle all classes (graph mode only) */}
+            {viewMode === 'graph' && (
+              <button
+                onClick={toggleAllClasses}
+                className="flex items-center gap-2 px-3 py-1.5 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white hover:bg-slate-800 transition-colors"
+              >
+                {visibleClasses.size === nc ? <EyeOff size={14} className="text-slate-400" /> : <Eye size={14} className="text-emerald-400" />}
+                {visibleClasses.size === nc ? 'Hide All' : 'Show All'} ({visibleClasses.size}/{nc})
+              </button>
+            )}
+          </div>
+
           {/* Mean row */}
           <div className="grid grid-cols-5 gap-3">
             <div className="bg-slate-900/60 border border-slate-800 rounded-lg px-3 py-2 text-center">
@@ -183,50 +309,136 @@ const PerClassMetrics: React.FC<Props> = ({ epochData, epoch, classNames }) => {
             </div>
           </div>
 
-          {/* Search */}
-          <div className="relative">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
-            <input
-              type="text"
-              placeholder="Search class..."
-              value={searchTerm}
-              onChange={e => setSearchTerm(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-slate-600"
-            />
-          </div>
+          {/* Table view */}
+          {viewMode === 'table' && (
+            <>
+              {/* Search */}
+              <div className="relative">
+                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                <input
+                  type="text"
+                  placeholder="Search class..."
+                  value={searchTerm}
+                  onChange={e => setSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-3 py-2 bg-slate-900/60 border border-slate-800 rounded-lg text-xs text-white placeholder-slate-600 focus:outline-none focus:border-slate-600"
+                />
+              </div>
 
-          {/* Table */}
-          <div className="overflow-x-auto max-h-[500px] overflow-y-auto rounded-lg border border-slate-800">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-slate-900/95 backdrop-blur-sm z-10">
-                <tr className="text-slate-500 uppercase tracking-wider border-b border-slate-800">
-                  <SortHeader label="#" field="index" />
-                  <th className="px-3 py-2 text-left">Class</th>
-                  <SortHeader label="mAP50-95" field="mAP50_95" />
-                  <SortHeader label="mAP50" field="mAP50" />
-                  <SortHeader label="Precision" field="precision" />
-                  <SortHeader label="Recall" field="recall" />
-                  <SortHeader label="F1" field="f1" />
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map(row => (
-                  <tr key={row.index} className="border-b border-slate-800/30 hover:bg-slate-800/20">
-                    <td className="px-3 py-1.5 text-right text-slate-600 font-mono">{row.index}</td>
-                    <td className="px-3 py-1.5 text-white font-medium whitespace-nowrap">{row.name}</td>
-                    <td className="px-3 py-1.5 w-32"><MetricBar value={row.mAP50_95} color="#a78bfa" /></td>
-                    <td className="px-3 py-1.5 w-32"><MetricBar value={row.mAP50} color="#38bdf8" /></td>
-                    <td className="px-3 py-1.5 w-32"><MetricBar value={row.precision} color="#f59e0b" /></td>
-                    <td className="px-3 py-1.5 w-32"><MetricBar value={row.recall} color="#f43f5e" /></td>
-                    <td className="px-3 py-1.5 w-32"><MetricBar value={row.f1} color="#10b981" /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="text-[10px] text-slate-600 text-right">
-            Showing {rows.length} of {nc} classes
-          </div>
+              {/* Table */}
+              <div className="overflow-x-auto max-h-[500px] overflow-y-auto rounded-lg border border-slate-800">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-slate-900/95 backdrop-blur-sm z-10">
+                    <tr className="text-slate-500 uppercase tracking-wider border-b border-slate-800">
+                      <SortHeader label="#" field="index" />
+                      <th className="px-3 py-2 text-left">Class</th>
+                      <SortHeader label="mAP50-95" field="mAP50_95" />
+                      <SortHeader label="mAP50" field="mAP50" />
+                      <SortHeader label="Precision" field="precision" />
+                      <SortHeader label="Recall" field="recall" />
+                      <SortHeader label="F1" field="f1" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map(row => (
+                      <tr key={row.index} className="border-b border-slate-800/30 hover:bg-slate-800/20">
+                        <td className="px-3 py-1.5 text-right text-slate-600 font-mono">{row.index}</td>
+                        <td className="px-3 py-1.5 text-white font-medium whitespace-nowrap">{row.name}</td>
+                        <td className="px-3 py-1.5 w-32"><MetricBar value={row.mAP50_95} color="#a78bfa" /></td>
+                        <td className="px-3 py-1.5 w-32"><MetricBar value={row.mAP50} color="#38bdf8" /></td>
+                        <td className="px-3 py-1.5 w-32"><MetricBar value={row.precision} color="#f59e0b" /></td>
+                        <td className="px-3 py-1.5 w-32"><MetricBar value={row.recall} color="#f43f5e" /></td>
+                        <td className="px-3 py-1.5 w-32"><MetricBar value={row.f1} color="#10b981" /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="text-[10px] text-slate-600 text-right">
+                Showing {rows.length} of {nc} classes
+              </div>
+            </>
+          )}
+
+          {/* Graph view */}
+          {viewMode === 'graph' && (
+            <>
+              {/* Class toggles */}
+              <div className="max-h-[200px] overflow-y-auto rounded-lg border border-slate-800 p-2">
+                <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-1">
+                  {Array.from({ length: nc }, (_, i) => (
+                    <button
+                      key={i}
+                      onClick={() => toggleClass(i)}
+                      className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] transition-colors ${
+                        visibleClasses.has(i)
+                          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                          : 'bg-slate-800 text-slate-500 border border-slate-700'
+                      }`}
+                      title={names[i]}
+                    >
+                      {visibleClasses.has(i) ? <Eye size={10} /> : <EyeOff size={10} />}
+                      <span className="truncate">{names[i]}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Line chart */}
+              <div className="h-[400px] rounded-lg border border-slate-800 p-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={graphData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                    <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                    <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 1]} />
+                    <Tooltip
+                      content={({ active, payload, label }) => {
+                        if (!active || !payload?.length) return null;
+                        return (
+                          <div className="bg-slate-950/90 border border-slate-800 p-2 rounded-lg shadow-xl backdrop-blur-md text-xs z-50">
+                            <p className="text-slate-400 font-bold mb-1.5 border-b border-slate-800 pb-1">Epoch {label}</p>
+                            {payload.map((entry: any, i: number) => (
+                              <div key={i} className="flex items-center justify-between gap-4 mb-0.5">
+                                <span className="flex items-center gap-1.5" style={{ color: entry.color }}>
+                                  <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: entry.color }} />
+                                  {names[parseInt(entry.dataKey.replace('class_', ''))]}
+                                </span>
+                                <span className="font-mono text-white">
+                                  {typeof entry.value === 'number' ? (entry.value * 100).toFixed(1) + '%' : '-'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      }}
+                    />
+                    <Legend
+                      iconType="circle"
+                      wrapperStyle={{ fontSize: '10px' }}
+                      onClick={(e: any) => {
+                        const classIndex = parseInt(e.dataKey.replace('class_', ''));
+                        if (!isNaN(classIndex)) toggleClass(classIndex);
+                      }}
+                    />
+                    {Array.from(visibleClasses).map((classIndex, i) => {
+                      const colors = ['#a78bfa', '#38bdf8', '#f59e0b', '#f43f5e', '#10b981', '#64748b', '#fb923c', '#22c55e', '#e11d48', '#8b5cf6'];
+                      return (
+                        <Line
+                          key={classIndex}
+                          type="monotone"
+                          dataKey={`class_${classIndex}`}
+                          name={names[classIndex]}
+                          stroke={colors[i % colors.length]}
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                        />
+                      );
+                    })}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

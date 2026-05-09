@@ -573,10 +573,7 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
 
         {/* Per-Class Metrics */}
         {job.history && job.history.length > 0 && (job.history[job.history.length - 1] as any).ap_per_class && (
-          <PerClassMetrics
-            epochData={job.history[job.history.length - 1] as any}
-            epoch={(job.history[job.history.length - 1] as any).epoch}
-          />
+          <PerClassMetrics history={job.history as any} />
         )}
 
         {/* Configuration */}
