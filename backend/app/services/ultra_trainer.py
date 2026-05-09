@@ -116,6 +116,32 @@ def _collect_cuda_diagnostics(torch_module=None) -> dict[str, Any]:
     return diag
 
 
+def _cuda_probe_hint(diag: dict[str, Any]) -> str:
+    nvidia_visible = str(diag.get("NVIDIA_VISIBLE_DEVICES", "")).strip().lower()
+    cuda_visible = str(diag.get("CUDA_VISIBLE_DEVICES", "")).strip().lower()
+    if nvidia_visible in {"void", "none", ""}:
+        return (
+            "NVIDIA_VISIBLE_DEVICES is set to "
+            f"{diag.get('NVIDIA_VISIBLE_DEVICES')!r}, so the container runtime is hiding GPUs from CUDA. "
+            "Start the container with GPU access, for example docker compose with "
+            "NVIDIA_VISIBLE_DEVICES=all and NVIDIA_DRIVER_CAPABILITIES=compute,utility, or docker run --gpus all."
+        )
+    if cuda_visible in {"void", "none"}:
+        return (
+            "CUDA_VISIBLE_DEVICES hides all CUDA devices. "
+            "Unset it or set CUDA_VISIBLE_DEVICES=0 before the backend starts."
+        )
+    if diag.get("nvidia_smi_L_stdout") and diag.get("cuda_is_available") is False:
+        return (
+            "nvidia-smi can see a GPU but torch.cuda.is_available() is false. "
+            "This usually means the container GPU runtime or CUDA library binding is misconfigured."
+        )
+    return (
+        "CUDA runtime failed during device probing. Restart the backend/worker container, "
+        "then retry with a clean CUDA environment."
+    )
+
+
 # ── Active jobs tracking ─────────────────────────────────────────────────────
 
 _active_jobs: dict[str, dict] = {}
@@ -1900,6 +1926,7 @@ def _training_worker(
 
         if _cuda_probe_error is not None:
             _cuda_diagnostics["probe_error"] = f"{type(_cuda_probe_error).__name__}: {_cuda_probe_error}"
+            _cuda_diagnostics["hint"] = _cuda_probe_hint(_cuda_diagnostics)
             try:
                 (job_dir / "cuda_diagnostics.json").write_text(
                     json.dumps(_cuda_diagnostics, indent=2, default=str),
@@ -1912,8 +1939,7 @@ def _training_worker(
             if not _allow_cuda_cpu_fallback:
                 raise RuntimeError(
                     "CUDA probe failed before training. "
-                    "This usually means the backend/worker process has a broken CUDA runtime state. "
-                    "Restart the backend/worker container, then retry the job. "
+                    f"{_cuda_diagnostics['hint']} "
                     "Set allow_cuda_cpu_fallback=true only if you intentionally want CPU training. "
                     f"Original CUDA error: {_cuda_probe_error}"
                 )
