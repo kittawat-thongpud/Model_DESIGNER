@@ -251,6 +251,98 @@ def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
     torch.save({"student": student, "teacher": teacher, "epoch": 0}, out_path)
 
 
+def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: Path, spec: dict, batch: int, workers: int, out_dir: Path) -> None:
+    """Run k-NN evaluation on DINO checkpoint to provide validation metrics."""
+    try:
+        job_storage.append_job_log(job_id, "INFO", "Starting k-NN evaluation for validation metrics...")
+        
+        # Check if dataset has train/val split (required for k-NN evaluation)
+        train_path = imagefolder / "train"
+        val_path = imagefolder / "val"
+        
+        if not (train_path.exists() and val_path.exists()):
+            job_storage.append_job_log(job_id, "INFO", "Dataset does not have train/val split with labels, skipping k-NN evaluation")
+            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation requires labeled dataset with train/val split")
+            return
+        
+        # Build eval_knn.py command
+        cmd = [
+            sys.executable,
+            "eval_knn.py",
+            "--arch",
+            str(spec["arch"]),
+            "--patch_size",
+            str(spec["patch_size"]),
+            "--pretrained_weights",
+            str(checkpoint),
+            "--batch_size_per_gpu",
+            str(min(batch, 128)),  # k-NN evaluation uses smaller batch
+            "--num_workers",
+            str(workers),
+            "--data_path",
+            str(imagefolder),
+        ]
+        
+        env = os.environ.copy()
+        backend_root = str(Path(__file__).resolve().parents[2])
+        pythonpath = [str(root), backend_root]
+        if env.get("PYTHONPATH"):
+            pythonpath.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        env.setdefault("RANK", "0")
+        env.setdefault("WORLD_SIZE", "1")
+        env.setdefault("LOCAL_RANK", "0")
+        
+        # Run k-NN evaluation
+        job_storage.append_job_log(job_id, "INFO", f"Running k-NN evaluation: {' '.join(cmd)}")
+        
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        
+        # Parse k-NN results from output
+        knn_accuracy = None
+        for line in proc.stdout or []:
+            _append_output_log(job_id, line)
+            # Parse k-NN accuracy from output
+            m = re.search(r"k-NN\s*accuracy:\s*([\d.]+)", line)
+            if m:
+                knn_accuracy = float(m.group(1))
+        
+        returncode = proc.wait()
+        
+        if returncode == 0 and knn_accuracy is not None:
+            # Update job with k-NN accuracy as validation metric
+            job = job_storage.load_job(job_id)
+            if job:
+                history = list(job.get("history") or [])
+                # Add k-NN accuracy to last history entry or create new entry
+                if history:
+                    history[-1]["knn_accuracy"] = knn_accuracy
+                else:
+                    history.append({
+                        "knn_accuracy": knn_accuracy,
+                        "timestamp": time.time(),
+                    })
+                
+                job_storage.save_job({**job, "history": history, "knn_accuracy": knn_accuracy})
+                job_storage.append_job_log(job_id, "INFO", f"k-NN evaluation complete: accuracy = {knn_accuracy:.2%}")
+                
+                # Publish update with k-NN accuracy
+                _publish(job_id, {**job, "knn_accuracy": knn_accuracy})
+        else:
+            job_storage.append_job_log(job_id, "WARNING", "k-NN evaluation failed or did not produce accuracy")
+            
+    except Exception as e:
+        job_storage.append_job_log(job_id, "WARNING", f"k-NN evaluation error: {str(e)}")
+
+
 def _append_history_from_log(job_id: str, out_dir: Path) -> None:
     log_path = out_dir / "log.txt"
     if not log_path.exists():
@@ -707,6 +799,10 @@ def run_worker(payload: dict[str, Any]) -> None:
         last_path = out_dir / "last.pth"
         shutil.copy2(final_ckpt, last_path)
         job_storage.append_job_log(job_id, "INFO", f"DINO final checkpoint: {final_ckpt.name}")
+        
+        # Run k-NN evaluation if dataset has train/val split with labels
+        # This provides validation metrics similar to mAP for self-supervised learning
+        _run_knn_evaluation(job_id, root, imagefolder, final_ckpt, spec, batch, workers, out_dir)
     
     _append_history_from_log(job_id, out_dir)
     weight_id = _save_weight(job_id, out_dir, elapsed)
