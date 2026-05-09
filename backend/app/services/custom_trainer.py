@@ -647,7 +647,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         continue
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
-                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj")):
+                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj", "saliency_head")):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
                         sgb_roles[id(param)] = "norm_bias"
@@ -1397,7 +1397,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                 for local_name, param in module.named_parameters(recurse=True):
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
-                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj")):
+                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj", "saliency_head")):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith("norm"):
                         sgb_roles[id(param)] = "sgb_norm"

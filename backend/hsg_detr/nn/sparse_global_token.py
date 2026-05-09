@@ -85,7 +85,7 @@ class SGTokenBlock(nn.Module):
         ratio: float = 0.25,
         mode: str = "topk",
         debug_enabled: bool = False,
-        gamma_init: float = 0.05,
+        gamma_init: float = 0.10,
         finite_limit: float = 20.0,
         attn_logit_limit: float = 50.0,
         delta_limit: float = 6.0,
@@ -125,6 +125,19 @@ class SGTokenBlock(nn.Module):
         self.out_proj = nn.Linear(c2, c2, bias=False)
         self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
         self._attn_scale = c2 ** -0.5
+
+        # Learnable saliency head: 2-layer pointwise CNN that scores each spatial token.
+        # Gradient flows back via the soft gate in forward(), teaching the backbone to
+        # produce high-score features at object locations rather than relying on raw L2.
+        _sal_mid = max(int(c2) // 8, 16)
+        self.saliency_head = nn.Sequential(
+            nn.Conv2d(c2, _sal_mid, 1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(_sal_mid, 1, 1, bias=True),
+        )
+        nn.init.xavier_uniform_(self.saliency_head[0].weight, gain=0.1)
+        nn.init.zeros_(self.saliency_head[-1].weight)
+        nn.init.constant_(self.saliency_head[-1].bias, 0.0)
 
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
@@ -302,10 +315,49 @@ class SGTokenBlock(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _compute_saliency(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Parameter-free L2 activation energy per spatial token."""
+        """Learnable saliency head scoring each spatial token.
+
+        Returns un-detached scores (B, N) so the soft gate in forward() carries
+        gradient back through saliency_head into the backbone.  The caller must
+        .detach() before passing to top-k to avoid differentiating through argmax.
+        """
+        sal_dtype = self.saliency_head[0].weight.dtype
         B, C, H, W = x_norm.shape
-        saliency = x_norm.detach().float().view(B, C, H * W).pow(2).sum(dim=1)
-        return torch.nan_to_num(saliency, nan=0.0, posinf=0.0, neginf=0.0)
+        scores = self.saliency_head(x_norm.to(dtype=sal_dtype))   # (B, 1, H, W)
+        scores_flat = scores.view(B, H * W)                        # (B, N)
+        return torch.nan_to_num(scores_flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @staticmethod
+    def _sinusoidal_pos_enc_2d(
+        idx: torch.Tensor,
+        H: int,
+        W: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """2D sinusoidal positional encoding for selected flat spatial indices.
+
+        idx     : (B, k) integer flat indices in [0, H*W)
+        Returns : (B, k, dim) float32 encodings, scaled to ~unit norm per token.
+
+        Encoding layout (dim must be divisible by 4):
+          [ sin(x·freq), cos(x·freq), sin(y·freq), cos(y·freq) ]
+        so Q and K each receive distinct spatial coordinates before dot-product.
+        """
+        B, k = idx.shape
+        device = idx.device
+        y_f = (idx // W).float() / max(H - 1, 1)    # (B, k) normalised to [0, 1]
+        x_f = (idx %  W).float() / max(W - 1, 1)    # (B, k) normalised to [0, 1]
+        d = max(dim // 4, 1)
+        freq = 10000.0 ** (
+            -torch.arange(d, device=device, dtype=torch.float32) * 4.0 / max(dim, 1)
+        )                                             # (d,)
+        enc = torch.cat([
+            torch.sin(x_f.unsqueeze(-1) * freq),     # (B, k, d)
+            torch.cos(x_f.unsqueeze(-1) * freq),
+            torch.sin(y_f.unsqueeze(-1) * freq),
+            torch.cos(y_f.unsqueeze(-1) * freq),
+        ], dim=-1)                                    # (B, k, dim)
+        return enc * (dim ** -0.5)                    # normalise magnitude
 
     def _select_k(self, N: int) -> int:
         """Compute effective k based on mode and constraints."""
@@ -317,8 +369,16 @@ class SGTokenBlock(nn.Module):
             return int(N)
         return max(1, min(int(round(self.ratio * int(N))), int(N)))
 
-    def _selected_attention_delta(self, selected: torch.Tensor) -> torch.Tensor:
-        """Run Q/K/V and sparse self-attention only on selected tokens."""
+    def _selected_attention_delta(
+        self,
+        selected: torch.Tensor,
+        pos_enc: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run Q/K/V and sparse self-attention only on selected tokens.
+
+        pos_enc : (B, k, C) float32 2D sinusoidal encoding for selected positions.
+                  Added to Q and K so attention is spatially aware.
+        """
         proj_dtype = self.q_proj.weight.dtype
         selected_proj = selected.to(dtype=proj_dtype)
         q_raw = self.q_proj(selected_proj)
@@ -345,6 +405,14 @@ class SGTokenBlock(nn.Module):
             self.norm.eps,
         )
         v = v_raw.float()
+
+        # Inject spatial positions so attention can model object topology.
+        # Without positional encoding the selected tokens form an unordered set
+        # and cannot learn directional or proximity relationships.
+        if pos_enc is not None:
+            pe = pos_enc.to(dtype=q.dtype)
+            q = q + pe
+            k = k + pe
 
         attn = torch.bmm(q, k.transpose(1, 2)) * float(self._attn_scale)
         attn = _finite_or_zero(attn, limit=self.attn_logit_limit)
@@ -426,14 +494,17 @@ class SGTokenBlock(nn.Module):
         x_norm = _finite_or_zero(x_norm, limit=self.finite_limit)
 
         if self.mode == "dense":
+            sal_scores = None
             saliency = None
             topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
             k_actual = N
         else:
-            saliency = self._compute_saliency(x_norm)
-            if not torch.isfinite(saliency).any():
-                saliency = torch.ones_like(saliency)
-            topk_idx = torch.topk(saliency, k_actual, dim=1).indices
+            sal_scores = self._compute_saliency(x_norm)    # (B, N) — keeps grad
+            sal_for_topk = sal_scores.detach()
+            if not torch.isfinite(sal_for_topk).any():
+                sal_for_topk = torch.zeros_like(sal_for_topk)
+            topk_idx = torch.topk(sal_for_topk, k_actual, dim=1).indices
+            saliency = sal_for_topk                         # detached copy for debug
 
         topk_idx = topk_idx.clamp(0, N - 1).long()
         self._store_debug(topk_idx, saliency)
@@ -442,9 +513,22 @@ class SGTokenBlock(nn.Module):
         idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)
         selected = torch.gather(x_flat, 2, idx_exp).transpose(1, 2)
 
-        delta_tokens = self._selected_attention_delta(selected)
+        # Compute 2D positional encoding for the selected positions so sparse
+        # attention is spatially aware (token at top-left vs bottom-right matters).
+        pos_enc = self._sinusoidal_pos_enc_2d(topk_idx, H, W, C)
+
+        delta_tokens = self._selected_attention_delta(selected, pos_enc=pos_enc)
         if delta_tokens.requires_grad:
             delta_tokens.register_hook(self._capture_selected_grad)
+
+        # Soft gate by learned saliency scores.
+        # This is the gradient bridge: detection loss → gate → saliency_head → backbone.
+        # The backbone now receives a training signal that teaches it to assign high
+        # saliency scores to object-containing tokens rather than relying on L2 energy.
+        if sal_scores is not None:
+            selected_sal = torch.gather(sal_scores, 1, topk_idx)          # (B, k)
+            sal_gate = torch.sigmoid(selected_sal).unsqueeze(-1)           # (B, k, 1)
+            delta_tokens = delta_tokens * sal_gate.to(dtype=delta_tokens.dtype)
 
         self.last_delta_norm_selected = float(
             delta_tokens.detach().float().norm(dim=-1).mean().item()
