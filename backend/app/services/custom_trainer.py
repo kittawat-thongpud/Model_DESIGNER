@@ -1181,7 +1181,20 @@ class CustomDetectionTrainer(DetectionTrainer):
 
     def optimizer_step(self):
         """Optimizer step with pre-EMA finite guards for BN buffers and gradients."""
-        # Pre-check: if any gradient is NaN/Inf, skip this step entirely
+        # Unscale before finite checks. With AMP, scaled gradients may overflow
+        # transiently; diagnostics after unscale are much more actionable.
+        amp_scale_before = None
+        try:
+            amp_scale_before = float(self.scaler.get_scale())
+        except Exception:
+            pass
+        try:
+            self.scaler.unscale_(self.optimizer)
+        except Exception as e:
+            self._handle_nonfinite_gradients(f"GradScaler unscale failed: {e}", amp_scale_before=amp_scale_before)
+            return
+
+        # Pre-check: if any unscaled gradient is NaN/Inf, skip this step entirely
         has_nan_grad = False
         for p in self.model.parameters():
             if p.grad is not None:
@@ -1189,11 +1202,13 @@ class CustomDetectionTrainer(DetectionTrainer):
                     has_nan_grad = True
                     break
         if has_nan_grad:
-            self._handle_nonfinite_gradients("Pre-check: NaN/Inf detected in gradients")
+            self._handle_nonfinite_gradients(
+                "Pre-check: NaN/Inf detected in unscaled gradients",
+                amp_scale_before=amp_scale_before,
+            )
             self.optimizer.zero_grad(set_to_none=True)
             return
         
-        self.scaler.unscale_(self.optimizer)
         self._assert_batchnorm_buffers_finite("before optimizer step")
         try:
             # Keep clipping conservative for the sparse CNN/DETR hybrid.
@@ -1205,10 +1220,16 @@ class CustomDetectionTrainer(DetectionTrainer):
         except TypeError:
             total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
             if not torch.isfinite(total_norm):
-                self._handle_nonfinite_gradients(f"NaN/Inf gradient norm detected: {float(total_norm)}")
+                self._handle_nonfinite_gradients(
+                    f"NaN/Inf gradient norm detected: {float(total_norm)}",
+                    amp_scale_before=amp_scale_before,
+                )
                 return
         except RuntimeError as e:
-            self._handle_nonfinite_gradients(f"NaN/Inf gradient norm detected: {e}")
+            self._handle_nonfinite_gradients(
+                f"NaN/Inf gradient norm detected: {e}",
+                amp_scale_before=amp_scale_before,
+            )
             return
 
         self.scaler.step(self.optimizer)
@@ -1222,34 +1243,49 @@ class CustomDetectionTrainer(DetectionTrainer):
             self.ema.update(self.model)
             self._sync_hsg_detr_alpha_to_ema()
 
-    def _handle_nonfinite_gradients(self, reason: str) -> None:
+    def _handle_nonfinite_gradients(self, reason: str, amp_scale_before: float | None = None) -> None:
         """Log offending gradients and skip a bounded number of bad optimizer steps."""
         self._nonfinite_grad_steps += 1
-        diagnostics = self._collect_nonfinite_grad_diagnostics(limit=12)
+        diagnostics = self._collect_nonfinite_grad_diagnostics(limit=24)
+        epoch = int(getattr(self, 'epoch', -1)) + 1 if hasattr(self, 'epoch') else None
+        batch_i = getattr(self, 'batch_i', None)
         amp_scale = None
         try:
             amp_scale = float(self.scaler.get_scale())
         except Exception:
             pass
+        amp_scale_after_update = None
+        try:
+            self.scaler.update()
+            amp_scale_after_update = float(self.scaler.get_scale())
+        except Exception:
+            pass
+        payload = {
+            "type": "nonfinite_gradients",
+            "skip_count": self._nonfinite_grad_steps,
+            "max_skip_count": self._max_nonfinite_grad_skips,
+            "epoch": epoch,
+            "batch_i": int(batch_i) if isinstance(batch_i, (int, np.integer)) else batch_i,
+            "amp_enabled": bool(getattr(getattr(self, "args", None), "amp", False)),
+            "amp_scale_before_unscale": amp_scale_before,
+            "amp_scale": amp_scale,
+            "amp_scale_after_update": amp_scale_after_update,
+            "loss_items": self._safe_loss_items(),
+            "batch_summary": getattr(self, "_last_train_batch_summary", None),
+            "diagnostics": diagnostics,
+        }
+        diagnostics_path = self._write_nonfinite_diagnostics_file(payload)
+        if diagnostics_path:
+            payload["diagnostics_file"] = diagnostics_path
         if self.job_id:
             job_storage.append_job_log(
                 self.job_id,
                 "ERROR",
                 reason,
-                {
-                    "type": "nonfinite_gradients",
-                    "skip_count": self._nonfinite_grad_steps,
-                    "max_skip_count": self._max_nonfinite_grad_skips,
-                    "amp_scale": amp_scale,
-                    "diagnostics": diagnostics,
-                },
+                payload,
             )
 
         self.optimizer.zero_grad(set_to_none=True)
-        try:
-            self.scaler.update()
-        except Exception:
-            pass
 
         if self._nonfinite_grad_steps <= self._max_nonfinite_grad_skips:
             if self.job_id:
@@ -1338,16 +1374,30 @@ class CustomDetectionTrainer(DetectionTrainer):
     def _collect_nonfinite_grad_diagnostics(self, limit: int = 12) -> list[dict[str, Any]]:
         """Summarize the first parameters whose gradients contain NaN/Inf."""
         issues: list[dict[str, Any]] = []
+        optimizer_groups = self._optimizer_group_lookup()
+        module_lookup = dict(self.model.named_modules())
         for name, param in self.model.named_parameters():
             grad = param.grad
             if grad is None or not torch.is_tensor(grad):
                 continue
-            summary = self._tensor_nonfinite_summary(grad.detach())
-            if summary is None:
+            grad_summary = self._tensor_nonfinite_summary(grad.detach())
+            if grad_summary is None:
                 continue
-            summary["name"] = name
+            summary: dict[str, Any] = {
+                "name": name,
+                "grad": grad_summary,
+            }
+            module_name = name.rsplit(".", 1)[0] if "." in name else ""
+            module = module_lookup.get(module_name)
+            summary["module"] = module_name
+            summary["module_type"] = module.__class__.__name__ if module is not None else "<root>"
+            group = optimizer_groups.get(id(param))
+            if group:
+                summary["optimizer_group"] = group
             if torch.is_tensor(param):
                 pdata = param.detach()
+                summary["param_norm"] = self._safe_tensor_norm(pdata)
+                summary["param_abs_max"] = self._safe_tensor_abs_max(pdata)
                 psummary = self._tensor_nonfinite_summary(pdata)
                 if psummary is not None:
                     summary["param_bad"] = {
@@ -1360,6 +1410,64 @@ class CustomDetectionTrainer(DetectionTrainer):
             if len(issues) >= limit:
                 break
         return issues
+
+    def _optimizer_group_lookup(self) -> dict[int, dict[str, Any]]:
+        lookup: dict[int, dict[str, Any]] = {}
+        opt = getattr(self, "optimizer", None)
+        if opt is None:
+            return lookup
+        for idx, group in enumerate(getattr(opt, "param_groups", [])):
+            info = {
+                "index": idx,
+                "name": group.get("name", f"group_{idx}"),
+                "lr": float(group.get("lr", 0.0)),
+                "weight_decay": float(group.get("weight_decay", 0.0)),
+            }
+            for param in group.get("params", []):
+                lookup[id(param)] = info
+        return lookup
+
+    def _safe_loss_items(self) -> Any:
+        li = getattr(self, 'loss_items', None)
+        if li is None:
+            return None
+        try:
+            t = li.detach() if isinstance(li, torch.Tensor) else torch.as_tensor(li)
+            return t.float().cpu().tolist()
+        except Exception:
+            return str(li)
+
+    def _safe_tensor_norm(self, t: torch.Tensor) -> float | None:
+        try:
+            finite = torch.isfinite(t)
+            if not finite.any():
+                return None
+            return float(t[finite].detach().float().norm().item())
+        except Exception:
+            return None
+
+    def _safe_tensor_abs_max(self, t: torch.Tensor) -> float | None:
+        try:
+            finite = torch.isfinite(t)
+            if not finite.any():
+                return None
+            return float(t[finite].detach().float().abs().max().item())
+        except Exception:
+            return None
+
+    def _write_nonfinite_diagnostics_file(self, payload: dict[str, Any]) -> str | None:
+        if not self.job_id:
+            return None
+        try:
+            epoch = payload.get("epoch", "unknown")
+            batch_i = payload.get("batch_i", "unknown")
+            out_dir = JOBS_DIR / str(self.job_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"nonfinite_gradients_e{epoch}_b{batch_i}_s{self._nonfinite_grad_steps}.json"
+            path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            return str(path)
+        except Exception:
+            return None
 
     def _assert_batchnorm_buffers_finite(self, phase: str) -> None:
         """Fail before EMA/save if BatchNorm running buffers become non-finite."""
