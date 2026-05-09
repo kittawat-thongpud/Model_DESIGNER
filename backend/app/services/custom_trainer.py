@@ -652,9 +652,8 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
-                        "saliency_head",
-                        "scorer",
-                        "aggregator",
+                        "scorer",       # ReferenceGuidedSparseBlock (V3)
+                        "aggregator",   # ReferenceGuidedSparseBlock (V3)
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
@@ -1419,9 +1418,8 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
-                        "saliency_head",
-                        "scorer",
-                        "aggregator",
+                        "scorer",       # ReferenceGuidedSparseBlock (V3)
+                        "aggregator",   # ReferenceGuidedSparseBlock (V3)
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith("norm"):
