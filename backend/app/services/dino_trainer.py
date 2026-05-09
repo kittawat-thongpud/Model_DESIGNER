@@ -441,71 +441,84 @@ def _get_system_resources() -> dict[str, Any]:
     except Exception:
         return {"ram_used_gb": 0, "ram_total_gb": 0}
 
-def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
-    """Parse DINO log line for metrics."""
+def _eta_to_seconds(eta_str: str) -> float | None:
+    """Convert eta string 'H:MM:SS' or 'MM:SS' to seconds."""
     try:
-        # Try JSON format first (DINO log.txt outputs JSON)
-        data = json.loads(line.strip())
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError:
-        pass
-    
-    # Parse text format from stdout (e.g., "Epoch: [8/300]  [372/373]  eta: 0:00:00  loss: 4.870012 (5.043951)  lr: 0.000006 (0.000006)  wd: 0.050772 (0.050693)  time: 0.086712  data: 0.000046  max mem: 4157")
-    metrics = {}
-    
-    # Parse epoch
+        parts = [int(p) for p in eta_str.split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return float(parts[0])
+    except Exception:
+        return None
+
+
+def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
+    """Parse DINO stdout log line for metrics.
+
+    Format: "Epoch: [E/T]  [iter/total]  eta: H:MM:SS  loss: X (avg)  lr: X (avg)  wd: X (avg)  time: X  data: X  max mem: X"
+    """
+    # Skip JSON lines (log.txt end-of-epoch summaries) — not useful for batch progress
+    if line.strip().startswith("{"):
+        return None
+
+    metrics: dict[str, Any] = {}
+
+    # Parse epoch: "Epoch: [3/300]"
     m = re.search(r"Epoch:\s*\[(\d+)/(\d+)\]", line)
+    if not m:
+        return None  # Not a training progress line
+    metrics["epoch"] = int(m.group(1))
+    metrics["total_epochs"] = int(m.group(2))
+
+    # Parse iteration: second bracket pair "[210/373]" (after epoch bracket)
+    rest = line[m.end():]
+    m2 = re.search(r"\[(\d+)/(\d+)\]", rest)
+    if m2:
+        metrics["iteration"] = int(m2.group(1))
+        metrics["total_iterations"] = int(m2.group(2))
+
+    # Parse ETA: "eta: 0:00:14"
+    m = re.search(r"eta:\s*([\d:]+)", line)
     if m:
-        metrics["epoch"] = int(m.group(1))
-        metrics["total_epochs"] = int(m.group(2))
-    
-    # Parse loss (current and average)
+        metrics["eta"] = m.group(1)
+        metrics["eta_s"] = _eta_to_seconds(m.group(1))
+
+    # Parse loss (current and running average): "loss: 9.73 (10.00)"
     m = re.search(r"loss:\s*([\d.]+)\s*\(([\d.]+)\)", line)
     if m:
         metrics["train_loss"] = float(m.group(1))
         metrics["train_loss_avg"] = float(m.group(2))
-    
-    # Parse learning rate
-    m = re.search(r"lr:\s*([\d.e-]+)\s*\(([\d.e-]+)\)", line)
+
+    # Parse learning rate: "lr: 0.000006 (0.000006)"
+    m = re.search(r"lr:\s*([\d.e+-]+)\s*\(([\d.e+-]+)\)", line)
     if m:
         metrics["train_lr"] = float(m.group(1))
         metrics["train_lr_avg"] = float(m.group(2))
-    
-    # Parse weight decay
-    m = re.search(r"wd:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+
+    # Parse weight decay: "wd: 0.050120 (0.050104)"
+    m = re.search(r"wd:\s*([\d.e+-]+)\s*\(([\d.e+-]+)\)", line)
     if m:
         metrics["weight_decay"] = float(m.group(1))
         metrics["weight_decay_avg"] = float(m.group(2))
-    
-    # Parse iterations (for epoch time calculation)
-    m = re.search(r"\[(\d+)/(\d+)\]", line)
-    if m:
-        metrics["iteration"] = int(m.group(1))
-        metrics["total_iterations"] = int(m.group(2))
-    
-    # Parse time per iteration
+
+    # Parse time per iteration: "time: 0.088645"
     m = re.search(r"time:\s*([\d.]+)", line)
     if m:
         metrics["time_per_iter"] = float(m.group(1))
-    
-    # Parse data loading time
+
+    # Parse data loading time: "data: 0.000056"
     m = re.search(r"data:\s*([\d.]+)", line)
     if m:
         metrics["data_time"] = float(m.group(1))
-    
-    # Parse max memory
+
+    # Parse max memory: "max mem: 4148"
     m = re.search(r"max mem:\s*(\d+)", line)
     if m:
         metrics["max_mem_mb"] = int(m.group(1))
-    
-    # Parse ETA
-    m = re.search(r"eta:\s*([\d:]+)", line)
-    if m:
-        metrics["eta"] = m.group(1)
-    
-    # Return metrics if we found at least epoch
-    return metrics if "epoch" in metrics else None
+
+    return metrics
 
 def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, start_time: float) -> None:
     """Update job with training metrics."""
@@ -817,53 +830,74 @@ def run_worker(payload: dict[str, Any]) -> None:
         if metrics:
             _update_job_metrics(job_id, metrics, batch, started)
             
-            # Publish SSE progress event (like Ultralytics)
+            # Emit PROGRESS log entry → log.jsonl → SSE via stream_controller (like RT-DETRv2)
             epoch = metrics.get("epoch")
             iteration = metrics.get("iteration")
             total_iterations = metrics.get("total_iterations")
             if epoch is not None:
                 system_res = _get_system_resources()
-                progress_data = {
-                    'type': 'progress',
-                    'phase': 'train',
-                    'epoch': f"{epoch}/{epochs}",
-                    'batch': f"{iteration}/{total_iterations}" if iteration and total_iterations else "0/0",
-                    'percent': int((iteration / total_iterations) * 100) if iteration and total_iterations else 0,
-                    'losses': {
-                        'box': metrics.get("train_loss"),  # DINO uses single loss, map to box loss
+                now = time.time()
+                total_elapsed_s = round(now - started, 1)
+                time_per_iter = metrics.get("time_per_iter")
+                imgs_per_sec = round(batch / time_per_iter, 1) if time_per_iter and time_per_iter > 0 else None
+                pct = round((iteration / total_iterations) * 100, 1) if iteration and total_iterations else 0.0
+                # Compute avg_epoch_s and eta_s from elapsed + epoch count
+                avg_epoch_s = round(total_elapsed_s / epoch, 1) if epoch > 0 else None
+                eta_s = metrics.get("eta_s")  # parsed from log string
+                if eta_s is None and avg_epoch_s:
+                    eta_s = round(avg_epoch_s * (epochs - epoch), 0)
+                progress_data: dict[str, Any] = {
+                    "type": "progress",
+                    "phase": "train",
+                    "epoch": f"{epoch}/{epochs}",
+                    "batch": f"{iteration}/{total_iterations}" if iteration and total_iterations else "0/0",
+                    "percent": pct,
+                    "losses": {
+                        "box": metrics.get("train_loss"),
                     },
-                    'device': device if device else 'cuda:0' if config.get("device") != 'cpu' else 'cpu',
-                    'ram_gb': system_res["ram_used_gb"],
-                    'ram_total_gb': system_res["ram_total_gb"],
-                    'gpu_mem_gb': metrics.get("max_mem_mb", 0) / 1024 if metrics.get("max_mem_mb") else None,
-                    'total_elapsed_s': time.time() - started,
-                    'epoch_elapsed_s': None,  # DINO doesn't track epoch start time
-                    'avg_epoch_s': job.get("avg_epoch_time"),
-                    'eta_s': None,  # DINO provides eta as string, not seconds
-                    'imgs_per_sec': batch / metrics.get("time_per_iter", 1) if metrics.get("time_per_iter") else None,
+                    "device": device if device else ("cuda:0" if config.get("device") != "cpu" else "cpu"),
+                    "ram_gb": system_res["ram_used_gb"],
+                    "ram_total_gb": system_res["ram_total_gb"],
+                    "gpu_mem_gb": round(metrics["max_mem_mb"] / 1024, 2) if metrics.get("max_mem_mb") else None,
+                    "total_elapsed_s": total_elapsed_s,
+                    "epoch_elapsed_s": None,
+                    "avg_epoch_s": avg_epoch_s,
+                    "eta_s": eta_s,
+                    "imgs_per_sec": imgs_per_sec,
+                    "lr": metrics.get("train_lr"),
                 }
-                event_bus.publish_sync(job_channel(job_id), progress_data)
+                job_storage.append_job_log(
+                    job_id,
+                    "PROGRESS",
+                    f"Epoch {epoch}/{epochs} | {pct}% | Batch {iteration}/{total_iterations}",
+                    progress_data,
+                )
             
-            # Write to extended_metrics.jsonl (like RT-DETRv2)
-            # Field names MUST match Ultralytics-style names for frontend compatibility
-            epoch = metrics.get("epoch")
-            if epoch is not None and epoch not in seen_epochs:
+            # Write end-of-epoch row to extended_metrics.jsonl (Ultralytics-compatible field names)
+            # Only write once per epoch (when last batch is seen)
+            if epoch is not None and total_iterations and iteration == total_iterations and epoch not in seen_epochs:
                 seen_epochs.add(epoch)
-                epoch_data = {
+                now_ts = time.time()
+                elapsed_so_far = round(now_ts - started, 1)
+                _avg_epoch_s = round(elapsed_so_far / epoch, 1) if epoch > 0 else None
+                epoch_data: dict[str, Any] = {
                     "epoch": epoch,
-                    "timestamp": time.time(),
-                    # Training loss (map DINO → Ultralytics-style)
-                    "train_box_loss": metrics.get("train_loss"),
+                    "timestamp": now_ts,
+                    # Losses — Ultralytics field names
+                    "box_loss": metrics.get("train_loss_avg"),  # use running avg at end of epoch
+                    "cls_loss": None,
+                    "dfl_loss": None,
                     # Learning rate
                     "lr": metrics.get("train_lr"),
-                    # Other metrics
+                    # Epoch timing
+                    "epoch_time": _avg_epoch_s,
+                    # GPU memory
+                    "gpu_memory_mb": metrics.get("max_mem_mb"),
+                    # Extra DINO-specific
                     "weight_decay": metrics.get("weight_decay"),
                     "time_per_iter": metrics.get("time_per_iter"),
                     "data_time": metrics.get("data_time"),
-                    "max_mem_mb": metrics.get("max_mem_mb"),
-                    "eta": metrics.get("eta"),
                 }
-                # Remove None values
                 epoch_data = {k: v for k, v in epoch_data.items() if v is not None}
                 try:
                     with ext_metrics_path.open("a") as mf:
