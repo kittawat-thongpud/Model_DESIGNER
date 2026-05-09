@@ -282,6 +282,61 @@ def _append_output_log(job_id: str, line: str) -> None:
         total = int(m.group(2))
         _set_job(job_id, epoch=epoch, total_epochs=total, message=f"DINO epoch {epoch}/{total}")
 
+def _parse_dino_metrics(line: str) -> dict[str, Any] | None:
+    """Parse DINO log line for metrics."""
+    try:
+        # DINO outputs JSON lines with metrics
+        data = json.loads(line.strip())
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    return None
+
+def _update_job_metrics(job_id: str, metrics: dict[str, Any]) -> None:
+    """Update job with training metrics."""
+    job = job_storage.load_job(job_id)
+    if not job:
+        return
+    
+    # Parse metrics
+    epoch = metrics.get("epoch", job.get("epoch", 0))
+    train_loss = metrics.get("train_loss")
+    train_lr = metrics.get("train_lr")
+    
+    updates = {"epoch": epoch}
+    if train_loss is not None:
+        updates["loss"] = float(train_loss)
+    if train_lr is not None:
+        updates["lr"] = float(train_lr)
+    
+    # Update history
+    history = list(job.get("history") or [])
+    history.append({
+        "epoch": epoch,
+        "loss": train_loss,
+        "lr": train_lr,
+        "timestamp": time.time(),
+        "metrics": metrics,
+    })
+    updates["history"] = history
+    
+    _set_job(job_id, **updates)
+
+def _cleanup_old_checkpoints(out_dir: Path, keep_last: int = 3) -> None:
+    """Keep only the last N checkpoints to prevent disk filling."""
+    checkpoints = sorted(
+        out_dir.glob("checkpoint*.pth"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    # Keep the most recent ones
+    for ckpt in checkpoints[keep_last:]:
+        try:
+            ckpt.unlink()
+        except Exception:
+            pass
+
 
 def run_worker(payload: dict[str, Any]) -> None:
     """Run one DINO training job inside the existing training child."""
@@ -351,10 +406,10 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     spec = _SCALE_TO_SPEC[model_scale]
     batch = int(config["batch"] if config.get("batch") is not None else config.get("batch_size", 64))
-    workers = int(config["workers"] if config.get("workers") is not None else 4)
+    workers = int(config["workers") if config.get("workers") is not None else 4)
     epochs = int(config["epochs"] if config.get("epochs") is not None else 100)
     use_fp16 = bool(config.get("amp", True))
-    save_period = int(config["save_period"] if config.get("save_period") is not None else 20)
+    save_period = int(config["save_period") if config.get("save_period") is not None else 20)
     warmup_epochs = int(float(config.get("warmup_epochs", 10)))
     lr = float(config.get("lr0", config.get("lr", 0.0005)))
     min_lr = float(config.get("min_lr", 1e-6))
@@ -362,7 +417,14 @@ def run_worker(payload: dict[str, Any]) -> None:
     seed = int(config.get("seed", 0))
     local_crops_number = int(config.get("local_crops_number", config.get("dino_local_crops_number", 8)))
 
+    # Resume logic: prioritize last.pth, then best.pth, then checkpoint.pth
     resume_ckpt = _resolve_checkpoint(str(config.get("resume") or ""))
+    if resume_ckpt is None:
+        # Try last.pth from previous training
+        last_ckpt = out_dir / "last.pth"
+        if last_ckpt.exists():
+            resume_ckpt = last_ckpt
+            job_storage.append_job_log(job_id, "INFO", f"DINO resuming from last.pth: {last_ckpt}")
     if resume_ckpt is None:
         resume_ckpt = _resolve_checkpoint(str(config.get("pretrained") or ""))
     if resume_ckpt is not None:
@@ -439,6 +501,9 @@ def run_worker(payload: dict[str, Any]) -> None:
     )
 
     started = time.time()
+    best_loss = float('inf')
+    best_checkpoint: Path | None = None
+    
     proc = subprocess.Popen(
         cmd,
         cwd=str(root),
@@ -448,13 +513,60 @@ def run_worker(payload: dict[str, Any]) -> None:
         text=True,
         bufsize=1,
     )
+    
+    # Track log.txt for metrics parsing
+    log_path = out_dir / "log.txt"
+    last_log_size = 0
+    
     for line in proc.stdout or []:
         _append_output_log(job_id, line)
+        
+        # Parse metrics from log.txt when it updates
+        if log_path.exists():
+            current_size = log_path.stat().st_size
+            if current_size > last_log_size:
+                last_log_size = current_size
+                # Parse new lines from log.txt
+                try:
+                    with open(log_path, 'r') as f:
+                        for log_line in f.readlines():
+                            metrics = _parse_dino_metrics(log_line)
+                            if metrics:
+                                _update_job_metrics(job_id, metrics)
+                                
+                                # Track best checkpoint
+                                train_loss = metrics.get("train_loss")
+                                if train_loss is not None and isinstance(train_loss, (int, float)):
+                                    if train_loss < best_loss:
+                                        best_loss = train_loss
+                                        # Copy current checkpoint to best.pth
+                                        current_ckpt = out_dir / "checkpoint.pth"
+                                        if current_ckpt.exists():
+                                            best_ckpt = out_dir / "best.pth"
+                                            shutil.copy2(current_ckpt, best_ckpt)
+                except Exception:
+                    pass
+    
     returncode = proc.wait()
     if returncode != 0:
         raise RuntimeError(f"DINO training failed with exit code {returncode}")
 
     elapsed = time.time() - started
+    
+    # Cleanup old checkpoints (keep only last 3 + best)
+    _cleanup_old_checkpoints(out_dir, keep_last=3)
+    
+    # Save best checkpoint if available, otherwise use last
+    best_ckpt = out_dir / "best.pth"
+    last_ckpt = out_dir / "checkpoint.pth"
+    final_ckpt = best_ckpt if best_ckpt.exists() else last_ckpt
+    
+    if final_ckpt.exists():
+        # Copy to last.pth for resume functionality
+        last_path = out_dir / "last.pth"
+        shutil.copy2(final_ckpt, last_path)
+        job_storage.append_job_log(job_id, "INFO", f"DINO final checkpoint: {final_ckpt.name}")
+    
     _append_history_from_log(job_id, out_dir)
     weight_id = _save_weight(job_id, out_dir, elapsed)
     _set_job(
