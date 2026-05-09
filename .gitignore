@@ -40,6 +40,10 @@ splits/
 weights/
 ultralytics_cache/
 Legacy_/
+
+# ─── Vendor repositories (embedded git repos) ─────────────────────────────────
+backend/data/vendor/
+
 # ── Data / cache ──────────────────────────────────────────────────────────────
 *.csv
 *.npy
