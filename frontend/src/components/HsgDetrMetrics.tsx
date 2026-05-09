@@ -208,13 +208,21 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           const gammaRaw = latest[metricKey(scale, 'gamma_raw_abs_mean')];
           const gammaFloor = latest[metricKey(scale, 'gamma_floor')];
           const delta = latest[metricKey(scale, 'delta_scaled_norm_selected')] ?? latest[metricKey(scale, 'delta_norm_selected')];
+          const scoreStd = latest[metricKey(scale, 'score_std')];
+          const isV2 = scoreStd != null;
+
+          // V2 shows different sub-label
+          const subLabel = isV2
+            ? `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | score_std=${fmt(scoreStd, 2)} | gamma=${fmt(gamma, 3)}`
+            : `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`;
+
           return (
             <MetricCard
               key={scale}
               label={`${scale} selected`}
               value={fmt(selected, 4)}
               color={metricColor(delta)}
-              sub={`${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`}
+              sub={subLabel}
             />
           );
         })}
@@ -251,33 +259,52 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           </ResponsiveContainer>
         </ChartPanel>
 
-        <ChartPanel title={hasScaledDeltaMetrics ? 'Selected Delta After Gamma' : 'Selected Delta Norm'} icon={<Activity size={14} className="text-rose-400" />}>
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
-              <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-              <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
-              <Tooltip content={<CustomTooltip />} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartPanel>
+        {!hasV2ScoreStats && (
+          <ChartPanel title={hasScaledDeltaMetrics ? 'Selected Delta After Gamma' : 'Selected Delta Norm'} icon={<Activity size={14} className="text-rose-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
 
-        <ChartPanel title={referenceGuidedCount > 0 ? 'Reference Sparse Grad' : 'Selected-token Sparse Grad'} icon={<Activity size={14} className="text-blue-400" />}>
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
-              <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-              <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
-              <Tooltip content={<CustomTooltip />} />
-              <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('selected_grad_norm')}
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartPanel>
+        {hasV2ScoreStats && (
+          <ChartPanel title="Score Std (Budget Formula)" icon={<Activity size={14} className="text-violet-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('score_std')}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
 
-        <ChartPanel title="Selection Ratio" icon={<Layers size={14} className="text-amber-400" />}>
+        {!hasV2ScoreStats && (
+          <ChartPanel title={referenceGuidedCount > 0 ? 'Reference Sparse Grad' : 'Selected-token Sparse Grad'} icon={<Activity size={14} className="text-blue-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('selected_grad_norm')}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        <ChartPanel title="Selection Ratio (k/N)" icon={<Layers size={14} className="text-amber-400" />}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
@@ -285,7 +312,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 1]} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('selected_ratio')}
+              {scaleLines('k_over_N')}
             </LineChart>
           </ResponsiveContainer>
         </ChartPanel>
@@ -336,15 +363,16 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <th className="px-4 py-2 text-right">Ratio</th>
                 <th className="px-4 py-2 text-right">Window</th>
                 <th className="px-4 py-2 text-right">k / N</th>
-                <th className="px-4 py-2 text-right">Gamma raw</th>
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Gamma raw</th>}
                 <th className="px-4 py-2 text-right">Gamma eff</th>
-                <th className="px-4 py-2 text-right">Floor</th>
-                <th className="px-4 py-2 text-right">Delta selected</th>
-                <th className="px-4 py-2 text-right">Delta scaled</th>
-                <th className="px-4 py-2 text-right">Delta non-selected</th>
-                <th className="px-4 py-2 text-right">Selected grad</th>
-                <th className="px-4 py-2 text-right">Non-selected sparse grad</th>
-                <th className="px-4 py-2 text-right">Guard hits</th>
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Floor</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Delta selected</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Delta scaled</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Delta non-selected</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Selected grad</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Non-selected sparse grad</th>}
+                {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Guard hits</th>}
+                {hasV2ScoreStats && <th className="px-4 py-2 text-right">Score std</th>}
                 <th className="px-4 py-2 text-center">Contract</th>
               </tr>
             </thead>
@@ -359,6 +387,12 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 const contractOk = (deltaNon ?? 0) <= EPS && (sparseNon ?? 0) <= EPS && guardHits === 0;
                 const refGuided = isReferenceGuided(latest, scale);
                 const windowSize = latest[metricKey(scale, 'window_size')];
+                const scoreStd = latest[metricKey(scale, 'score_std')];
+                const isV2 = scoreStd != null;
+
+                // For V2, contract is always OK (no delta/sparse grad checks)
+                const v2ContractOk = true;
+
                 return (
                   <tr key={scale} className="border-b border-slate-800/50 hover:bg-slate-800/20">
                     <td className="px-4 py-2 font-bold" style={{ color: SCALE_COLORS[scale] }}>
@@ -380,25 +414,18 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                       {fmt(latest[metricKey(scale, 'k_over_N')], 4)}
                       <span className="text-slate-600 ml-1">({fmt(latest[metricKey(scale, 'k')], 0)}/{fmt(latest[metricKey(scale, 'N')], 0)})</span>
                     </td>
-                    <td className="px-4 py-2 text-right font-mono text-slate-300">{fmt(latest[metricKey(scale, 'gamma_raw_abs_mean')], 4)}</td>
+                    {!isV2 && <td className="px-4 py-2 text-right font-mono text-slate-300">{fmt(latest[metricKey(scale, 'gamma_raw_abs_mean')], 4)}</td>}
                     <td className="px-4 py-2 text-right font-mono text-emerald-400">{fmt(latest[metricKey(scale, 'gamma_abs_mean')], 4)}</td>
-                    <td className="px-4 py-2 text-right font-mono text-cyan-400">{fmt(latest[metricKey(scale, 'gamma_floor')], 4)}</td>
-                    <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaSelected)}`}>
-                      {fmt(deltaSelected, 4)}
-                    </td>
-                    <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaScaled ?? deltaSelected)}`}>
-                      {fmt(deltaScaled, 4)}
-                    </td>
-                    <td className={`px-4 py-2 text-right font-mono ${(deltaNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {fmt(deltaNon, 4)}
-                    </td>
-                    <td className={`px-4 py-2 text-right font-mono ${metricColor(selectedGrad)}`}>{fmt(selectedGrad, 4)}</td>
-                    <td className={`px-4 py-2 text-right font-mono ${(sparseNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {fmt(sparseNon, 4)}
-                    </td>
-                    <td className={`px-4 py-2 text-right font-mono ${guardHits === 0 ? 'text-slate-400' : 'text-red-400'}`}>{fmt(guardHits, 0)}</td>
+                    {!isV2 && <td className="px-4 py-2 text-right font-mono text-cyan-400">{fmt(latest[metricKey(scale, 'gamma_floor')], 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaSelected)}`}>{fmt(deltaSelected, 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaScaled ?? deltaSelected)}`}>{fmt(deltaScaled, 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${(deltaNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>{fmt(deltaNon, 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${metricColor(selectedGrad)}`}>{fmt(selectedGrad, 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${(sparseNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>{fmt(sparseNon, 4)}</td>}
+                    {!isV2 && <td className={`px-4 py-2 text-right font-mono ${guardHits === 0 ? 'text-slate-400' : 'text-red-400'}`}>{fmt(guardHits, 0)}</td>}
+                    {isV2 && <td className="px-4 py-2 text-right font-mono text-violet-400">{fmt(scoreStd, 2)}</td>}
                     <td className="px-4 py-2 text-center">
-                      {contractOk
+                      {(isV2 ? v2ContractOk : contractOk)
                         ? <span className="text-emerald-400 text-[10px]">PASS</span>
                         : <span className="text-red-400 text-[10px]">CHECK</span>}
                     </td>
