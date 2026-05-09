@@ -1172,39 +1172,52 @@ class CustomDetectionTrainer(DetectionTrainer):
 
             metrics[f'{tag}_reference_guided'] = 0.0
 
-            selected_ratio = getattr(blk, 'last_selected_ratio', None)
-            if selected_ratio is not None:
-                metrics[f'{tag}_selected_ratio'] = float(selected_ratio)
-            gamma_raw_abs = getattr(blk, 'last_gamma_raw_abs_mean', None)
-            if gamma_raw_abs is not None:
-                metrics[f'{tag}_gamma_raw_abs_mean'] = float(gamma_raw_abs)
-            gamma_abs = getattr(blk, 'last_gamma_abs_mean', None)
-            if gamma_abs is not None:
-                metrics[f'{tag}_gamma_abs_mean'] = float(gamma_abs)
-            gamma_floor = getattr(blk, 'last_gamma_floor', None)
-            if gamma_floor is not None:
-                metrics[f'{tag}_gamma_floor'] = float(gamma_floor)
-            delta_selected = getattr(blk, 'last_delta_norm_selected', None)
-            if delta_selected is not None:
-                metrics[f'{tag}_delta_norm_selected'] = float(delta_selected)
-            delta_nonselected = getattr(blk, 'last_delta_norm_nonselected', None)
-            if delta_nonselected is not None:
-                metrics[f'{tag}_delta_norm_nonselected'] = float(delta_nonselected)
-            delta_scaled = getattr(blk, 'last_delta_scaled_norm_selected', None)
-            if delta_scaled is not None:
-                metrics[f'{tag}_delta_scaled_norm_selected'] = float(delta_scaled)
-            selected_grad = getattr(blk, 'last_selected_grad_norm', None)
-            if selected_grad is not None:
-                metrics[f'{tag}_selected_grad_norm'] = float(selected_grad)
-            nonselected_sparse_grad = getattr(blk, 'last_nonselected_sparse_grad', None)
-            if nonselected_sparse_grad is not None:
-                metrics[f'{tag}_nonselected_sparse_grad'] = float(nonselected_sparse_grad)
-            finite_guard_count = getattr(blk, 'last_finite_guard_count', None)
-            if finite_guard_count is not None:
-                metrics[f'{tag}_finite_guard_count'] = float(finite_guard_count)
-            score_std = getattr(blk, 'last_score_std', None)
-            if score_std is not None:
-                metrics[f'{tag}_score_std'] = float(score_std)
+            # Handle different attribute names between v1 (SGTokenBlock) and v2 (SGTokenBlockV2)
+            is_v2 = blk.__class__.__name__ == 'SGTokenBlockV2'
+
+            if is_v2:
+                # V2 attributes
+                last_gate = getattr(blk, 'last_gate', None)
+                if last_gate is not None:
+                    metrics[f'{tag}_gamma_abs_mean'] = float(last_gate)
+                last_score_std = getattr(blk, 'last_score_std', None)
+                if last_score_std is not None:
+                    metrics[f'{tag}_score_std'] = float(last_score_std)
+            else:
+                # V1/Legacy attributes
+                selected_ratio = getattr(blk, 'last_selected_ratio', None)
+                if selected_ratio is not None:
+                    metrics[f'{tag}_selected_ratio'] = float(selected_ratio)
+                gamma_raw_abs = getattr(blk, 'last_gamma_raw_abs_mean', None)
+                if gamma_raw_abs is not None:
+                    metrics[f'{tag}_gamma_raw_abs_mean'] = float(gamma_raw_abs)
+                gamma_abs = getattr(blk, 'last_gamma_abs_mean', None)
+                if gamma_abs is not None:
+                    metrics[f'{tag}_gamma_abs_mean'] = float(gamma_abs)
+                gamma_floor = getattr(blk, 'last_gamma_floor', None)
+                if gamma_floor is not None:
+                    metrics[f'{tag}_gamma_floor'] = float(gamma_floor)
+                delta_selected = getattr(blk, 'last_delta_norm_selected', None)
+                if delta_selected is not None:
+                    metrics[f'{tag}_delta_norm_selected'] = float(delta_selected)
+                delta_nonselected = getattr(blk, 'last_delta_norm_nonselected', None)
+                if delta_nonselected is not None:
+                    metrics[f'{tag}_delta_norm_nonselected'] = float(delta_nonselected)
+                delta_scaled = getattr(blk, 'last_delta_scaled_norm_selected', None)
+                if delta_scaled is not None:
+                    metrics[f'{tag}_delta_scaled_norm_selected'] = float(delta_scaled)
+                selected_grad = getattr(blk, 'last_selected_grad_norm', None)
+                if selected_grad is not None:
+                    metrics[f'{tag}_selected_grad_norm'] = float(selected_grad)
+                nonselected_sparse_grad = getattr(blk, 'last_nonselected_sparse_grad', None)
+                if nonselected_sparse_grad is not None:
+                    metrics[f'{tag}_nonselected_sparse_grad'] = float(nonselected_sparse_grad)
+                finite_guard_count = getattr(blk, 'last_finite_guard_count', None)
+                if finite_guard_count is not None:
+                    metrics[f'{tag}_finite_guard_count'] = float(finite_guard_count)
+                score_std = getattr(blk, 'last_score_std', None)
+                if score_std is not None:
+                    metrics[f'{tag}_score_std'] = float(score_std)
 
             saliency = getattr(blk, 'last_saliency', None)
             if saliency is not None and saliency.numel():
