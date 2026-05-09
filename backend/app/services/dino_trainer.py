@@ -616,19 +616,15 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, s
     
     _set_job(job_id, **updates)
 
-def _cleanup_old_checkpoints(out_dir: Path, keep_last: int = 3) -> None:
-    """Keep only the last N checkpoints to prevent disk filling."""
-    checkpoints = sorted(
-        out_dir.glob("checkpoint*.pth"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-    )
-    # Keep the most recent ones
-    for ckpt in checkpoints[keep_last:]:
-        try:
-            ckpt.unlink()
-        except Exception:
-            pass
+def _cleanup_old_checkpoints(out_dir: Path) -> None:
+    """Remove all periodic checkpoints, keep only best.pth and last.pth."""
+    # Remove checkpoint{epoch:04}.pth files (periodic checkpoints)
+    for ckpt in out_dir.glob("checkpoint*.pth"):
+        if ckpt.name != "checkpoint.pth":  # Keep checkpoint.pth for resume
+            try:
+                ckpt.unlink()
+            except Exception:
+                pass
 
 
 def run_worker(payload: dict[str, Any]) -> None:
@@ -756,7 +752,7 @@ def run_worker(payload: dict[str, Any]) -> None:
         "--use_fp16",
         "true" if use_fp16 else "false",
         "--saveckp_freq",
-        str(save_period),
+        str(epochs + 1),  # Disable periodic checkpoints (keep only checkpoint.pth)
         "--warmup_epochs",
         str(max(0, min(warmup_epochs, epochs))),
         "--lr",
@@ -892,8 +888,8 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     elapsed = time.time() - started
     
-    # Cleanup old checkpoints (keep only last 3 + best)
-    _cleanup_old_checkpoints(out_dir, keep_last=3)
+    # Cleanup periodic checkpoints (keep only checkpoint.pth, best.pth, last.pth)
+    _cleanup_old_checkpoints(out_dir)
     
     # Save best checkpoint if available, otherwise use last
     best_ckpt = out_dir / "best.pth"
