@@ -158,6 +158,30 @@ const PerClassMetrics: React.FC<Props> = ({ history, classNames }) => {
     });
   }, [history, visibleClasses, metricType]);
 
+  // Calculate Y-axis domain with margin
+  const yAxisDomain = useMemo(() => {
+    if (graphData.length === 0 || visibleClasses.size === 0) return [0, 1];
+
+    let min = Infinity;
+    let max = -Infinity;
+
+    graphData.forEach(epoch => {
+      visibleClasses.forEach(classIndex => {
+        const value = epoch[`class_${classIndex}`];
+        if (typeof value === 'number' && !isNaN(value)) {
+          min = Math.min(min, value);
+          max = Math.max(max, value);
+        }
+      });
+    });
+
+    if (!isFinite(min) || !isFinite(max)) return [0, 1];
+
+    // Add 10% margin on top and bottom
+    const margin = (max - min) * 0.1;
+    return [Math.max(0, min - margin), Math.min(1, max + margin)];
+  }, [graphData, visibleClasses]);
+
   // Toggle class visibility
   const toggleClass = (classIndex: number) => {
     const newSet = new Set(visibleClasses);
@@ -386,10 +410,10 @@ const PerClassMetrics: React.FC<Props> = ({ history, classNames }) => {
               {/* Line chart */}
               <div className="h-[400px] rounded-lg border border-slate-800 p-2">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={graphData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                  <LineChart data={graphData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
                     <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-                    <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 1]} />
+                    <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={yAxisDomain} />
                     <Tooltip
                       content={({ active, payload, label }) => {
                         if (!active || !payload?.length) return null;
