@@ -2,17 +2,26 @@
 # runpod_setup.sh — RunPod "Start Command" / pre-cmd script
 #
 # Paste this path (or its contents) into RunPod Pod Template → "Start Command":
-#   bash /workspace/Model_DESIGNER/scripts/runpod_setup.sh
+#   bash /Model_DESIGNER/scripts/runpod_setup.sh
+# or set REPO_DIR explicitly if you keep the repo somewhere else.
 #
 # What it does (idempotent — safe to run every pod start):
 #   1. Install / upgrade Python deps from requirements.txt into the system Python
-#   2. Ensure /workspace symlink layout is sane
+#   2. Ensure project-local data directories exist
 #   3. Start Model DESIGNER backend server
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/workspace/Model_DESIGNER}"
+if [ -z "${REPO_DIR:-}" ]; then
+    if [ -f "/Model_DESIGNER/requirements.txt" ]; then
+        REPO_DIR="/Model_DESIGNER"
+    elif [ -f "/workspace/Model_DESIGNER/requirements.txt" ]; then
+        REPO_DIR="/workspace/Model_DESIGNER"
+    else
+        REPO_DIR="/Model_DESIGNER"
+    fi
+fi
 REQ="${REPO_DIR}/requirements.txt"
 PYTHON="${MODEL_DESIGNER_PYTHON:-$(which python3)}"
 LOG_PREFIX="[runpod_setup]"
