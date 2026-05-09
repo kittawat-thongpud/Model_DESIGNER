@@ -440,19 +440,23 @@ class SGTokenBlock(nn.Module):
     def _effective_gamma(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         """Return signed LayerScale with a small floor so sparse contribution cannot vanish.
 
-        Uses softplus instead of clamp_min so the gradient is never zero-killed when
-        gamma.abs() < floor. clamp_min has zero gradient in the clamped region, which
-        causes gamma to freeze permanently once it descends below the floor.
+        Uses a straight-through estimator (STE) over clamp_min so:
+          - Forward : magnitude = max(|gamma|, floor)   — floor is enforced
+          - Backward: gradient = sign(gamma)            — never zero, no softplus ln(2) bias
+
+        The previous softplus formula had a fatal flaw: softplus(x) → ln(2) ≈ 0.693 as x → 0,
+        so when gamma_raw ≈ floor the effective gamma was pinned at floor + ln(2) ≈ 0.703
+        regardless of what gamma_raw was — gamma never learned.
         """
         gamma = self.gamma.to(dtype=dtype, device=device)
         floor = float(getattr(self, "gamma_floor", 0.0))
         if floor <= 0.0:
             return gamma
         sign = torch.where(gamma.detach() >= 0, torch.ones_like(gamma), -torch.ones_like(gamma))
-        # softplus(x) smoothly approaches x for x >> 0 and 0 for x << 0,
-        # so floor + softplus(|gamma| - floor) is always >= floor and has a
-        # non-zero gradient everywhere (sigmoid(|gamma| - floor)).
-        mag = floor + torch.nn.functional.softplus(gamma.abs() - floor)
+        abs_g = gamma.abs()
+        # STE: forward uses clamped magnitude, backward gradient flows through abs_g unchanged.
+        mag_hard = abs_g.clamp(min=floor)
+        mag = abs_g + (mag_hard - abs_g).detach()   # = mag_hard in forward, grad = sign(gamma)
         return sign * mag
 
     # ------------------------------------------------------------------ #
@@ -521,14 +525,17 @@ class SGTokenBlock(nn.Module):
         if delta_tokens.requires_grad:
             delta_tokens.register_hook(self._capture_selected_grad)
 
-        # Soft gate by learned saliency scores.
-        # This is the gradient bridge: detection loss → gate → saliency_head → backbone.
-        # The backbone now receives a training signal that teaches it to assign high
-        # saliency scores to object-containing tokens rather than relying on L2 energy.
+        # Gradient bridge to saliency_head via additive straight-through perturbation.
+        # Multiplicative gating (sal_gate * delta) caused collapse: the model learned to
+        # output negative saliency scores → sigmoid → 0 → delta → 0 → no gradient → dead.
+        # Instead, add a zero-magnitude STE term: forward contributes nothing, backward
+        # carries gradient through saliency_head into backbone so it learns object salience.
         if sal_scores is not None:
-            selected_sal = torch.gather(sal_scores, 1, topk_idx)          # (B, k)
-            sal_gate = torch.sigmoid(selected_sal).unsqueeze(-1)           # (B, k, 1)
-            delta_tokens = delta_tokens * sal_gate.to(dtype=delta_tokens.dtype)
+            selected_sal = torch.gather(sal_scores, 1, topk_idx)           # (B, k)
+            # Scale STE signal to delta magnitude so gradient is proportionate, not dominant.
+            delta_scale = delta_tokens.detach().abs().mean().clamp(min=1e-6)
+            ste = (selected_sal.unsqueeze(-1) - selected_sal.detach().unsqueeze(-1)) * delta_scale
+            delta_tokens = delta_tokens + ste.to(dtype=delta_tokens.dtype)
 
         self.last_delta_norm_selected = float(
             delta_tokens.detach().float().norm(dim=-1).mean().item()
