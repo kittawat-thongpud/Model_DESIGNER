@@ -1,38 +1,66 @@
-# HSG-DETR-N recheck recipe after SGB gamma-floor and metric-label fixes.
-# Use this as the next training config before changing SGB ratios.
+# =============================================================================
+# HSG-DETR-N Legacy — COCO-2017 training config (baseline run)
+# =============================================================================
+# Purpose: establish a clean improvement baseline before architectural changes.
+#   V1 best result: mAP50=0.503 achieved WITH 3 active bugs.
+#   This config transfers V1 weights, then trains with all 3 bugs fixed +
+#   higher token ratios — expected ceiling: mAP50 ≈ 0.52–0.55.
+#
+# Architecture: parameter-free L2 saliency, no PE, no STE bridge.
+#   SGTokenBlock only — no learnable saliency head.
+#
+# Bug fixes active in this run (vs V1):
+#   1. gamma STE clamp_min — gamma can now learn (was pinned at 0.707 before)
+#   2. Norm weight dtype — autograd connection preserved through AMP
+#   3. Alpha resume guard — decoder alpha ramp starts correctly at epoch 0
+#
+# Weight transfer: V1 N best checkpoint (mAP50=0.503, 150ep, amp=False).
+#   Gamma values from checkpoint (~0.707) are now free to move immediately.
+#   resume=false → fresh optimizer + fresh scheduler.
+# =============================================================================
+
 model_id: arch:hsg_detr
 model_name: HSG-DETR N
 model_scale: n
 task: detect
 dataset_name: coco
 
+# ── Core ──────────────────────────────────────────────────────────────────────
 imgsz: 640
 batch: 64
 workers: 8
 cache: disk
-epochs: 50
-patience: 18
-seed: 24
+epochs: 150
+patience: 30
+seed: 42
 deterministic: false
 amp: true
 ema: true
 pin_memory: true
 
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+# lr0=2e-4: there is no learnable saliency_head to warm up.
+# Cosine decay to lr0 * lrf = 2e-6 at epoch 150.
+# warmup_epochs=2: shorter warmup since all weights come from a converged checkpoint.
 optimizer: AdamW
-lr0: 0.00015
+lr0: 0.0002
 lrf: 0.01
 momentum: 0.937
 weight_decay: 0.02
 warmup_epochs: 2.0
 warmup_momentum: 0.8
-warmup_bias_lr: 0.1
+warmup_bias_lr: 0.05
 cos_lr: true
 
-pretrained: b2578a827908
-use_yolo_pretrained: true
+# ── Weights ───────────────────────────────────────────────────────────────────
+# Transfer backbone + neck + decoder from best V1 N checkpoint (150-epoch COCO).
+# saliency_head keys (if any) are silently dropped by _load_from_state_dict.
+pretrained: 4e948007202f
+use_yolo_pretrained: false
 freeze: 0
 resume: false
 
+# ── Loss weights (RT-DETR) ────────────────────────────────────────────────────
 box: 7.5
 cls: 0.5
 dfl: 1.5
@@ -44,6 +72,9 @@ agnostic_nms: false
 rect: false
 single_cls: false
 
+# ── Augmentation ──────────────────────────────────────────────────────────────
+# Mosaic + mixup for COCO multi-object diversity.
+# close_mosaic=20: disable mosaic in final 20 epochs for clean bbox regression.
 hsv_h: 0.015
 hsv_s: 0.7
 hsv_v: 0.4
@@ -57,11 +88,12 @@ fliplr: 0.5
 bgr: 0.0
 mosaic: 1.0
 mixup: 0.10
-copy_paste: 0.0
+copy_paste: 0.10
 erasing: 0.4
 crop_fraction: 1.0
 close_mosaic: 20
 
+# ── Misc ──────────────────────────────────────────────────────────────────────
 save_period: -1
 val: true
 plots: true

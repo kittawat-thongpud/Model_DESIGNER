@@ -1,22 +1,22 @@
 """
-SparseGlobalTokenBlock for HSG-DETR.
+SparseGlobalTokenBlock — SGB-centric sparse-token encoder for HSG-DETR.
 
-The HSG-DETR sparse branch is intentionally selected-token-only:
-  - score spatial tokens with parameter-free L2 energy
-  - project Q/K/V only after top-k gather
-  - run k x k sparse attention in an FP32 island
-  - scatter the selected delta onto a zero canvas
-  - fuse with a small non-zero per-channel LayerScale gamma
+Single tensor-in / tensor-out block with internal top-k selector, compatible
+with Ultralytics ``parse_model``.  Supports three ablation modes:
+  - ``dense``  : full self-attention (O(N²d)) — ablation baseline
+  - ``topk``   : hard top-k sparse attention (O(k²d)) — production
+  - ``hybrid`` : dense local + sparse global fusion — accuracy
 
-Non-selected spatial positions keep the CNN residual path, but they do not
-receive sparse-attention updates. This keeps the block honest to the "sparse
-attention with CNN hybrid" design in the paper draft.
+Optional metadata (selected indices, saliency scores, residual scale) can be
+stored as instance attributes for debug / visualization without breaking
+``parse_model`` (single tensor return).
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
 
@@ -31,28 +31,19 @@ def _finite_or_zero(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     ).clamp(-limit, limit)
 
 
-def _bounded_tanh(x: torch.Tensor, limit: float = 6.0) -> torch.Tensor:
-    """Soft-bound a tensor without hard clipping gradients in the central range."""
-    limit = float(limit)
-    if limit <= 0:
-        return x
-    return limit * torch.tanh(x / limit)
-
-
-def _module_param_dtype(module: nn.Module, fallback: torch.dtype) -> torch.dtype:
-    """Return the dtype of a module parameter without assuming a specific layout."""
-    try:
-        return next(module.parameters()).dtype
-    except StopIteration:
-        return fallback
-
-
 def _make_gn(channels: int) -> nn.GroupNorm:
     """Return a GroupNorm layer without BatchNorm running buffers."""
     groups = min(32, int(channels))
     while int(channels) % groups != 0:
         groups -= 1
     return nn.GroupNorm(groups, int(channels), eps=1e-5)
+
+
+def _fp32_context(device: torch.device):
+    """Disable autocast so numerically sensitive sparse blocks stay in FP32."""
+    if device.type in {"cuda", "cpu"}:
+        return torch.autocast(device_type=device.type, enabled=False)
+    return nullcontext()
 
 
 def _safe_unit_interval(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -68,11 +59,18 @@ def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
 
 class SGTokenBlock(nn.Module):
     """
-    Selected-token-only sparse attention block for HSG-DETR.
+    Sparse-Token Global Self-Attention block.
 
-    The sparse branch projects and updates only the top-k selected spatial
-    tokens. Non-selected locations keep the CNN residual path and receive no
-    sparse-branch delta.
+    Internally performs top-k token selection, sparse self-attention,
+    scatter-back, and gated residual fusion.  Returns a single tensor
+    so it is transparent to Ultralytics ``parse_model``.
+
+    Args:
+        c1 (int): Input channels (auto-injected by parse_model).
+        c2 (int): Output channels (auto-injected by parse_model from YAML args[0]).
+        ratio (float): Fraction of spatial tokens to retain; k = ratio·N (scales with imgsz).
+        mode (str): One of ``"dense"``, ``"topk"``, ``"hybrid"``.
+        debug_enabled (bool): Store detached selector metadata during forward.
     """
 
     VALID_MODES: set[str] = {"dense", "topk", "hybrid"}
@@ -85,139 +83,70 @@ class SGTokenBlock(nn.Module):
         ratio: float = 0.25,
         mode: str = "topk",
         debug_enabled: bool = False,
-        gamma_init: float = 0.10,
-        finite_limit: float = 20.0,
-        attn_logit_limit: float = 50.0,
-        delta_limit: float = 6.0,
-        gamma_floor: float | None = None,
     ) -> None:
         super().__init__()
-        assert c1 == c2, f"SGTokenBlock is channel-preserving (c1={c1}, c2={c2})"
+        assert c1 == c2, (
+            f"SparseGlobalTokenBlock is channel-preserving (c1={c1}, c2={c2})"
+        )
         mode = str(mode).lower()
         if mode not in self.VALID_MODES:
-            raise ValueError(f"Invalid mode: {mode}. Expected {sorted(self.VALID_MODES)}")
+            raise ValueError(
+                f"Invalid SGTokenBlock mode: {mode}. Expected one of {sorted(self.VALID_MODES)}"
+            )
         ratio = float(ratio)
         if not torch.isfinite(torch.tensor(ratio)):
-            raise ValueError(f"Invalid ratio: {ratio}")
+            raise ValueError(f"Invalid SGTokenBlock ratio: {ratio}")
 
-        self.c = int(c2)
+        self.c = c2
         self.ratio = max(0.0, min(ratio, 1.0))
-        # Accept legacy "hybrid" configs, but the new baseline has no local path.
-        self.mode = "topk" if mode == "hybrid" else mode
-        self.requested_mode = mode
-        self.finite_limit = float(finite_limit)
-        self.attn_logit_limit = float(attn_logit_limit)
-        self.delta_limit = float(delta_limit)
-        if gamma_floor is None:
-            if self.ratio >= 0.20:
-                gamma_floor = 0.010
-            elif self.ratio >= 0.10:
-                gamma_floor = 0.0075
-            else:
-                gamma_floor = 0.005
-        self.gamma_floor = max(0.0, float(gamma_floor))
+        self.mode = mode
 
         self.pre_norm = _make_gn(c2)
+        self.delta_norm = _make_gn(c2)
+
+        # 1×1 projections — no spatial aggregation, just channel mixing
+        self.q_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.k_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.v_proj = nn.Conv2d(c2, c2, 1, bias=False)
+        self.out_proj = nn.Conv2d(c2, c2, 1, bias=False)
+
+        # Layer norm on selected tokens (channel dim)
         self.norm = nn.LayerNorm(c2)
-        self.q_proj = nn.Linear(c2, c2, bias=False)
-        self.k_proj = nn.Linear(c2, c2, bias=False)
-        self.v_proj = nn.Linear(c2, c2, bias=False)
-        self.out_proj = nn.Linear(c2, c2, bias=False)
-        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
+
+        # Per-channel LayerScale residual.  Starting near identity keeps the
+        # CNN/PAN path dominant while the sparse branch calibrates.
+        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
+
         self._attn_scale = c2 ** -0.5
 
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
+        # ── Hybrid mode: lightweight local path ───────────────────────────
+        if mode == "hybrid":
+            self.local_dw = nn.Sequential(
+                nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False),
+                _make_gn(c2),
+                nn.SiLU(),
+                nn.Conv2d(c2, c2, 1, bias=False),
+                _make_gn(c2),
+            )
+            self.local_gamma = nn.Parameter(torch.full((1, c2, 1, 1), 1e-4))
+        else:
+            self.local_dw = None
+            self.local_gamma = None
 
+        # Debug metadata (populated only when debug is enabled)
         self.debug_enabled = bool(debug_enabled)
         self.debug_to_cpu = False
         self.last_indices: torch.Tensor | None = None
         self.last_saliency: torch.Tensor | None = None
+        self.last_gate: float | None = None
         self.last_mode: str | None = None
         self.last_k: int | None = None
         self.last_N: int | None = None
-        self.last_selected_ratio: float | None = None
-        self.last_gamma_raw_abs_mean: float | None = None
-        self.last_gamma_abs_mean: float | None = None
-        self.last_gamma_floor: float | None = None
-        self.last_delta_norm_selected: float | None = None
-        self.last_delta_norm_nonselected: float | None = None
-        self.last_delta_scaled_norm_selected: float | None = None
-        self.last_selected_grad_norm: float | None = None
-        self.last_nonselected_sparse_grad: float | None = None
-        self.last_finite_guard_count: int | None = None
 
     def __setstate__(self, state: dict) -> None:
         """Restore runtime-only attrs for checkpoints saved before debug flags existed."""
         super().__setstate__(state)
         self._ensure_runtime_attrs()
-
-    def _load_from_state_dict(
-        self,
-        state_dict: dict,
-        prefix: str,
-        local_metadata: dict,
-        strict: bool,
-        missing_keys: list,
-        unexpected_keys: list,
-        error_msgs: list,
-    ) -> None:
-        """Drop obsolete sparse-block keys and incompatible legacy Conv2d projections."""
-        legacy_roots = {
-            "saliency_mix",
-            "saliency_head",    # V2 learnable saliency head — absent in Legacy
-            "chan_fc1",
-            "chan_fc2",
-            "spatial_conv",
-            "alpha_scale",
-            "local_dw",
-            "local_blend",
-            "local_gamma",
-            "gate",
-        }
-        own_state = self.state_dict()
-        keys_to_remove: list[str] = []
-        for key in list(state_dict.keys()):
-            if not key.startswith(prefix):
-                continue
-            local_name = key[len(prefix):]
-            root = local_name.split(".")[0]
-            if root in legacy_roots:
-                keys_to_remove.append(key)
-                continue
-            expected = own_state.get(local_name)
-            value = state_dict.get(key)
-            if (
-                expected is not None
-                and torch.is_tensor(value)
-                and tuple(value.shape) != tuple(expected.shape)
-            ):
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            state_dict.pop(key, None)
-
-        if keys_to_remove:
-            import warnings
-
-            short_names = sorted({k[len(prefix):].split(".")[0] for k in keys_to_remove})[:8]
-            warnings.warn(
-                "SGTokenBlock checkpoint load: dropped "
-                f"{len(keys_to_remove)} obsolete/incompatible keys: {short_names}",
-                UserWarning,
-            )
-
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
 
     # ------------------------------------------------------------------ #
     # Debug / introspection
@@ -230,19 +159,10 @@ class SGTokenBlock(nn.Module):
             "debug_to_cpu": False,
             "last_indices": None,
             "last_saliency": None,
+            "last_gate": None,
             "last_mode": None,
             "last_k": None,
             "last_N": None,
-            "last_selected_ratio": None,
-            "last_gamma_raw_abs_mean": None,
-            "last_gamma_abs_mean": None,
-            "last_gamma_floor": getattr(self, "gamma_floor", 0.0),
-            "last_delta_norm_selected": None,
-            "last_delta_norm_nonselected": None,
-            "last_delta_scaled_norm_selected": None,
-            "last_selected_grad_norm": None,
-            "last_nonselected_sparse_grad": None,
-            "last_finite_guard_count": None,
         }
         for name, value in defaults.items():
             if not hasattr(self, name):
@@ -254,19 +174,10 @@ class SGTokenBlock(nn.Module):
         return {
             "indices": self.last_indices,
             "saliency": self.last_saliency,
+            "gate": self.last_gate,
             "mode": self.last_mode,
             "k": self.last_k,
             "N": self.last_N,
-            "selected_ratio": self.last_selected_ratio,
-            "gamma_raw_abs_mean": self.last_gamma_raw_abs_mean,
-            "gamma_abs_mean": self.last_gamma_abs_mean,
-            "gamma_floor": self.last_gamma_floor,
-            "delta_norm_selected": self.last_delta_norm_selected,
-            "delta_norm_nonselected": self.last_delta_norm_nonselected,
-            "delta_scaled_norm_selected": self.last_delta_scaled_norm_selected,
-            "selected_grad_norm": self.last_selected_grad_norm,
-            "nonselected_sparse_grad": self.last_nonselected_sparse_grad,
-            "finite_guard_count": self.last_finite_guard_count,
         }
 
     def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
@@ -283,7 +194,7 @@ class SGTokenBlock(nn.Module):
         indices: torch.Tensor | None = None,
         saliency: torch.Tensor | None = None,
     ) -> None:
-        """Store detached selector metadata only when debug capture is enabled."""
+        """Store detached metadata only when debug capture is explicitly enabled."""
         self._ensure_runtime_attrs()
         if not self.debug_enabled:
             self.last_indices = None
@@ -301,471 +212,159 @@ class SGTokenBlock(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _compute_saliency(self, x_norm: torch.Tensor) -> torch.Tensor:
-        """Parameter-free L2 activation energy selector (detached — no gradient).
-
-        Returns normalised energy scores (B, N) for top-k token selection.
-        No learnable parameters: scores are purely derived from feature magnitude.
-        """
-        B, C, H, W = x_norm.shape
-        energy = x_norm.detach().float().view(B, C, H * W).pow(2).mean(dim=1)  # (B, N)
-        energy_mean = energy.mean(dim=1, keepdim=True).clamp(min=1e-6)
-        scores = (energy / energy_mean).to(dtype=x_norm.dtype)
-        return torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+    def _compute_saliency(self, x: torch.Tensor) -> torch.Tensor:
+        """L2 activation energy per spatial token, in FP32."""
+        B, C, H, W = x.shape
+        N = H * W
+        importance = x.view(B, C, N).float().pow(2).sum(dim=1)  # [B, N]
+        return torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _select_k(self, N: int) -> int:
         """Compute effective k based on mode and constraints."""
         if self.mode == "dense":
             if int(N) > self.DENSE_TOKEN_LIMIT:
                 raise RuntimeError(
-                    f"Dense SGB too large: N={N}. Use topk instead."
+                    f"Dense SGB too large: N={N}. Use topk/hybrid instead."
                 )
             return int(N)
         return max(1, min(int(round(self.ratio * int(N))), int(N)))
 
-    def _selected_attention_delta(self, selected: torch.Tensor) -> torch.Tensor:
-        """Run Q/K/V and sparse self-attention only on selected tokens."""
-        proj_dtype = self.q_proj.weight.dtype
-        selected_proj = selected.to(dtype=proj_dtype)
-        q_raw = self.q_proj(selected_proj)
-        k_raw = self.k_proj(selected_proj)
-        v_raw = self.v_proj(selected_proj)
+    def _sparse_attention_delta(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        kk: torch.Tensor,
+        v: torch.Tensor,
+        topk_idx: torch.Tensor,
+        k_actual: int,
+    ) -> torch.Tensor:
+        """
+        Run self-attention on selected tokens and scatter back.
 
-        # Cast weight/bias through to() so autocast keeps them as the same
-        # storage object rather than creating a temporary that breaks the
-        # autograd connection back to the original parameter.
-        norm_w = self.norm.weight.to(dtype=torch.float32) if self.norm.weight is not None else None
-        norm_b = self.norm.bias.to(dtype=torch.float32) if self.norm.bias is not None else None
-        q = F.layer_norm(
-            q_raw.float(),
+        All attention math in FP32 for AMP stability.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        topk_idx = torch.nan_to_num(topk_idx, nan=0).long().clamp(0, N - 1)
+        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # [B, C, k]
+
+        q_sel = torch.gather(q, 2, idx_exp).transpose(1, 2)   # [B, k, C]
+        k_sel = torch.gather(kk, 2, idx_exp).transpose(1, 2)  # [B, k, C]
+        v_sel = torch.gather(v, 2, idx_exp).transpose(1, 2)   # [B, k, C]
+
+        # Layer norm in FP32
+        orig_dtype = q_sel.dtype
+        norm_w = self.norm.weight
+        norm_b = self.norm.bias
+        q_sel = F.layer_norm(
+            q_sel.float(),
             self.norm.normalized_shape,
-            norm_w,
-            norm_b,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
             self.norm.eps,
         )
-        k = F.layer_norm(
-            k_raw.float(),
+        k_sel = F.layer_norm(
+            k_sel.float(),
             self.norm.normalized_shape,
-            norm_w,
-            norm_b,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
             self.norm.eps,
         )
-        v = v_raw.float()
+        v_sel = F.layer_norm(
+            v_sel.float(),
+            self.norm.normalized_shape,
+            norm_w.float() if norm_w is not None else None,
+            norm_b.float() if norm_b is not None else None,
+            self.norm.eps,
+        )
 
-        attn = torch.bmm(q, k.transpose(1, 2)) * float(self._attn_scale)
-        attn = _finite_or_zero(attn, limit=self.attn_logit_limit)
-        attn = attn - attn.max(dim=-1, keepdim=True).values.detach()
+        # Sparse self-attention (stable softmax)
+        attn = torch.bmm(q_sel, k_sel.transpose(1, 2)) * float(self._attn_scale)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = attn.clamp(min=-80.0, max=80.0)
+        attn = attn - attn.max(dim=-1, keepdim=True).values
         attn = torch.softmax(attn, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        attended = torch.bmm(attn, v_sel)  # [B, k, C]
+        attended = torch.nan_to_num(attended, nan=0.0, posinf=0.0, neginf=0.0)
+        attended = attended.to(orig_dtype)
 
-        attended = torch.bmm(attn, v)
-        attended = _bounded_tanh(attended, limit=self.delta_limit)
-        out_dtype = self.out_proj.weight.dtype
-        delta = self.out_proj(attended.to(dtype=out_dtype)).float()
-        delta = _bounded_tanh(delta, limit=self.delta_limit)
-        return _finite_or_zero(delta, limit=self.delta_limit).to(dtype=selected.dtype)
+        # Scatter sparse context back to a zero canvas. The identity path is
+        # provided by the residual in forward().
+        out = torch.zeros_like(v).view(B, C, N)  # [B, C, N]
 
-    def _capture_selected_grad(self, grad: torch.Tensor) -> torch.Tensor:
-        """Backward hook used only for debug metrics."""
-        try:
-            self.last_selected_grad_norm = float(grad.detach().float().norm().item())
-            self.last_nonselected_sparse_grad = 0.0
-        except Exception:
-            pass
-        return grad
+        # Guard: sanitize attended before scatter to prevent NaN propagation
+        attended_clean = torch.nan_to_num(attended.transpose(1, 2), nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _effective_gamma(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Return signed LayerScale with a small floor so sparse contribution cannot vanish.
+        # Guard: ensure idx_exp is valid for scatter
+        idx_exp = torch.clamp(idx_exp, 0, N - 1)
+        idx_exp = torch.nan_to_num(idx_exp, nan=0).long()
 
-        Uses a straight-through estimator (STE) over clamp_min so:
-          - Forward : magnitude = max(|gamma|, floor)   — floor is enforced
-          - Backward: gradient = sign(gamma)            — never zero, no softplus ln(2) bias
+        out.scatter_(2, idx_exp, attended_clean)
+        out = out.view(B, C, H, W)
+        delta = self.out_proj(out)
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+        delta = 6.0 * torch.tanh(delta.float() / 6.0)
+        delta = self.delta_norm(delta)
 
-        The previous softplus formula had a fatal flaw: softplus(x) → ln(2) ≈ 0.693 as x → 0,
-        so when gamma_raw ≈ floor the effective gamma was pinned at floor + ln(2) ≈ 0.703
-        regardless of what gamma_raw was — gamma never learned.
-        """
-        gamma = self.gamma.to(dtype=dtype, device=device)
-        floor = float(getattr(self, "gamma_floor", 0.0))
-        if floor <= 0.0:
-            return gamma
-        sign = torch.where(gamma.detach() >= 0, torch.ones_like(gamma), -torch.ones_like(gamma))
-        abs_g = gamma.abs()
-        # STE: forward uses clamped magnitude, backward gradient flows through abs_g unchanged.
-        mag_hard = abs_g.clamp(min=floor)
-        mag = abs_g + (mag_hard - abs_g).detach()   # = mag_hard in forward, grad = sign(gamma)
-        return sign * mag
+        # GroupNorm can introduce non-zero values at zero-canvas positions, so
+        # mask once more to keep the sparse branch restricted to selected tokens.
+        delta_mask = torch.zeros(B, 1, N, device=delta.device, dtype=delta.dtype)
+        delta_mask.scatter_(2, topk_idx.unsqueeze(1), 1.0)
+        delta = delta * delta_mask.view(B, 1, H, W)
+        return delta.to(orig_dtype)
 
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Selected-token-only sparse attention.
-
-        Flow:
-          finite guard -> GN -> L2 top-k -> gather selected tokens
-          -> Linear Q/K/V -> FP32 attention -> Linear out
-          -> zero-canvas scatter -> x + gamma * delta
-        """
         self._ensure_runtime_attrs()
         B, C, H, W = x.shape
         N = int(H) * int(W)
-        k_actual = self._select_k(N)
 
+        k_actual = self._select_k(N)
         self.last_N = N
         self.last_k = k_actual
         self.last_mode = self.mode
-        self.last_selected_ratio = float(k_actual) / float(N) if N else 0.0
-        self.last_gamma_raw_abs_mean = float(self.gamma.detach().float().abs().mean().item())
-        self.last_gamma_floor = float(getattr(self, "gamma_floor", 0.0))
-        self.last_selected_grad_norm = None
-        self.last_nonselected_sparse_grad = 0.0
 
-        if self.debug_enabled:
-            finite = torch.isfinite(x)
-            self.last_finite_guard_count = int((~finite).sum().item())
-        else:
-            self.last_finite_guard_count = 0
+        gamma = self.gamma.to(dtype=x.dtype)
+        self.last_gate = float(gamma.detach().abs().mean().item())
 
-        x_safe = _finite_or_zero(x, limit=self.finite_limit)
-        norm_dtype = self.pre_norm.weight.dtype
-        x_norm = self.pre_norm(x_safe.to(dtype=norm_dtype)).to(dtype=x_safe.dtype)
-        x_norm = _finite_or_zero(x_norm, limit=self.finite_limit)
+        with _fp32_context(x.device):
+            x_branch = self.pre_norm(x.float())
 
-        if self.mode == "dense":
-            saliency = None
-            topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-            k_actual = N
-        else:
-            saliency = self._compute_saliency(x_norm)       # (B, N) — detached L2 energy
-            if not torch.isfinite(saliency).any():
-                saliency = torch.zeros_like(saliency)
-            topk_idx = torch.topk(saliency, k_actual, dim=1).indices
+            # Projections
+            q = self.q_proj(x_branch).view(B, C, N)   # [B, C, N]
+            kk = self.k_proj(x_branch).view(B, C, N)  # [B, C, N]
+            v = self.v_proj(x_branch).view(B, C, N)   # [B, C, N]
 
-        topk_idx = topk_idx.clamp(0, N - 1).long()
-        self._store_debug(topk_idx, saliency)
+            if self.mode == "dense":
+                # Full self-attention on all tokens (ablation baseline)
+                topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+                saliency = self._compute_saliency(x_branch) if self.debug_enabled else None
+                self._store_debug(topk_idx, saliency)
+                delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, N)
+                return x + gamma * delta.to(dtype=x.dtype)
 
-        x_flat = x_norm.view(B, C, N)
-        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)
-        selected = torch.gather(x_flat, 2, idx_exp).transpose(1, 2)
+            importance = self._compute_saliency(x_branch)
 
-        delta_tokens = self._selected_attention_delta(selected)
-        if delta_tokens.requires_grad:
-            delta_tokens.register_hook(self._capture_selected_grad)
+            if not torch.isfinite(importance).any():
+                importance = torch.ones_like(importance)
 
-        self.last_delta_norm_selected = float(
-            delta_tokens.detach().float().norm(dim=-1).mean().item()
-        )
-        self.last_delta_norm_nonselected = 0.0
+            topk_idx = torch.topk(importance, k_actual, dim=1).indices  # [B, k]
+            topk_idx = torch.clamp(topk_idx, 0, N - 1)
+            topk_idx = torch.nan_to_num(topk_idx, nan=0).long()
+            self._store_debug(topk_idx, importance)
 
-        delta_flat = x_safe.new_zeros(B, C, N)
-        delta_flat = delta_flat.scatter(2, idx_exp, delta_tokens.transpose(1, 2).to(dtype=x_safe.dtype))
-        delta = delta_flat.view(B, C, H, W)
-        gamma_eff = self._effective_gamma(dtype=x_safe.dtype, device=x_safe.device)
-        self.last_gamma_abs_mean = float(gamma_eff.detach().float().abs().mean().item())
-        try:
-            scaled_tokens = delta_tokens * gamma_eff.flatten().view(1, 1, C).to(dtype=delta_tokens.dtype)
-            self.last_delta_scaled_norm_selected = float(
-                scaled_tokens.detach().float().norm(dim=-1).mean().item()
-            )
-        except Exception:
-            self.last_delta_scaled_norm_selected = None
-        out = x_safe + gamma_eff * delta
-        return _finite_or_zero(out, limit=self.finite_limit).to(dtype=x.dtype)
+            delta = self._sparse_attention_delta(x_branch, q, kk, v, topk_idx, k_actual)
 
+            if self.mode == "hybrid" and self.local_dw is not None:
+                local_delta = self.local_dw(x_branch)
+                local_gamma = self.local_gamma.to(dtype=x.dtype)
+                return x + gamma * delta.to(dtype=x.dtype) + local_gamma * local_delta.to(dtype=x.dtype)
 
-class TokenScorer(nn.Module):
-    """Task-learned token scorer with an activation-energy prior.
-
-    The learned head can adapt to the detection objective, while the detached
-    L2 prior prevents zero-init heads from selecting arbitrary fixed positions.
-    """
-
-    def __init__(self, channels: int, hidden_ratio: float = 0.125) -> None:
-        super().__init__()
-        hidden = max(int(channels * float(hidden_ratio)), 16)
-        self.head = nn.Sequential(
-            nn.Conv2d(channels, hidden, 1, bias=False),
-            nn.SiLU(),
-            nn.Conv2d(hidden, 1, 1, bias=True),
-        )
-        nn.init.xavier_uniform_(self.head[0].weight, gain=0.1)
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        score_dtype = self.head[0].weight.dtype
-        learned = self.head(x.to(dtype=score_dtype)).view(B, H * W)
-        prior = x.detach().float().view(B, C, H * W).pow(2).mean(dim=1)
-        prior = prior / prior.mean(dim=1, keepdim=True).clamp(min=1e-6)
-        return torch.nan_to_num(learned + prior.to(dtype=learned.dtype), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-class LocalSparseAggregator(nn.Module):
-    """Reference-guided local sparse attention over fixed spatial windows.
-
-    For each selected reference token, aggregate only a small local window. This
-    keeps complexity O(k * window^2) and preserves a spatial inductive bias.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        window_size: int = 3,
-        attn_logit_limit: float = 50.0,
-        delta_limit: float = 6.0,
-    ) -> None:
-        super().__init__()
-        window_size = int(window_size)
-        if window_size < 1 or window_size % 2 == 0:
-            raise ValueError(f"window_size must be a positive odd integer, got {window_size}")
-        self.channels = int(channels)
-        self.window_size = window_size
-        self.attn_logit_limit = float(attn_logit_limit)
-        self.delta_limit = float(delta_limit)
-        self.norm = nn.LayerNorm(channels)
-        self.q_proj = nn.Linear(channels, channels, bias=False)
-        self.k_proj = nn.Linear(channels, channels, bias=False)
-        self.v_proj = nn.Linear(channels, channels, bias=False)
-        self.out_proj = nn.Linear(channels, channels, bias=False)
-        self._attn_scale = channels ** -0.5
-
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
-
-    def _window_position_encoding(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        w = int(self.window_size)
-        radius = w // 2
-        coords = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32)
-        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
-        offsets = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=-1) / max(radius, 1)
-        n = offsets.shape[0]
-        c = self.channels
-        d = max(c // 4, 1)
-        freq = 10000.0 ** (-torch.arange(d, device=device, dtype=torch.float32) * 4.0 / max(c, 1))
-        enc = torch.cat(
-            [
-                torch.sin(offsets[:, :1] * freq),
-                torch.cos(offsets[:, :1] * freq),
-                torch.sin(offsets[:, 1:] * freq),
-                torch.cos(offsets[:, 1:] * freq),
-            ],
-            dim=-1,
-        )
-        if enc.shape[-1] < c:
-            enc = F.pad(enc, (0, c - enc.shape[-1]))
-        elif enc.shape[-1] > c:
-            enc = enc[:, :c]
-        return (enc.view(1, 1, n, c) * (c ** -0.5)).to(dtype=dtype)
-
-    def forward(self, x_norm: torch.Tensor, topk_idx: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x_norm.shape
-        N = H * W
-        k = topk_idx.shape[1]
-        proj_dtype = self.q_proj.weight.dtype
-
-        x_flat = x_norm.view(B, C, N)
-        idx_center = topk_idx.unsqueeze(1).expand(-1, C, -1)
-        selected = torch.gather(x_flat, 2, idx_center).transpose(1, 2).to(dtype=proj_dtype)
-
-        patches = F.unfold(
-            x_norm.to(dtype=proj_dtype),
-            kernel_size=self.window_size,
-            padding=self.window_size // 2,
-        )
-        win_tokens = self.window_size * self.window_size
-        patches = patches.view(B, C * win_tokens, N)
-        idx_patch = topk_idx.unsqueeze(1).expand(-1, C * win_tokens, -1)
-        windows = torch.gather(patches, 2, idx_patch)
-        windows = windows.view(B, C, win_tokens, k).permute(0, 3, 2, 1).contiguous()
-
-        norm_w = self.norm.weight.to(dtype=torch.float32) if self.norm.weight is not None else None
-        norm_b = self.norm.bias.to(dtype=torch.float32) if self.norm.bias is not None else None
-        q_raw = self.q_proj(selected)
-        k_raw = self.k_proj(windows)
-        v_raw = self.v_proj(windows)
-        q = F.layer_norm(q_raw.float(), self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
-        kk = F.layer_norm(k_raw.float(), self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
-        vv = v_raw.float()
-
-        kk = kk + self._window_position_encoding(x_norm.device, kk.dtype)
-        attn = (q.unsqueeze(2) * kk).sum(dim=-1) * float(self._attn_scale)
-        attn = _finite_or_zero(attn, limit=self.attn_logit_limit)
-        attn = attn - attn.max(dim=-1, keepdim=True).values.detach()
-        attn = torch.softmax(attn, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        aggregated = (attn.unsqueeze(-1) * vv).sum(dim=2)
-        aggregated = _bounded_tanh(aggregated, limit=self.delta_limit)
-        out = self.out_proj(aggregated.to(dtype=self.out_proj.weight.dtype)).float()
-        out = _bounded_tanh(out, limit=self.delta_limit)
-        return _finite_or_zero(out, limit=self.delta_limit).to(dtype=x_norm.dtype)
-
-
-class ReferenceGuidedSparseBlock(nn.Module):
-    """Reference-guided sparse block for HSG-DETR v3.
-
-    The block separates scoring, sampling, local aggregation, and residual
-    fusion. It is intentionally compatible with the debug fields emitted by
-    ``SGTokenBlock`` so the existing trainer/frontend metrics remain useful.
-    """
-
-    VALID_MODES: set[str] = {"topk", "dense"}
-    DENSE_TOKEN_LIMIT: int = 4096
-
-    def __init__(
-        self,
-        c1: int,
-        c2: int,
-        ratio: float = 0.12,
-        window_size: int = 3,
-        mode: str = "topk",
-        debug_enabled: bool = False,
-        gamma_init: float = 0.05,
-        finite_limit: float = 20.0,
-        attn_logit_limit: float = 50.0,
-        delta_limit: float = 6.0,
-        gamma_floor: float | None = None,
-    ) -> None:
-        super().__init__()
-        assert c1 == c2, f"ReferenceGuidedSparseBlock is channel-preserving (c1={c1}, c2={c2})"
-        mode = str(mode).lower()
-        if mode not in self.VALID_MODES:
-            raise ValueError(f"Invalid mode: {mode}. Expected {sorted(self.VALID_MODES)}")
-        ratio = float(ratio)
-        if not torch.isfinite(torch.tensor(ratio)):
-            raise ValueError(f"Invalid ratio: {ratio}")
-        self.c = int(c2)
-        self.ratio = max(0.0, min(ratio, 1.0))
-        self.mode = mode
-        self.finite_limit = float(finite_limit)
-        if gamma_floor is None:
-            if self.ratio >= 0.20:
-                gamma_floor = 0.010
-            elif self.ratio >= 0.10:
-                gamma_floor = 0.0075
-            else:
-                gamma_floor = 0.005
-        self.gamma_floor = max(0.0, float(gamma_floor))
-
-        self.pre_norm = _make_gn(c2)
-        self.scorer = TokenScorer(c2)
-        self.aggregator = LocalSparseAggregator(
-            c2,
-            window_size=window_size,
-            attn_logit_limit=attn_logit_limit,
-            delta_limit=delta_limit,
-        )
-        self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
-
-        self.debug_enabled = bool(debug_enabled)
-        self.debug_to_cpu = False
-        self.last_indices: torch.Tensor | None = None
-        self.last_saliency: torch.Tensor | None = None
-        self.last_mode: str | None = None
-        self.last_k: int | None = None
-        self.last_N: int | None = None
-        self.last_selected_ratio: float | None = None
-        self.last_gamma_raw_abs_mean: float | None = None
-        self.last_gamma_abs_mean: float | None = None
-        self.last_gamma_floor: float | None = None
-        self.last_delta_norm_selected: float | None = None
-        self.last_delta_norm_nonselected: float | None = None
-        self.last_delta_scaled_norm_selected: float | None = None
-        self.last_selected_grad_norm: float | None = None
-        self.last_nonselected_sparse_grad: float | None = None
-        self.last_finite_guard_count: int | None = None
-
-    def _ensure_runtime_attrs(self) -> None:
-        SGTokenBlock._ensure_runtime_attrs(self)
-
-    def get_debug_state(self) -> dict:
-        return SGTokenBlock.get_debug_state(self)
-
-    def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
-        SGTokenBlock.set_debug(self, enabled=enabled, cpu=cpu)
-
-    def _store_debug(
-        self,
-        indices: torch.Tensor | None = None,
-        saliency: torch.Tensor | None = None,
-    ) -> None:
-        SGTokenBlock._store_debug(self, indices=indices, saliency=saliency)
-
-    def _select_k(self, N: int) -> int:
-        if self.mode == "dense":
-            if int(N) > self.DENSE_TOKEN_LIMIT:
-                raise RuntimeError(f"Dense ReferenceGuidedSparseBlock too large: N={N}. Use topk instead.")
-            return int(N)
-        return max(1, min(int(round(self.ratio * int(N))), int(N)))
-
-    def _capture_selected_grad(self, grad: torch.Tensor) -> torch.Tensor:
-        return SGTokenBlock._capture_selected_grad(self, grad)
-
-    def _effective_gamma(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        return SGTokenBlock._effective_gamma(self, dtype=dtype, device=device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._ensure_runtime_attrs()
-        B, C, H, W = x.shape
-        N = int(H) * int(W)
-        k_actual = self._select_k(N)
-
-        self.last_N = N
-        self.last_k = k_actual
-        self.last_mode = self.mode
-        self.last_selected_ratio = float(k_actual) / float(N) if N else 0.0
-        self.last_gamma_raw_abs_mean = float(self.gamma.detach().float().abs().mean().item())
-        self.last_gamma_floor = float(getattr(self, "gamma_floor", 0.0))
-        self.last_selected_grad_norm = None
-        self.last_nonselected_sparse_grad = 0.0
-        self.last_finite_guard_count = int((~torch.isfinite(x)).sum().item()) if self.debug_enabled else 0
-
-        x_safe = _finite_or_zero(x, limit=self.finite_limit)
-        norm_dtype = self.pre_norm.weight.dtype
-        x_norm = self.pre_norm(x_safe.to(dtype=norm_dtype)).to(dtype=x_safe.dtype)
-        x_norm = _finite_or_zero(x_norm, limit=self.finite_limit)
-
-        scores = self.scorer(x_norm)
-        saliency = scores.detach()
-        topk_idx = torch.topk(saliency, k_actual, dim=1).indices.clamp(0, N - 1).long()
-        self._store_debug(topk_idx, saliency)
-
-        delta_tokens = self.aggregator(x_norm, topk_idx)
-        if delta_tokens.requires_grad:
-            delta_tokens.register_hook(self._capture_selected_grad)
-        selected_scores = torch.gather(scores, 1, topk_idx)
-        delta_scale = delta_tokens.detach().abs().mean().clamp(min=1e-6)
-        scorer_ste = (selected_scores.unsqueeze(-1) - selected_scores.detach().unsqueeze(-1)) * delta_scale
-        delta_tokens = delta_tokens + scorer_ste.to(dtype=delta_tokens.dtype)
-
-        self.last_delta_norm_selected = float(delta_tokens.detach().float().norm(dim=-1).mean().item())
-        self.last_delta_norm_nonselected = 0.0
-
-        x_flat = x_norm.view(B, C, N)
-        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)
-        delta_flat = x_safe.new_zeros(B, C, N)
-        delta_flat = delta_flat.scatter(2, idx_exp, delta_tokens.transpose(1, 2).to(dtype=x_safe.dtype))
-        delta = delta_flat.view(B, C, H, W)
-
-        gamma_eff = self._effective_gamma(dtype=x_safe.dtype, device=x_safe.device)
-        self.last_gamma_abs_mean = float(gamma_eff.detach().float().abs().mean().item())
-        try:
-            scaled_tokens = delta_tokens * gamma_eff.flatten().view(1, 1, C).to(dtype=delta_tokens.dtype)
-            self.last_delta_scaled_norm_selected = float(
-                scaled_tokens.detach().float().norm(dim=-1).mean().item()
-            )
-        except Exception:
-            self.last_delta_scaled_norm_selected = None
-        out = x_safe + gamma_eff * delta
-        return _finite_or_zero(out, limit=self.finite_limit).to(dtype=x.dtype)
+            return x + gamma * delta.to(dtype=x.dtype)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1051,7 +650,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         # Guard: validate topk indices before using for indexing
         N_features = features.shape[1]  # h*w
         topk_ind = torch.clamp(topk_ind, 0, N_features - 1)
-        topk_ind = topk_ind.long()
+        topk_ind = torch.nan_to_num(topk_ind, nan=0).long()
 
         # ── Remainder identical to base RTDETRDecoder ──────────────────
         batch_ind = (
@@ -1075,7 +674,7 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
 
         embeddings = (
-            self.tgt_embed.weight.to(dtype=features.dtype).unsqueeze(0).repeat(bs, 1, 1)
+            self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
             if self.learnt_init_query
             else top_k_features
         )
@@ -1115,22 +714,10 @@ class RTDETRDecoderSGB(RTDETRDecoder):
             shapes,
             attn_mask=attn_mask,
         )
-        # Cast back to original dtype for AMP compatibility
-        orig_dtype = embed.dtype
-        dec_bboxes = dec_bboxes.to(dtype=orig_dtype)
-        dec_scores = dec_scores.to(dtype=orig_dtype)
-        enc_bboxes = enc_bboxes.to(dtype=orig_dtype)
-        enc_scores = enc_scores.to(dtype=orig_dtype)
-        
         out = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return out
-        # Eval/export: convert the selected decoder layer to the format expected
-        # by the RT-DETR validator: [bbox(4), max_score(1), label(1)].
-        layer_idx = int(getattr(self, "eval_idx", -1))
-        scores = dec_scores[layer_idx].sigmoid()
-        max_scores, labels = scores.max(-1, keepdim=True)
-        y = torch.cat((dec_bboxes[layer_idx], max_scores, labels.float()), -1)
+        y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
         return y if self.export else (y, out)
 
     def _safe_decoder_forward(
@@ -1142,41 +729,45 @@ class RTDETRDecoderSGB(RTDETRDecoder):
         attn_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mirror the base decoder while isolating only box refinement in FP32."""
+        """Mirror the base decoder but keep reference boxes in a safer numeric range."""
         output = embed
         dec_bboxes = []
         dec_cls = []
+        last_refined_bbox = None
         refer_bbox = _safe_unit_interval(refer_bbox.float().sigmoid(), eps=self.REFINE_EPS)
 
         for i, layer in enumerate(self.decoder.layers):
             ref_for_layer = _safe_unit_interval(refer_bbox, eps=self.REFINE_EPS)
-            query_dtype = _module_param_dtype(self.query_pos_head, output.dtype)
-            query_pos = self.query_pos_head(ref_for_layer.to(dtype=query_dtype)).to(dtype=output.dtype)
             output = layer(
                 output,
                 ref_for_layer.to(dtype=output.dtype),
-                feats.to(dtype=output.dtype),
+                feats,
                 shapes,
                 padding_mask,
                 attn_mask,
-                query_pos,
+                self.query_pos_head(ref_for_layer).to(dtype=output.dtype),
             )
 
-            head_input = F.layer_norm(output, (output.shape[-1],))
-            bbox_head = self.dec_bbox_head[i]
-            bbox_dtype = _module_param_dtype(bbox_head, head_input.dtype)
-            bbox = bbox_head(head_input.to(dtype=bbox_dtype)).float()
+            head_input = F.layer_norm(output.float(), (output.shape[-1],))
+            bbox = self.dec_bbox_head[i](head_input)
             bbox = self.BBOX_DELTA_LIMIT * torch.tanh(bbox / self.BBOX_DELTA_LIMIT)
-            refined_bbox = torch.sigmoid(
-                bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS)
-            )
+            refined_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(ref_for_layer, eps=self.REFINE_EPS))
             refined_bbox = _safe_unit_interval(refined_bbox, eps=self.REFINE_EPS)
 
-            score_head = self.dec_score_head[i]
-            score_dtype = _module_param_dtype(score_head, head_input.dtype)
-            dec_cls.append(score_head(head_input.to(dtype=score_dtype)))
+            if self.training:
+                dec_cls.append(self.dec_score_head[i](head_input))
+                if i == 0:
+                    dec_bboxes.append(refined_bbox)
+                else:
+                    prev_ref = _safe_unit_interval(last_refined_bbox, eps=self.REFINE_EPS)
+                    prev_bbox = torch.sigmoid(bbox + _safe_inverse_sigmoid(prev_ref, eps=self.REFINE_EPS))
+                    dec_bboxes.append(_safe_unit_interval(prev_bbox, eps=self.REFINE_EPS))
+            elif i == self.decoder.eval_idx:
+                dec_cls.append(self.dec_score_head[i](head_input))
+                dec_bboxes.append(refined_bbox)
+                break
 
+            last_refined_bbox = refined_bbox
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
-            dec_bboxes.append(refined_bbox)
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)

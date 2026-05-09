@@ -40,7 +40,7 @@ def _selected_mask(torch, indices, channels: int, height: int, width: int):
 
 
 def _sparse_params(block):
-    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj, block.saliency_head):
+    for module in (block.q_proj, block.k_proj, block.v_proj, block.out_proj):
         yield from module.parameters()
 
 
@@ -66,13 +66,12 @@ def test_sg_token_contract(torch, device: str) -> None:
 
     _require(y.shape == x.shape, f"shape changed: {tuple(x.shape)} -> {tuple(y.shape)}")
     _require(torch.isfinite(y).all().item(), "forward output contains NaN/Inf")
-    _require(abs(float(block.gamma.detach().mean()) - 0.10) < 1e-6, "gamma_init is not 0.10")
+    _require(abs(float(block.gamma.detach().mean()) - 1e-4) < 1e-8, "legacy gamma_init is not 1e-4")
     _require(state["k"] == 4 and state["N"] == 16, f"unexpected top-k metadata: {state}")
 
     diff = y - x
     nonselected_delta = float(diff[~mask].detach().abs().max().item()) if (~mask).any() else 0.0
     _require(nonselected_delta == 0.0, f"non-selected positions received sparse delta: {nonselected_delta}")
-    _require(abs(float(state["delta_norm_nonselected"])) == 0.0, "delta_norm_nonselected must be zero")
 
     loss = y[~mask].sum()
     loss.backward()
@@ -89,27 +88,24 @@ def test_sg_token_contract(torch, device: str) -> None:
 
     selected_sparse_grad = _sparse_grad_abs(torch, block)
     _require(selected_sparse_grad > 0.0, "sparse q/k/v/out params did not receive selected-token gradients")
-    _require(block.get_debug_state()["selected_grad_norm"] is not None, "selected_grad_norm hook did not fire")
-    _require(block.get_debug_state()["nonselected_sparse_grad"] == 0.0, "nonselected_sparse_grad must remain zero")
 
     print("PASS selected tokens update sparse params; non-selected tokens do not.")
 
 
 def test_amp_forward(torch, device: str) -> None:
-    from hsg_detr.nn.sparse_global_token import ReferenceGuidedSparseBlock, SGTokenBlock
+    from hsg_detr.nn.sparse_global_token import SGTokenBlock
 
     _print_step("AMP forward finite check")
     amp_device = "cuda" if device.startswith("cuda") else "cpu"
     amp_dtype = torch.float16 if amp_device == "cuda" else torch.bfloat16
 
-    for cls in (SGTokenBlock, ReferenceGuidedSparseBlock):
-        block = cls(16, 16, ratio=0.25, debug_enabled=True).to(device).eval()
-        x = torch.randn(2, 16, 8, 8, device=device)
-        with torch.no_grad(), torch.amp.autocast(amp_device, dtype=amp_dtype):
-            y = block(x)
+    block = SGTokenBlock(16, 16, ratio=0.25, debug_enabled=True).to(device).eval()
+    x = torch.randn(2, 16, 8, 8, device=device)
+    with torch.no_grad(), torch.amp.autocast(amp_device, dtype=amp_dtype):
+        y = block(x)
 
-        _require(y.shape == x.shape, f"{cls.__name__} AMP forward changed shape")
-        _require(torch.isfinite(y).all().item(), f"{cls.__name__} AMP forward produced NaN/Inf")
+    _require(y.shape == x.shape, "SGTokenBlock AMP forward changed shape")
+    _require(torch.isfinite(y).all().item(), "SGTokenBlock AMP forward produced NaN/Inf")
     print(f"PASS autocast device={amp_device} dtype={amp_dtype}.")
 
 
@@ -122,7 +118,7 @@ def test_model_forward(torch, device: str, imgsz: int) -> None:
     model = RTDETR(str(cfg)).model.to(device).eval()
     sgb_blocks = [m for m in model.modules() if m.__class__.__name__ == "SGTokenBlock"]
     _require(len(sgb_blocks) > 0, "model has no SGTokenBlock modules")
-    _require(all(abs(float(b.gamma.detach().mean()) - 0.10) < 1e-6 for b in sgb_blocks), "some SGB gamma values are not initialized to 0.10")
+    _require(all(abs(float(b.gamma.detach().mean()) - 1e-4) < 1e-8 for b in sgb_blocks), "some SGB gamma values are not initialized to 1e-4")
 
     x = torch.randn(1, 3, imgsz, imgsz, device=device)
     amp_device = "cuda" if device.startswith("cuda") else "cpu"
@@ -134,29 +130,6 @@ def test_model_forward(torch, device: str, imgsz: int) -> None:
     _require(torch.is_tensor(tensor_out), f"unexpected model output type: {type(out)!r}")
     _require(torch.isfinite(tensor_out).all().item(), "model forward produced NaN/Inf")
     print(f"PASS blocks={len(sgb_blocks)} output_shape={tuple(tensor_out.shape)}.")
-
-
-def test_v3_model_forward(torch, device: str, imgsz: int) -> None:
-    import hsg_detr  # noqa: F401 - registers HSG-DETR modules with Ultralytics
-    from ultralytics import RTDETR
-
-    _print_step("HSG-DETR-v3-N instantiate + eval forward")
-    cfg = ROOT / "backend" / "hsg_detr" / "configs" / "hsg_detr_v3_n.yaml"
-    model = RTDETR(str(cfg)).model.to(device).eval()
-    blocks = [m for m in model.modules() if m.__class__.__name__ == "ReferenceGuidedSparseBlock"]
-    _require(len(blocks) == 3, f"expected 3 ReferenceGuidedSparseBlock modules, got {len(blocks)}")
-
-    x = torch.randn(1, 3, imgsz, imgsz, device=device)
-    amp_device = "cuda" if device.startswith("cuda") else "cpu"
-    amp_dtype = torch.float16 if amp_device == "cuda" else torch.bfloat16
-    with torch.no_grad(), torch.amp.autocast(amp_device, dtype=amp_dtype):
-        out = model(x)
-
-    tensor_out = out[0] if isinstance(out, (tuple, list)) else out
-    _require(torch.is_tensor(tensor_out), f"unexpected v3 model output type: {type(out)!r}")
-    _require(torch.isfinite(tensor_out).all().item(), "v3 model forward produced NaN/Inf")
-    print(f"PASS v3_blocks={len(blocks)} output_shape={tuple(tensor_out.shape)}.")
-
 
 def test_optimizer_groups_and_grad_regions(torch, device: str, imgsz: int) -> None:
     import hsg_detr  # noqa: F401 - registers HSG-DETR modules with Ultralytics
@@ -237,7 +210,6 @@ def main() -> int:
         test_amp_forward(torch, args.device)
         if not args.skip_model:
             test_model_forward(torch, args.device, args.imgsz)
-            test_v3_model_forward(torch, args.device, args.imgsz)
         if not args.skip_trainer:
             test_optimizer_groups_and_grad_regions(torch, args.device, args.imgsz)
     except Exception:

@@ -12,7 +12,6 @@ from __future__ import annotations
 import linecache
 
 from .sparse_global_token import (
-    ReferenceGuidedSparseBlock,
     SGTokenBlock,
     SGStem,
     SGDown,
@@ -37,7 +36,6 @@ except ImportError:
     _HSG_DET_MODULES = {}
 
 _MODULES: dict[str, type] = {
-    "ReferenceGuidedSparseBlock": ReferenceGuidedSparseBlock,
     "SGTokenBlock": SGTokenBlock,
     "SGStem": SGStem,
     "SGDown": SGDown,

@@ -641,7 +641,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name in {"SGTokenBlock", "ReferenceGuidedSparseBlock"}:
+            if cls_name == "SGTokenBlock":
                 for local_name, param in module.named_parameters(recurse=True):
                     if not param.requires_grad:
                         continue
@@ -652,8 +652,6 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
-                        "scorer",       # ReferenceGuidedSparseBlock (V3)
-                        "aggregator",   # ReferenceGuidedSparseBlock (V3)
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
@@ -977,7 +975,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             model = unwrap_model(self.model)
             capture_sparse_debug = bool(getattr(self, "record_gradients", False))
             for m in model.modules():
-                if m.__class__.__name__ in {'SGTokenBlock', 'ReferenceGuidedSparseBlock'} and hasattr(m, 'set_debug'):
+                if m.__class__.__name__ == 'SGTokenBlock' and hasattr(m, 'set_debug'):
                     m.set_debug(capture_sparse_debug, cpu=True)
         except Exception:
             pass
@@ -1129,7 +1127,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         sgb_blocks = [
             m for m in model.modules()
-            if m.__class__.__name__ in {'SGTokenBlock', 'ReferenceGuidedSparseBlock'}
+            if m.__class__.__name__ == 'SGTokenBlock'
         ]
         decoder_modules = [m for m in model.modules() if m.__class__.__name__ == 'RTDETRDecoderSGB']
 
@@ -1172,11 +1170,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             if N is not None and k is not None and N > 0:
                 metrics[f'{tag}_k_over_N'] = float(k) / float(N)
 
-            is_reference_guided = blk.__class__.__name__ == 'ReferenceGuidedSparseBlock'
-            metrics[f'{tag}_reference_guided'] = 1.0 if is_reference_guided else 0.0
-            window_size = getattr(getattr(blk, 'aggregator', None), 'window_size', None)
-            if window_size is not None:
-                metrics[f'{tag}_window_size'] = float(window_size)
+            metrics[f'{tag}_reference_guided'] = 0.0
 
             selected_ratio = getattr(blk, 'last_selected_ratio', None)
             if selected_ratio is not None:
@@ -1409,7 +1403,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name in {"SGTokenBlock", "ReferenceGuidedSparseBlock"}:
+            if cls_name == "SGTokenBlock":
                 for local_name, param in module.named_parameters(recurse=True):
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
@@ -1418,8 +1412,6 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
-                        "scorer",       # ReferenceGuidedSparseBlock (V3)
-                        "aggregator",   # ReferenceGuidedSparseBlock (V3)
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith("norm"):

@@ -1009,27 +1009,20 @@ _HSG_DET_MODULES: list[dict[str, Any]] = [
 # ── HSG-DETR custom modules (registered via hsg_detr package) ─────────────────
 _HSG_DETR_MODULES: list[dict[str, Any]] = [
     {
-        "name": "ReferenceGuidedSparseBlock",
+        "name": "SGTokenBlock",
         "category": "attention",
         "description": (
-            "HSG-DETR v3 reference-guided sparse aggregation. Separates token "
-            "scoring, top-k reference selection, local window aggregation, and "
-            "LayerScale residual fusion. Complexity is O(k * window^2), closer "
-            "to deformable/local sparse attention than selected-token all-pairs attention."
+            "HSG-DETR legacy sparse-token global self-attention block. Uses "
+            "parameter-free L2 saliency, hard top-k sparse attention, zero-canvas "
+            "scatter-back, and small LayerScale residual fusion."
         ),
         "args": [
             {"name": "out_channels", "type": "int", "default": 256,
              "help": "Number of channels (channel-preserving; auto-injected by parse_model)"},
             {"name": "ratio", "type": "float", "default": 0.12,
-             "help": "Fraction of spatial reference tokens to retain"},
-            {"name": "window_size", "type": "int", "default": 3,
-             "help": "Odd local aggregation window size around each selected reference"},
+             "help": "Fraction of spatial tokens to retain"},
             {"name": "mode", "type": "str", "default": "topk",
-             "help": "topk or dense ablation mode"},
-            {"name": "gamma_init", "type": "float", "default": 0.05,
-             "help": "Initial per-channel LayerScale for sparse delta"},
-            {"name": "gamma_floor", "type": "float", "default": None,
-             "help": "Minimum effective LayerScale magnitude; auto-selected by ratio when omitted"},
+             "help": "topk, dense, or hybrid ablation mode"},
         ],
         "source": "hsg_detr",
     },

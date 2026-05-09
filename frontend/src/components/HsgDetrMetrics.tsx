@@ -139,7 +139,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
   const hasGammaFloorMetrics = SCALES.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
   const hasScaledDeltaMetrics = SCALES.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
   const referenceGuidedCount = SCALES.filter(scale => isReferenceGuided(latest, scale)).length;
-  const sparseVariant = referenceGuidedCount > 0 ? 'v3 reference-guided local aggregation' : 'v2 selected-token sparse attention';
+  const sparseVariant = referenceGuidedCount > 0 ? 'reference-guided local aggregation' : 'legacy selected-token sparse attention';
 
   return (
     <div className="space-y-6">
@@ -150,7 +150,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
         <div>
           <h3 className="text-white font-semibold text-sm">HSG-DETR Sparse Debug</h3>
           <p className="text-[10px] text-slate-500 uppercase tracking-wider">
-            {sparseVariant} | stride-labeled blocks, gamma floor, decoder alpha, gradient contract
+            {sparseVariant} | stride-labeled blocks, sparse selection, decoder alpha, gradient contract
           </p>
         </div>
         <div className="ml-auto flex gap-2">
@@ -159,7 +159,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
               : 'bg-violet-500/10 text-violet-300 border-violet-500/20'
           }`}>
-            {referenceGuidedCount > 0 ? 'V3 local' : 'V2 token'}
+            {referenceGuidedCount > 0 ? 'Local sparse' : 'Legacy token'}
           </span>
           <StatusBadge ok={!hasNan} label={hasNan ? 'NaN' : 'No NaN'} />
           <StatusBadge ok={!hasInf} label={hasInf ? 'Inf' : 'No Inf'} />
