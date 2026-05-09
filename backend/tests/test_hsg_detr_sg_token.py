@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 torch = pytest.importorskip("torch")
 pytest.importorskip("ultralytics")
 
-from hsg_detr.nn.sparse_global_token import SGTokenBlock  # noqa: E402
+from hsg_detr.nn.sparse_global_token import ReferenceGuidedSparseBlock, SGTokenBlock  # noqa: E402
 
 
 def _selected_mask(indices: torch.Tensor, channels: int, height: int, width: int) -> torch.Tensor:
@@ -116,3 +116,22 @@ def test_positional_encoding_handles_non_multiple_of_four_channels():
 
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
+
+
+def test_reference_guided_sparse_block_forward_and_scorer_grad():
+    block = ReferenceGuidedSparseBlock(12, 12, ratio=0.25, debug_enabled=True)
+    x = torch.randn(1, 12, 4, 4, requires_grad=True)
+    y = block(x)
+
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    state = block.get_debug_state()
+    assert state["k"] == 4
+    assert state["delta_scaled_norm_selected"] is not None
+
+    y.pow(2).mean().backward()
+    scorer_grad = sum(
+        (p.grad.detach().abs().sum() for p in block.scorer.parameters() if p.grad is not None),
+        torch.tensor(0.0),
+    )
+    assert scorer_grad.item() > 0

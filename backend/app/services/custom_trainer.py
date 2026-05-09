@@ -641,13 +641,21 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name == "SGTokenBlock":
+            if cls_name in {"SGTokenBlock", "ReferenceGuidedSparseBlock"}:
                 for local_name, param in module.named_parameters(recurse=True):
                     if not param.requires_grad:
                         continue
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
-                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj", "saliency_head")):
+                    elif local_name.startswith((
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "out_proj",
+                        "saliency_head",
+                        "scorer",
+                        "aggregator",
+                    )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
                         sgb_roles[id(param)] = "norm_bias"
@@ -970,7 +978,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             model = unwrap_model(self.model)
             capture_sparse_debug = bool(getattr(self, "record_gradients", False))
             for m in model.modules():
-                if m.__class__.__name__ == 'SGTokenBlock' and hasattr(m, 'set_debug'):
+                if m.__class__.__name__ in {'SGTokenBlock', 'ReferenceGuidedSparseBlock'} and hasattr(m, 'set_debug'):
                     m.set_debug(capture_sparse_debug, cpu=True)
         except Exception:
             pass
@@ -1120,7 +1128,10 @@ class CustomDetectionTrainer(DetectionTrainer):
         except Exception:
             return
 
-        sgb_blocks = [m for m in model.modules() if m.__class__.__name__ == 'SGTokenBlock']
+        sgb_blocks = [
+            m for m in model.modules()
+            if m.__class__.__name__ in {'SGTokenBlock', 'ReferenceGuidedSparseBlock'}
+        ]
         decoder_modules = [m for m in model.modules() if m.__class__.__name__ == 'RTDETRDecoderSGB']
 
         metrics: dict[str, float] = {}
@@ -1393,11 +1404,19 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         for module in model.modules():
             cls_name = module.__class__.__name__
-            if cls_name == "SGTokenBlock":
+            if cls_name in {"SGTokenBlock", "ReferenceGuidedSparseBlock"}:
                 for local_name, param in module.named_parameters(recurse=True):
                     if local_name == "gamma":
                         sgb_roles[id(param)] = "sgb_gamma"
-                    elif local_name.startswith(("q_proj", "k_proj", "v_proj", "out_proj", "saliency_head")):
+                    elif local_name.startswith((
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "out_proj",
+                        "saliency_head",
+                        "scorer",
+                        "aggregator",
+                    )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith("norm"):
                         sgb_roles[id(param)] = "sgb_norm"

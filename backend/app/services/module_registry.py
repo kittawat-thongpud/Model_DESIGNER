@@ -1009,6 +1009,31 @@ _HSG_DET_MODULES: list[dict[str, Any]] = [
 # ── HSG-DETR custom modules (registered via hsg_detr package) ─────────────────
 _HSG_DETR_MODULES: list[dict[str, Any]] = [
     {
+        "name": "ReferenceGuidedSparseBlock",
+        "category": "attention",
+        "description": (
+            "HSG-DETR v3 reference-guided sparse aggregation. Separates token "
+            "scoring, top-k reference selection, local window aggregation, and "
+            "LayerScale residual fusion. Complexity is O(k * window^2), closer "
+            "to deformable/local sparse attention than selected-token all-pairs attention."
+        ),
+        "args": [
+            {"name": "out_channels", "type": "int", "default": 256,
+             "help": "Number of channels (channel-preserving; auto-injected by parse_model)"},
+            {"name": "ratio", "type": "float", "default": 0.12,
+             "help": "Fraction of spatial reference tokens to retain"},
+            {"name": "window_size", "type": "int", "default": 3,
+             "help": "Odd local aggregation window size around each selected reference"},
+            {"name": "mode", "type": "str", "default": "topk",
+             "help": "topk or dense ablation mode"},
+            {"name": "gamma_init", "type": "float", "default": 0.05,
+             "help": "Initial per-channel LayerScale for sparse delta"},
+            {"name": "gamma_floor", "type": "float", "default": None,
+             "help": "Minimum effective LayerScale magnitude; auto-selected by ratio when omitted"},
+        ],
+        "source": "hsg_detr",
+    },
+    {
         "name": "SparseGlobalTokenBlock",
         "category": "attention",
         "description": (
@@ -1025,7 +1050,7 @@ _HSG_DETR_MODULES: list[dict[str, Any]] = [
              "help": "Fraction of spatial tokens to retain (0 < ratio ≤ 1)"},
             {"name": "mode", "type": "str", "default": "topk",
              "help": "dense (full selected-token attn) or topk (sparse attn)"},
-            {"name": "gamma_init", "type": "float", "default": 0.05,
+            {"name": "gamma_init", "type": "float", "default": 0.10,
              "help": "Initial per-channel LayerScale for sparse delta"},
             {"name": "gamma_floor", "type": "float", "default": None,
              "help": "Minimum effective LayerScale magnitude; auto-selected by ratio when omitted"},
