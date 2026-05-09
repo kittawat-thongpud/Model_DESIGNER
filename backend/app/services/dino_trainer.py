@@ -673,6 +673,34 @@ def run_worker(payload: dict[str, Any]) -> None:
         raise RuntimeError(f"DINO upstream trainer not found: {root / 'main_dino.py'}")
 
     data_arg = str(config.get("data") or "")
+    
+    # Handle resume case: if data_arg is a data.yaml path, extract dataset ID
+    if not dataset_registry.is_image_dataset(data_arg):
+        # Check if it's a data.yaml file (from previous run)
+        if Path(data_arg).exists() and Path(data_arg).name == "data.yaml":
+            # Extract dataset ID from path or read from data.yaml
+            # Path format: .../jobs/{job_id}/data.yaml → need original dataset ID
+            # Try to read dataset name from data.yaml comment or path
+            try:
+                with open(data_arg, 'r') as f:
+                    first_line = f.readline()
+                    if "# Ultralytics data.yaml —" in first_line:
+                        # Extract dataset name from comment: "# Ultralytics data.yaml — kitti"
+                        dataset_name = first_line.split("—")[-1].strip()
+                        if dataset_registry.is_image_dataset(dataset_name):
+                            data_arg = dataset_name
+            except Exception:
+                pass
+            # Fallback: try to extract from path (e.g., /datasets/kitti)
+            if not dataset_registry.is_image_dataset(data_arg):
+                path_obj = Path(data_arg)
+                for parent in path_obj.parents:
+                    if parent.name == "datasets":
+                        dataset_name = parent.parent.name
+                        if dataset_registry.is_image_dataset(dataset_name):
+                            data_arg = dataset_name
+                            break
+    
     if not dataset_registry.is_image_dataset(data_arg):
         raise RuntimeError(f"DINO requires a registered image dataset, got: {data_arg!r}")
 
