@@ -1027,6 +1027,8 @@ _HSG_DETR_MODULES: list[dict[str, Any]] = [
              "help": "dense (full selected-token attn) or topk (sparse attn)"},
             {"name": "gamma_init", "type": "float", "default": 0.05,
              "help": "Initial per-channel LayerScale for sparse delta"},
+            {"name": "gamma_floor", "type": "float", "default": None,
+             "help": "Minimum effective LayerScale magnitude; auto-selected by ratio when omitted"},
         ],
         "source": "hsg_detr",
     },

@@ -89,6 +89,7 @@ class SGTokenBlock(nn.Module):
         finite_limit: float = 20.0,
         attn_logit_limit: float = 50.0,
         delta_limit: float = 6.0,
+        gamma_floor: float | None = None,
     ) -> None:
         super().__init__()
         assert c1 == c2, f"SGTokenBlock is channel-preserving (c1={c1}, c2={c2})"
@@ -107,6 +108,14 @@ class SGTokenBlock(nn.Module):
         self.finite_limit = float(finite_limit)
         self.attn_logit_limit = float(attn_logit_limit)
         self.delta_limit = float(delta_limit)
+        if gamma_floor is None:
+            if self.ratio >= 0.20:
+                gamma_floor = 0.010
+            elif self.ratio >= 0.10:
+                gamma_floor = 0.0075
+            else:
+                gamma_floor = 0.005
+        self.gamma_floor = max(0.0, float(gamma_floor))
 
         self.pre_norm = _make_gn(c2)
         self.norm = nn.LayerNorm(c2)
@@ -130,9 +139,12 @@ class SGTokenBlock(nn.Module):
         self.last_k: int | None = None
         self.last_N: int | None = None
         self.last_selected_ratio: float | None = None
+        self.last_gamma_raw_abs_mean: float | None = None
         self.last_gamma_abs_mean: float | None = None
+        self.last_gamma_floor: float | None = None
         self.last_delta_norm_selected: float | None = None
         self.last_delta_norm_nonselected: float | None = None
+        self.last_delta_scaled_norm_selected: float | None = None
         self.last_selected_grad_norm: float | None = None
         self.last_nonselected_sparse_grad: float | None = None
         self.last_finite_guard_count: int | None = None
@@ -222,9 +234,12 @@ class SGTokenBlock(nn.Module):
             "last_k": None,
             "last_N": None,
             "last_selected_ratio": None,
+            "last_gamma_raw_abs_mean": None,
             "last_gamma_abs_mean": None,
+            "last_gamma_floor": getattr(self, "gamma_floor", 0.0),
             "last_delta_norm_selected": None,
             "last_delta_norm_nonselected": None,
+            "last_delta_scaled_norm_selected": None,
             "last_selected_grad_norm": None,
             "last_nonselected_sparse_grad": None,
             "last_finite_guard_count": None,
@@ -243,9 +258,12 @@ class SGTokenBlock(nn.Module):
             "k": self.last_k,
             "N": self.last_N,
             "selected_ratio": self.last_selected_ratio,
+            "gamma_raw_abs_mean": self.last_gamma_raw_abs_mean,
             "gamma_abs_mean": self.last_gamma_abs_mean,
+            "gamma_floor": self.last_gamma_floor,
             "delta_norm_selected": self.last_delta_norm_selected,
             "delta_norm_nonselected": self.last_delta_norm_nonselected,
+            "delta_scaled_norm_selected": self.last_delta_scaled_norm_selected,
             "selected_grad_norm": self.last_selected_grad_norm,
             "nonselected_sparse_grad": self.last_nonselected_sparse_grad,
             "finite_guard_count": self.last_finite_guard_count,
@@ -348,6 +366,16 @@ class SGTokenBlock(nn.Module):
             pass
         return grad
 
+    def _effective_gamma(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Return signed LayerScale with a small floor so sparse contribution cannot vanish."""
+        gamma = self.gamma.to(dtype=dtype, device=device)
+        floor = float(getattr(self, "gamma_floor", 0.0))
+        if floor <= 0.0:
+            return gamma
+        sign = torch.where(gamma.detach() >= 0, torch.ones_like(gamma), -torch.ones_like(gamma))
+        mag = gamma.abs().clamp_min(floor)
+        return sign * mag
+
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
@@ -370,7 +398,8 @@ class SGTokenBlock(nn.Module):
         self.last_k = k_actual
         self.last_mode = self.mode
         self.last_selected_ratio = float(k_actual) / float(N) if N else 0.0
-        self.last_gamma_abs_mean = float(self.gamma.detach().float().abs().mean().item())
+        self.last_gamma_raw_abs_mean = float(self.gamma.detach().float().abs().mean().item())
+        self.last_gamma_floor = float(getattr(self, "gamma_floor", 0.0))
         self.last_selected_grad_norm = None
         self.last_nonselected_sparse_grad = 0.0
 
@@ -414,7 +443,16 @@ class SGTokenBlock(nn.Module):
         delta_flat = x_safe.new_zeros(B, C, N)
         delta_flat = delta_flat.scatter(2, idx_exp, delta_tokens.transpose(1, 2).to(dtype=x_safe.dtype))
         delta = delta_flat.view(B, C, H, W)
-        out = x_safe + self.gamma.to(dtype=x_safe.dtype, device=x_safe.device) * delta
+        gamma_eff = self._effective_gamma(dtype=x_safe.dtype, device=x_safe.device)
+        self.last_gamma_abs_mean = float(gamma_eff.detach().float().abs().mean().item())
+        try:
+            scaled_tokens = delta_tokens * gamma_eff.flatten().view(1, 1, C).to(dtype=delta_tokens.dtype)
+            self.last_delta_scaled_norm_selected = float(
+                scaled_tokens.detach().float().norm(dim=-1).mean().item()
+            )
+        except Exception:
+            self.last_delta_scaled_norm_selected = None
+        out = x_safe + gamma_eff * delta
         return _finite_or_zero(out, limit=self.finite_limit).to(dtype=x.dtype)
 
 

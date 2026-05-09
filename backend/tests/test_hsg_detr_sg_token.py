@@ -43,6 +43,10 @@ def test_sg_token_block_shape_and_gamma_init():
     state = block.get_debug_state()
     assert state["k"] == 16
     assert state["selected_ratio"] == pytest.approx(0.25)
+    assert state["gamma_raw_abs_mean"] == pytest.approx(0.05)
+    assert state["gamma_abs_mean"] == pytest.approx(0.05)
+    assert state["gamma_floor"] == pytest.approx(0.01)
+    assert state["delta_scaled_norm_selected"] is not None
 
 
 def test_sparse_delta_is_zero_on_nonselected_positions():

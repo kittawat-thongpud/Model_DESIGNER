@@ -264,8 +264,8 @@ class CustomDetectionTrainer(DetectionTrainer):
     """Custom trainer with enhanced monitoring for Model Designer."""
 
     # Scheduled Saliency-Guided Query Selection (alpha schedule)
-    # alpha: 0 → HSG_ALPHA_TARGET over HSG_ALPHA_WARMUP_EPOCHS epochs
-    HSG_ALPHA_TARGET = 0.30          # max saliency weight for query selection
+    # alpha: 0 -> HSG_ALPHA_TARGET over HSG_ALPHA_WARMUP_EPOCHS epochs
+    HSG_ALPHA_TARGET = 0.50          # max saliency weight for query selection
     HSG_ALPHA_START_EPOCH = 0        # start warming from epoch 0
     HSG_ALPHA_WARMUP_EPOCHS = 15     # linear warmup duration
     HSG_ALPHA_RESUME_RAMP_EPOCHS = 20  # ramp after resume to avoid jumps
@@ -623,8 +623,8 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         Param groups:
           - base model:             lr=lr0,        wd=decay
-          - SGB sparse projections: lr=lr0 x 1.5,  wd=decay
-          - SGB gamma:              lr=lr0 x 2.0,  wd=0
+          - SGB sparse projections: lr=lr0 x 2.0,  wd=decay
+          - SGB gamma:              lr=lr0 x 5.0,  wd=0
           - norm / bias:            lr=lr0,        wd=0
           - decoder:                lr=lr0 x 1.5,  wd=decay
         """
@@ -695,8 +695,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         groups = []
         for name, params, lr_mult, use_wd in [
             ('base',       pg_base,       1.0, True),
-            ('sgb_sparse', pg_sgb_sparse, 1.5, True),
-            ('sgb_gamma',  pg_sgb_gamma,  2.0, False),
+            ('sgb_sparse', pg_sgb_sparse, 2.0, True),
+            ('sgb_gamma',  pg_sgb_gamma,  5.0, False),
             ('norm_bias',  pg_norm_bias,  1.0, False),
             ('decoder',    pg_decoder,    1.5, True),
         ]:
@@ -728,9 +728,18 @@ class CustomDetectionTrainer(DetectionTrainer):
         # Log group sizes
         if self.job_id:
             sizes = {g.get('name', '?'): len(g['params']) for g in groups}
+            group_cfg = {
+                g.get('name', '?'): {
+                    'params': len(g['params']),
+                    'lr': float(g.get('lr', 0.0)),
+                    'weight_decay': float(g.get('weight_decay', 0.0)),
+                }
+                for g in groups
+            }
             job_storage.append_job_log(
                 self.job_id, 'INFO',
-                f'Optimizer param groups: {sizes} | lr0={lr0}, wd={wd}'
+                f'Optimizer param groups: {sizes} | lr0={lr0}, wd={wd}',
+                {'type': 'optimizer_param_groups', 'groups': group_cfg}
             )
 
         return optimizer
@@ -1063,8 +1072,32 @@ class CustomDetectionTrainer(DetectionTrainer):
         metrics: dict[str, float] = {}
 
         # ── Selected-token SGB metrics ───────────────────────────────────
+        # HSG-DETR YAML emits SGB blocks in P5 -> P4 -> P3 order. Tag by
+        # spatial token count so Job Detail and analysis do not invert levels.
+        def _sgb_level(block, fallback_idx: int) -> str:
+            N = getattr(block, 'last_N', None)
+            if N is not None:
+                try:
+                    n_val = int(N)
+                    known = sorted(
+                        {int(getattr(b, 'last_N', 0) or 0) for b in sgb_blocks},
+                        reverse=True,
+                    )
+                    known = [v for v in known if v > 0]
+                    if n_val in known:
+                        rank = known.index(n_val)
+                        if rank == 0:
+                            return 'P3'
+                        if rank == 1:
+                            return 'P4'
+                        if rank == 2:
+                            return 'P5'
+                except Exception:
+                    pass
+            return ('P5', 'P4', 'P3')[fallback_idx] if fallback_idx < 3 else f'P{fallback_idx + 3}'
+
         for i, blk in enumerate(sgb_blocks):
-            tag = f'sgb/P{i+3}'
+            tag = f'sgb/{_sgb_level(blk, i)}'
             metrics[f'{tag}_ratio'] = float(getattr(blk, 'ratio', 0))
             N = getattr(blk, 'last_N', None)
             k = getattr(blk, 'last_k', None)
@@ -1078,15 +1111,24 @@ class CustomDetectionTrainer(DetectionTrainer):
             selected_ratio = getattr(blk, 'last_selected_ratio', None)
             if selected_ratio is not None:
                 metrics[f'{tag}_selected_ratio'] = float(selected_ratio)
+            gamma_raw_abs = getattr(blk, 'last_gamma_raw_abs_mean', None)
+            if gamma_raw_abs is not None:
+                metrics[f'{tag}_gamma_raw_abs_mean'] = float(gamma_raw_abs)
             gamma_abs = getattr(blk, 'last_gamma_abs_mean', None)
             if gamma_abs is not None:
                 metrics[f'{tag}_gamma_abs_mean'] = float(gamma_abs)
+            gamma_floor = getattr(blk, 'last_gamma_floor', None)
+            if gamma_floor is not None:
+                metrics[f'{tag}_gamma_floor'] = float(gamma_floor)
             delta_selected = getattr(blk, 'last_delta_norm_selected', None)
             if delta_selected is not None:
                 metrics[f'{tag}_delta_norm_selected'] = float(delta_selected)
             delta_nonselected = getattr(blk, 'last_delta_norm_nonselected', None)
             if delta_nonselected is not None:
                 metrics[f'{tag}_delta_norm_nonselected'] = float(delta_nonselected)
+            delta_scaled = getattr(blk, 'last_delta_scaled_norm_selected', None)
+            if delta_scaled is not None:
+                metrics[f'{tag}_delta_scaled_norm_selected'] = float(delta_scaled)
             selected_grad = getattr(blk, 'last_selected_grad_norm', None)
             if selected_grad is not None:
                 metrics[f'{tag}_selected_grad_norm'] = float(selected_grad)

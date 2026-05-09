@@ -26,6 +26,11 @@ interface Props {
 
 const SCALES = ['P3', 'P4', 'P5'] as const;
 const SCALE_COLORS: Record<string, string> = { P3: '#f59e0b', P4: '#38bdf8', P5: '#a78bfa' };
+const SCALE_HELP: Record<string, string> = {
+  P3: 'high-res',
+  P4: 'mid-res',
+  P5: 'low-res',
+};
 const EPS = 1e-8;
 
 const metricKey = (scale: string, name: string) => `sgb/${scale}_${name}`;
@@ -118,6 +123,9 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
   const anyFiniteGuard = SCALES.some(s => (latest[metricKey(s, 'finite_guard_count')] ?? 0) > 0);
   const sparseGrad = latest['grad/sgb_sparse_norm'];
   const gammaGrad = latest['grad/sgb_gamma_norm'];
+  const alphaMax = Math.max(0.55, ...history.map(h => Number(h['decoder/alpha'] ?? 0) * 1.1));
+  const hasGammaFloorMetrics = SCALES.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
+  const hasScaledDeltaMetrics = SCALES.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
 
   return (
     <div className="space-y-6">
@@ -127,7 +135,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
         </div>
         <div>
           <h3 className="text-white font-semibold text-sm">HSG-DETR Sparse Debug</h3>
-          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Selected-token SGB, decoder alpha, gradient contract</p>
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider">Stride-labeled SGB, gamma floor, decoder alpha, gradient contract</p>
         </div>
         <div className="ml-auto flex gap-2">
           <StatusBadge ok={!hasNan} label={hasNan ? 'NaN' : 'No NaN'} />
@@ -165,14 +173,16 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
         {SCALES.map(scale => {
           const selected = latest[metricKey(scale, 'selected_ratio')] ?? latest[metricKey(scale, 'k_over_N')];
           const gamma = latest[metricKey(scale, 'gamma_abs_mean')];
-          const delta = latest[metricKey(scale, 'delta_norm_selected')];
+          const gammaRaw = latest[metricKey(scale, 'gamma_raw_abs_mean')];
+          const gammaFloor = latest[metricKey(scale, 'gamma_floor')];
+          const delta = latest[metricKey(scale, 'delta_scaled_norm_selected')] ?? latest[metricKey(scale, 'delta_norm_selected')];
           return (
             <MetricCard
               key={scale}
               label={`${scale} selected`}
               value={fmt(selected, 4)}
               color={metricColor(delta)}
-              sub={`gamma=${fmt(gamma, 3)} | delta=${fmt(delta, 3)}`}
+              sub={`${SCALE_HELP[scale]} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`}
             />
           );
         })}
@@ -184,7 +194,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
             <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
               <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
-              <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 0.35]} />
+              <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, alphaMax]} />
               <Tooltip content={<CustomTooltip />} />
               <Line type="monotone" dataKey="decoder/alpha" name="Alpha" stroke="#10b981" strokeWidth={2} dot={false} connectNulls />
             </LineChart>
@@ -200,11 +210,16 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
               {scaleLines('gamma_abs_mean')}
+              {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
+                strokeDasharray: '3 3',
+                strokeWidth: 1,
+                name: `${line.props.name} floor`,
+              }))}
             </LineChart>
           </ResponsiveContainer>
         </ChartPanel>
 
-        <ChartPanel title="Selected Delta Norm" icon={<Activity size={14} className="text-rose-400" />}>
+        <ChartPanel title={hasScaledDeltaMetrics ? 'Selected Delta After Gamma' : 'Selected Delta Norm'} icon={<Activity size={14} className="text-rose-400" />}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
@@ -212,7 +227,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('delta_norm_selected')}
+              {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
             </LineChart>
           </ResponsiveContainer>
         </ChartPanel>
@@ -263,7 +278,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
 
       <div className="bg-slate-900/40 border border-slate-800 rounded-xl overflow-hidden">
         <div className="px-4 py-2.5 border-b border-slate-800/50 bg-slate-900/30">
-          <span className="text-xs font-semibold text-slate-200">Sparse Contract Latest — Epoch {latest.epoch}</span>
+          <span className="text-xs font-semibold text-slate-200">Sparse Contract Latest - Epoch {latest.epoch}</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-xs">
@@ -272,8 +287,11 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <th className="px-4 py-2 text-left">Block</th>
                 <th className="px-4 py-2 text-right">Ratio</th>
                 <th className="px-4 py-2 text-right">k / N</th>
-                <th className="px-4 py-2 text-right">Gamma</th>
+                <th className="px-4 py-2 text-right">Gamma raw</th>
+                <th className="px-4 py-2 text-right">Gamma eff</th>
+                <th className="px-4 py-2 text-right">Floor</th>
                 <th className="px-4 py-2 text-right">Delta selected</th>
+                <th className="px-4 py-2 text-right">Delta scaled</th>
                 <th className="px-4 py-2 text-right">Delta non-selected</th>
                 <th className="px-4 py-2 text-right">Selected grad</th>
                 <th className="px-4 py-2 text-right">Non-selected sparse grad</th>
@@ -284,21 +302,31 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
             <tbody>
               {SCALES.map(scale => {
                 const deltaNon = latest[metricKey(scale, 'delta_norm_nonselected')];
+                const deltaSelected = latest[metricKey(scale, 'delta_norm_selected')];
+                const deltaScaled = latest[metricKey(scale, 'delta_scaled_norm_selected')];
                 const sparseNon = latest[metricKey(scale, 'nonselected_sparse_grad')];
                 const selectedGrad = latest[metricKey(scale, 'selected_grad_norm')];
                 const guardHits = latest[metricKey(scale, 'finite_guard_count')] ?? 0;
                 const contractOk = (deltaNon ?? 0) <= EPS && (sparseNon ?? 0) <= EPS && guardHits === 0;
                 return (
                   <tr key={scale} className="border-b border-slate-800/50 hover:bg-slate-800/20">
-                    <td className="px-4 py-2 font-bold" style={{ color: SCALE_COLORS[scale] }}>{scale}</td>
+                    <td className="px-4 py-2 font-bold" style={{ color: SCALE_COLORS[scale] }}>
+                      {scale}
+                      <span className="block text-[9px] font-normal text-slate-500">{SCALE_HELP[scale]}</span>
+                    </td>
                     <td className="px-4 py-2 text-right font-mono text-slate-300">{fmt(latest[metricKey(scale, 'ratio')], 3)}</td>
                     <td className="px-4 py-2 text-right font-mono text-slate-300">
                       {fmt(latest[metricKey(scale, 'k_over_N')], 4)}
                       <span className="text-slate-600 ml-1">({fmt(latest[metricKey(scale, 'k')], 0)}/{fmt(latest[metricKey(scale, 'N')], 0)})</span>
                     </td>
+                    <td className="px-4 py-2 text-right font-mono text-slate-300">{fmt(latest[metricKey(scale, 'gamma_raw_abs_mean')], 4)}</td>
                     <td className="px-4 py-2 text-right font-mono text-emerald-400">{fmt(latest[metricKey(scale, 'gamma_abs_mean')], 4)}</td>
-                    <td className={`px-4 py-2 text-right font-mono ${metricColor(latest[metricKey(scale, 'delta_norm_selected')])}`}>
-                      {fmt(latest[metricKey(scale, 'delta_norm_selected')], 4)}
+                    <td className="px-4 py-2 text-right font-mono text-cyan-400">{fmt(latest[metricKey(scale, 'gamma_floor')], 4)}</td>
+                    <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaSelected)}`}>
+                      {fmt(deltaSelected, 4)}
+                    </td>
+                    <td className={`px-4 py-2 text-right font-mono ${metricColor(deltaScaled ?? deltaSelected)}`}>
+                      {fmt(deltaScaled, 4)}
                     </td>
                     <td className={`px-4 py-2 text-right font-mono ${(deltaNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>
                       {fmt(deltaNon, 4)}

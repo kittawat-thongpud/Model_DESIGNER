@@ -158,7 +158,8 @@ def test_optimizer_groups_and_grad_regions(torch, device: str, imgsz: int) -> No
     gamma_group = next(g for g in optimizer.param_groups if g.get("name") == "sgb_gamma")
     sparse_group = next(g for g in optimizer.param_groups if g.get("name") == "sgb_sparse")
     _require(gamma_group["weight_decay"] == 0.0, "sgb_gamma must not use weight decay")
-    _require(abs(float(sparse_group["lr"]) - 1.5e-3) < 1e-12, "sgb_sparse lr multiplier should be 1.5x")
+    _require(abs(float(sparse_group["lr"]) - 2.0e-3) < 1e-12, "sgb_sparse lr multiplier should be 2.0x")
+    _require(abs(float(gamma_group["lr"]) - 5.0e-3) < 1e-12, "sgb_gamma lr multiplier should be 5.0x")
     print(f"PASS optimizer groups={sizes}.")
 
     _print_step("Custom trainer grad region diagnostics")
