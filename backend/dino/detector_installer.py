@@ -22,7 +22,8 @@ def _replace(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     if old not in text:
         return
-    path.write_text(text.replace(old, new), encoding="utf-8")
+    # Replace only once to avoid duplicate patches
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
 def _apply_compat_patches(root: Path) -> None:
