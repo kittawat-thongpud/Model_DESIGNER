@@ -366,124 +366,33 @@ class RTDETRDecoderV2(RTDETRDecoder):
     REFINE_EPS: float = 1e-3
     BBOX_DELTA_LIMIT: float = 4.0
 
-    def __init__(self, *args) -> None:
-        # Handle variable arguments from YAML parse_model
-        # Simple format (6 args): [nc, hd, nq, loc_quality_mode, alpha_u, beta_s]
-        # Extended format (20 args): [nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
-        #                            eval_idx, nd, label_noise_ratio, box_noise_scale, 
-        #                            learnt_init_query, loc_quality_mode, alpha_u, beta_s]
-        
-        # Set defaults for N-scale
-        nc = 80
-        ch = (256, 512, 1024)  # N-scale channels from P3/P4/P5
-        hd = 256
-        nq = 100
-        ndp = 4
-        nh = 8
-        ndl = 6
-        d_ffn = 1024
-        dropout = 0.0
-        act = nn.ReLU()
-        eval_idx = -1
-        nd = 100
-        label_noise_ratio = 0.5
-        box_noise_scale = 1.0
-        learnt_init_query = True
-        loc_quality_mode = "area"
-        alpha_u = 0.3
-        beta_s = 0.0
-        
-        # Parse args - support both simple (6 args) and extended (20 args) formats
-        if len(args) >= 1:
-            # Handle nc - could be int or string "nc" from YAML
-            nc_arg = args[0]
-            if isinstance(nc_arg, str) and nc_arg.lower() == "nc":
-                nc = 80  # Default COCO classes
+    def __init__(
+        self,
+        nc: int = 80,
+        ch: tuple = (512, 1024, 2048),
+        hd: int = 256,
+        nq: int = 300,
+        loc_quality_mode: str = "area",
+        alpha_u: float = 0.3,
+        beta_s: float = 0.0,
+        ndp: int = 4,
+        nh: int = 8,
+        ndl: int = 6,
+        d_ffn: int = 1024,
+        dropout: float = 0.0,
+        act: nn.Module = nn.ReLU(),
+        eval_idx: int = -1,
+        nd: int = 100,
+        label_noise_ratio: float = 0.5,
+        box_noise_scale: float = 1.0,
+        learnt_init_query: bool = True,
+    ) -> None:
+        if isinstance(nc, str):
+            if nc.lower() == "nc":
+                nc = 80
             else:
-                nc = int(nc_arg)
-        
-        if len(args) == 6:
-            # Simple format: [nc, hd, nq, loc_quality_mode, alpha_u, beta_s]
-            hd = args[1]
-            nq = args[2]
-            loc_quality_mode = args[3]
-            alpha_u = args[4]
-            beta_s = args[5]
-        elif len(args) >= 2:
-            # Extended format with ch as list/tuple or individual values
-            ch_arg = args[1]
-            if isinstance(ch_arg, (list, tuple)) and len(ch_arg) == 3:
-                ch = tuple(ch_arg)
-                if len(args) >= 3:
-                    hd = args[2]
-                if len(args) >= 4:
-                    nq = args[3]
-                if len(args) >= 5:
-                    ndp = args[4]
-                if len(args) >= 6:
-                    nh = args[5]
-                if len(args) >= 7:
-                    ndl = args[6]
-                if len(args) >= 8:
-                    d_ffn = args[7]
-                if len(args) >= 9:
-                    dropout = args[8]
-                if len(args) >= 10:
-                    act = args[9]
-                if len(args) >= 11:
-                    eval_idx = args[10]
-                if len(args) >= 12:
-                    nd = args[11]
-                if len(args) >= 13:
-                    label_noise_ratio = args[12]
-                if len(args) >= 14:
-                    box_noise_scale = args[13]
-                if len(args) >= 15:
-                    learnt_init_query = args[14]
-                if len(args) >= 16:
-                    loc_quality_mode = args[15]
-                if len(args) >= 17:
-                    alpha_u = args[16]
-                if len(args) >= 18:
-                    beta_s = args[17]
-            else:
-                # ch values spread as individual args
-                ch = (ch_arg, args[2], args[3]) if len(args) >= 4 else ch
-                if len(args) >= 5:
-                    hd = args[4]
-                if len(args) >= 6:
-                    nq = args[5]
-                if len(args) >= 7:
-                    ndp = args[6]
-                if len(args) >= 8:
-                    nh = args[7]
-                if len(args) >= 9:
-                    ndl = args[8]
-                if len(args) >= 10:
-                    d_ffn = args[9]
-                if len(args) >= 11:
-                    dropout = args[10]
-                if len(args) >= 12:
-                    act = args[11]
-                if len(args) >= 13:
-                    eval_idx = args[12]
-                if len(args) >= 14:
-                    nd = args[13]
-                if len(args) >= 15:
-                    label_noise_ratio = args[14]
-                if len(args) >= 16:
-                    box_noise_scale = args[15]
-                if len(args) >= 17:
-                    learnt_init_query = args[16]
-                if len(args) >= 18:
-                    loc_quality_mode = args[17]
-                if len(args) >= 19:
-                    alpha_u = args[18]
-                if len(args) >= 20:
-                    beta_s = args[19]
-        
-        # Debug: log values before calling parent
-        print(f"[RTDETRDecoderV2] nc={nc} (type={type(nc)}), ch={ch}, hd={hd}, nq={nq}, nh={nh}")
+                nc = int(nc)
+
         super().__init__(
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
@@ -574,7 +483,9 @@ class RTDETRDecoderV2(RTDETRDecoder):
             cls_conf = enc_outputs_scores.detach().float().sigmoid().max(-1).values  # (bs, hw)
 
             # Phase 1: Localization confidence based on mode
-            box_pred = self.enc_bbox_head(features.detach().float()).sigmoid()  # (bs, hw, 4)
+            bbox_head_dtype = next(self.enc_bbox_head.parameters()).dtype
+            bbox_delta = self.enc_bbox_head(features.detach().to(dtype=bbox_head_dtype)).float()
+            box_pred = bbox_delta.sigmoid()  # (bs, hw, 4)
             
             if self.loc_quality_mode == "area":
                 # LQ-A: Original area proxy (w·h)
@@ -582,11 +493,9 @@ class RTDETRDecoderV2(RTDETRDecoder):
             elif self.loc_quality_mode == "stability":
                 # LQ-B: Stability proxy - exp(-abs(bbox_delta).mean())
                 # bbox_delta is the raw prediction before sigmoid
-                bbox_delta = self.enc_bbox_head(features.detach().float())
                 loc_conf = torch.exp(-bbox_delta.abs().mean(-1)).clamp(min=1e-6)   # (bs, hw)
             elif self.loc_quality_mode == "cls_consistency":
                 # LQ-C: Class * localization consistency
-                bbox_delta = self.enc_bbox_head(features.detach().float())
                 loc_stability = torch.exp(-bbox_delta.abs().mean(-1)).clamp(min=1e-6)
                 loc_conf = cls_conf * loc_stability  # (bs, hw)
             else:
