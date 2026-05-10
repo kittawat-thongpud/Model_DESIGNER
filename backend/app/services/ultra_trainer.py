@@ -369,11 +369,21 @@ def _checkpoint_candidates_for_job(job_id: str, *, prefer_best: bool = False) ->
         return [*ordered, *sorted(run_dir.rglob("*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)]
 
     if family == "dino":
-        run_dir = job_dir / "runs" / "dino"
-        return [
-            run_dir / "checkpoint.pth",
-            *sorted(run_dir.glob("checkpoint*.pth"), key=lambda p: p.stat().st_mtime, reverse=True),
-        ]
+        # DINO-DETR uses "dino_detr" directory, DINO self-supervised uses "dino"
+        run_dir_dino = job_dir / "runs" / "dino"
+        run_dir_dino_detr = job_dir / "runs" / "dino_detr"
+        candidates = []
+        if run_dir_dino_detr.exists():
+            candidates.extend([
+                run_dir_dino_detr / "checkpoint.pth",
+                *sorted(run_dir_dino_detr.glob("checkpoint*.pth"), key=lambda p: p.stat().st_mtime, reverse=True),
+            ])
+        if run_dir_dino.exists():
+            candidates.extend([
+                run_dir_dino / "checkpoint.pth",
+                *sorted(run_dir_dino.glob("checkpoint*.pth"), key=lambda p: p.stat().st_mtime, reverse=True),
+            ])
+        return candidates
 
     weights_dir = job_dir / "runs" / "train" / "weights"
     ordered = [weights_dir / "best.pt", weights_dir / "last.pt"] if prefer_best else [weights_dir / "last.pt", weights_dir / "best.pt"]
@@ -3263,19 +3273,21 @@ def _run_worker_from_args_file(args_path: str) -> int:
             rtdetrv2_trainer.run_worker(payload)
             return 0
         if arch_plugin and arch_plugin.family == "dino":
-            # Check if this is DINO-DETR detection (based on task)
-            task = str(payload.get("task") or str(_MODEL_DEFAULTS.get("task", "detect")))
+            # Check if this is DINO-DETR detection (based on model_scale)
+            # DINO-DETR uses ResNet-50 backbone for object detection
+            # Other scales (vits16, vits8, etc.) are for self-supervised learning
+            model_scale = str(payload.get("model_scale") or "")
             
-            if task == "detect":
+            if model_scale == "resnet50":
                 # DINO-DETR detection - use DINO-DETR trainer
                 from . import dino_detr_trainer
-                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO-DETR detection trainer")
+                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO-DETR detection trainer (model_scale={model_scale})")
                 dino_detr_trainer.run_worker(payload)
                 return 0
             else:
-                # DINO self-supervised
+                # DINO self-supervised (ViT-based scales)
                 from . import dino_trainer
-                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO self-supervised trainer")
+                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO self-supervised trainer (model_scale={model_scale})")
                 dino_trainer.run_worker(payload)
                 return 0
     except Exception:

@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from app.config import JOBS_DIR
 from app.services import job_storage, weight_storage
 from app.services.dataset_yaml import write_data_yaml
@@ -38,6 +40,50 @@ def repo_dir() -> Path:
     """Get DINO-DETR vendor directory."""
     from app.config import DATA_DIR
     return DATA_DIR / "vendor" / "DINO-DETR"
+
+
+def _emit_extended_metrics(job_id: str, epoch: int, metrics: dict[str, Any]) -> None:
+    """Emit epoch metrics to extended_metrics.jsonl for frontend charts.
+    
+    Field names MUST match what job_storage.get_job_history() expects:
+      train_box_loss, train_cls_loss, train_dfl_loss,
+      map50, map (=mAP50-95), map75, precision, recall, lr, etc.
+    """
+    ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+    try:
+        epoch_data: dict[str, Any] = {
+            "epoch": epoch,
+            "timestamp": time.time(),
+        }
+        
+        # Training losses (map DINO-DETR → Ultralytics-style names)
+        if "loss_bbox" in metrics:
+            epoch_data["train_box_loss"] = metrics["loss_bbox"]
+        if "loss_ce" in metrics:
+            epoch_data["train_cls_loss"] = metrics["loss_ce"]
+        if "loss_giou" in metrics:
+            epoch_data["train_dfl_loss"] = metrics["loss_giou"]
+        
+        # Validation metrics (from evaluation)
+        if "map" in metrics:
+            epoch_data["map"] = metrics["map"]  # mAP50-95
+        if "map50" in metrics:
+            epoch_data["map50"] = metrics["map50"]
+        if "map75" in metrics:
+            epoch_data["map75"] = metrics["map75"]
+        
+        # Learning rate
+        if "lr" in metrics:
+            epoch_data["lr"] = metrics["lr"]
+        
+        # Remove None values
+        epoch_data = {k: v for k, v in epoch_data.items() if v is not None}
+        
+        # Write to extended_metrics.jsonl
+        with ext_metrics_path.open("a") as mf:
+            mf.write(json.dumps(epoch_data) + "\n")
+    except Exception as e:
+        _log(job_id, "WARNING", f"Failed to write extended_metrics.jsonl: {e}")
 
 
 def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
@@ -128,6 +174,25 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
                     y_min = (y_center - height / 2) * img_height
                     box_width = width * img_width
                     box_height = height * img_height
+                    
+                    # Validate bounding box coordinates
+                    # Skip invalid boxes (negative dimensions or out of bounds)
+                    if box_width <= 0 or box_height <= 0:
+                        continue
+                    
+                    # Clamp to image boundaries
+                    x_min = max(0, x_min)
+                    y_min = max(0, y_min)
+                    x_max = min(img_width, x_min + box_width)
+                    y_max = min(img_height, y_min + box_height)
+                    
+                    # Recalculate width/height after clamping
+                    box_width = x_max - x_min
+                    box_height = y_max - y_min
+                    
+                    # Skip if box becomes invalid after clamping
+                    if box_width <= 0 or box_height <= 0:
+                        continue
                     
                     coco_output["annotations"].append({
                         "id": annotation_id,
@@ -242,6 +307,114 @@ def _restore_vendor_code(root: Path, original_content: str) -> None:
                 pass
 
 
+def _parse_dino_detr_metrics(line: str) -> dict[str, Any] | None:
+    """Parse DINO-DETR stdout log line for metrics.
+
+    Format 1: "Test:  [ 160/5985]  eta: 0:10:53  lr: 0.000100  class_error: 66.67  loss: 10.2455 (10.7039)  ..."
+    Format 2: "Epoch: [0]  [1040/5985]  eta: 0:08:22  lr: 0.000100  ..."
+    """
+    metrics: dict[str, Any] = {}
+
+    # Only parse lines that match the DINO-DETR training output format
+    # Must start with "Test:" or "Epoch:" followed by "[iter/total]"
+    m = re.match(r'(?:Test:|Epoch:)\s*\[\s*(\d+)/(\d+)\]', line)
+    if not m:
+        return None  # Not a DINO-DETR training progress line
+    
+    # Parse iteration and total_iterations
+    metrics["iteration"] = int(m.group(1))
+    metrics["total_iterations"] = int(m.group(2))
+    
+    # Epoch is not in the line - will be tracked externally via iteration count
+
+    # Parse ETA from DINO-DETR: "eta: 0:10:53" (format: H:MM:SS)
+    m = re.search(r'eta:\s*([\d:]+)', line)
+    if m:
+        eta_str = m.group(1)
+        # Parse H:MM:SS format
+        parts = eta_str.split(':')
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            metrics["eta_s"] = hours * 3600 + minutes * 60 + seconds
+
+    # Parse class_error: "class_error: 0.00"
+    m = re.search(r"class_error:\s*([\d.]+)", line)
+    if m:
+        metrics["class_error"] = float(m.group(1))
+
+    # Parse loss (current and running average): "loss: 13.8408 (15.2805)"
+    m = re.search(r"loss:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["train_loss"] = float(m.group(1))
+        metrics["train_loss_avg"] = float(m.group(2))
+
+    # Parse key DINO-DETR loss components (simplified metrics like hsg-detr)
+    # Only extract main losses: loss_ce, loss_bbox, loss_giou (skip detailed decoder-specific losses)
+    m = re.search(r"loss_ce:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["loss_ce"] = float(m.group(1))
+
+    m = re.search(r"loss_bbox:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["loss_bbox"] = float(m.group(1))
+
+    m = re.search(r"loss_giou:\s*([\d.]+)\s*\(([\d.]+)\)", line)
+    if m:
+        metrics["loss_giou"] = float(m.group(1))
+
+    # Parse time per iteration: "time: 0.0955"
+    m = re.search(r"time:\s*([\d.]+)", line)
+    if m:
+        metrics["time_per_iter"] = float(m.group(1))
+
+    # Parse data time: "data: 0.0017"
+    m = re.search(r"data:\s*([\d.]+)", line)
+    if m:
+        metrics["data_time"] = float(m.group(1))
+
+    # Parse max memory: "max mem: 3792"
+    m = re.search(r"max mem:\s*(\d+)", line)
+    if m:
+        metrics["max_mem_mb"] = int(m.group(1))
+
+    return metrics
+
+
+def _parse_dino_detr_eval_metrics(line: str) -> dict[str, Any] | None:
+    """Parse DINO-DETR evaluation output for mAP metrics.
+
+    Format: "Average Precision  (AP) @[ IoU=0.50:0.95 | area=  all | maxDets=100 ] = 0.123"
+    """
+    metrics: dict[str, Any] = {}
+
+    # Parse AP (mAP@[0.50:0.95]): "Average Precision  (AP) @[ IoU=0.50:0.95 | area=  all | maxDets=100 ] = 0.123"
+    if "IoU=0.50:0.95" in line and "] =" in line:
+        m = re.search(r"\]\s*=\s*([\d.]+)", line)
+        if m:
+            metrics["map"] = float(m.group(1))
+
+    # Parse AP50: "Average Precision  (AP) @[ IoU=0.50      | area=  all | maxDets=100 ] = 0.345"
+    # Match line with "IoU=0.50" followed by spaces and "|" (not ":0.95")
+    # Use word boundary or check that "IoU=0.50" is not followed by ":0.95"
+    if "IoU=0.50" in line and "IoU=0.50:0.95" not in line and "] =" in line:
+        m = re.search(r"\]\s*=\s*([\d.]+)", line)
+        if m:
+            metrics["map50"] = float(m.group(1))
+
+    # Parse AP75: "Average Precision  (AP) @[ IoU=0.75      | area=  all | maxDets=100 ] = 0.567"
+    if "IoU=0.75" in line and "] =" in line:
+        m = re.search(r"\]\s*=\s*([\d.]+)", line)
+        if m:
+            metrics["map75"] = float(m.group(1))
+
+    # Only return metrics if we found at least one
+    if metrics:
+        return metrics
+    return None
+
+
 def run_worker(payload: dict[str, Any]) -> None:
     """Run one DINO-DETR detection training job."""
     job_id = str(payload["job_id"])
@@ -299,6 +472,11 @@ def run_worker(payload: dict[str, Any]) -> None:
         with data_yaml.open("w") as f:
             yaml.dump(data_yaml_content, f)
     
+    # Get DINO-DETR venv Python
+    venv_python = root / "venv" / "bin" / "python3"
+    if not venv_python.exists():
+        venv_python = Path(sys.executable)  # Fallback to system Python
+    
     # Training parameters
     epochs = int(config.get("epochs", 300))
     batch = int(config.get("batch", 16))
@@ -306,28 +484,37 @@ def run_worker(payload: dict[str, Any]) -> None:
     lr = float(config.get("lr0", 0.0001))
     weight_decay = float(config.get("weight_decay", 0.05))
     
+    # Clamp learning rate to safe range for DINO-DETR (0.0001 is default)
+    if lr > 0.001:
+        _log_fn(f"WARNING: Learning rate {lr} is too high for DINO-DETR. Clamping to 0.0001.")
+        lr = 0.0001
+    
     _log_fn(f"DINO-DETR detection training: epochs={epochs}, batch={batch}, workers={workers}, lr={lr}")
+    
+    # Disable periodic checkpoints to prevent bloat (keep only checkpoint.pth)
+    # DINO-DETR saves checkpoint.pth by default, we don't need periodic saves
+    save_period = epochs + 1  # Save only at the end
     
     # Patch vendor code to fix IndentationError
     original_slconfig = _patch_vendor_code(root, job_id)
     
     # Build DINO-DETR training command
+    # Note: DINO-DETR doesn't support imgsz parameter like YOLO
+    # It uses data_aug_scales in config file, but --options doesn't support list parsing
+    # We'll ignore imgsz parameter and use default config
+    imgsz_val = config.get("imgsz")
+    if imgsz_val is not None:
+        _log_fn(f"WARNING: imgsz parameter ({imgsz_val}) is not supported for DINO-DETR. Using default data_aug_scales from config file.")
+    
     cmd = [
-        sys.executable,
+        str(venv_python),
         "main.py",
-        "-c",
-        "config/DINO/DINO_4scale.py",
-        "--coco_path",
-        str(dataset_dir),
-        "--output_dir",
-        str(job_dir / "runs" / "dino_detr"),
-        "--num_workers",
-        str(workers),
-        "--options",
-        f"epochs={epochs}",
-        f"batch_size={batch}",
-        f"lr={lr}",
-        f"weight_decay={weight_decay}",
+        "-c", "config/DINO/DINO_4scale.py",
+        "--coco_path", str(dataset_dir),
+        "--output_dir", str(job_dir / "runs" / "dino_detr"),
+        "--num_workers", str(config.get("workers", 2)),
+        "--options", f"epochs={epochs}", f"batch_size={batch}", f"lr={lr}", f"weight_decay={weight_decay}",
+        "--amp",  # Enable mixed precision
     ]
     
     if config.get("amp", True):
@@ -350,13 +537,166 @@ def run_worker(payload: dict[str, Any]) -> None:
     )
     
     started = time.time()
+    seen_epochs = set()  # Track seen epochs for dedup
+    current_epoch = 0  # Track current epoch externally (not in log line)
+    last_completed_epoch = 0  # Track last completed epoch for evaluation metrics matching
+    accumulated_eval_metrics = {}  # Accumulate evaluation metrics for the current epoch
     
-    # Stream output
+    # Stream output and parse metrics
     for line in proc.stdout:
         line = line.strip()
         if not line:
             continue
         _log(job_id, "INFO", line)
+        
+        # Parse metrics from stdout
+        metrics = _parse_dino_detr_metrics(line)
+        eval_metrics = _parse_dino_detr_eval_metrics(line)
+        
+        if metrics:
+            # Calculate epoch from iteration count (DINO-DETR doesn't output epoch in Test: lines)
+            iteration = metrics.get("iteration")
+            total_iterations = metrics.get("total_iterations")
+            
+            # Estimate epoch based on iteration count
+            # Assuming total_iterations is the total iterations per epoch
+            if iteration and total_iterations:
+                # Calculate which epoch we're in (1-indexed)
+                epoch = ((iteration - 1) // total_iterations) + 1
+                # Update current_epoch if it increased
+                if epoch > current_epoch:
+                    # Track the last completed epoch before incrementing
+                    last_completed_epoch = current_epoch
+                    current_epoch = epoch
+            else:
+                epoch = current_epoch
+            
+            metrics["epoch"] = epoch
+            
+            # Update job record with current epoch
+            if epoch is not None:
+                _set_job(job_id, epoch=epoch)
+            
+            # Emit PROGRESS log entry → log.jsonl → SSE via stream_controller
+            if epoch is not None:
+                import psutil
+                system_res = {
+                    "ram_used_gb": round(psutil.virtual_memory().used / (1024**3), 2),
+                    "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+                }
+                now = time.time()
+                total_elapsed_s = round(now - started, 1)
+                time_per_iter = metrics.get("time_per_iter")
+                imgs_per_sec = round(batch / time_per_iter, 1) if time_per_iter and time_per_iter > 0 else None
+                
+                # Use iteration for progress within epoch if available
+                iteration = metrics.get("iteration")
+                total_iterations = metrics.get("total_iterations")
+                if iteration and total_iterations:
+                    # Calculate overall progress: (completed epochs + current epoch progress) / total epochs
+                    epoch_progress = iteration / total_iterations
+                    pct = round(((epoch - 1 + epoch_progress) / epochs) * 100, 1)
+                else:
+                    pct = round((epoch / epochs) * 100, 1) if epoch and epochs else 0.0
+                
+                # Compute avg_epoch_s and total ETA
+                # Use ETA from DINO-DETR logs if available, otherwise calculate
+                eta_s = metrics.get("eta_s")
+                if eta_s:
+                    # DINO-DETR's ETA is for the current epoch, multiply by remaining epochs for total
+                    eta_s = round(eta_s * (epochs - epoch + 1), 0)
+                else:
+                    # Calculate from elapsed time
+                    if epoch > 0 and pct > 0:
+                        avg_epoch_s = total_elapsed_s / epoch
+                        eta_s = round(avg_epoch_s * (epochs - epoch + 1), 0)
+                    else:
+                        eta_s = None
+                
+                # Get learning rate
+                lr = metrics.get("lr")
+                if lr is None:
+                    # Try to parse lr from DINO-DETR logs
+                    m = re.search(r"lr:\s*([\d.]+)", line)
+                    if m:
+                        lr = float(m.group(1))
+                
+                progress_data = {
+                    "type": "progress",
+                    "phase": "train",
+                    "epoch": f"{epoch}/{epochs}",
+                    "batch": f"{iteration}/{total_iterations}" if iteration and total_iterations else "0/0",
+                    "percent": pct,
+                    "losses": {
+                        "total": metrics.get("train_loss"),
+                        "ce": metrics.get("loss_ce"),
+                        "bbox": metrics.get("loss_bbox"),
+                        "giou": metrics.get("loss_giou"),
+                        "class_error": metrics.get("class_error"),
+                    },
+                    "val_map50": None,
+                    "val_map": None,
+                    "val_map75": None,
+                    "device": "cuda" if torch.cuda.is_available() else "cpu",
+                    "ram_gb": system_res["ram_used_gb"],
+                    "ram_total_gb": system_res["ram_total_gb"],
+                    "gpu_mem_gb": None,
+                    "total_elapsed_s": total_elapsed_s,
+                    "epoch_elapsed_s": None,
+                    "avg_epoch_s": total_elapsed_s / epoch if epoch > 0 else None,
+                    "eta_s": eta_s,
+                    "imgs_per_sec": imgs_per_sec,
+                    "lr": lr,
+                }
+                job_storage.append_job_log(
+                    job_id,
+                    "PROGRESS",
+                    f"Epoch {epoch}/{epochs} | {pct}%",
+                    progress_data,
+                )
+
+            # Emit extended_metrics.jsonl entry when epoch changes
+            if epoch not in seen_epochs:
+                seen_epochs.add(epoch)
+                
+                # Emit extended_metrics.jsonl entry for frontend charts
+                extended_data = {
+                    "epoch": epoch,
+                    "loss_bbox": metrics.get("loss_bbox"),
+                    "loss_ce": metrics.get("loss_ce"),
+                    "loss_giou": metrics.get("loss_giou"),
+                    "lr": lr,
+                }
+                _emit_extended_metrics(job_id, epoch, extended_data)
+        
+        # Accumulate evaluation metrics instead of emitting immediately
+        if eval_metrics:
+            accumulated_eval_metrics.update(eval_metrics)
+        
+        # Detect end of evaluation and emit accumulated metrics
+        # Evaluation typically ends after all IoU thresholds are reported
+        # We emit when we have all three metrics (map, map50, map75)
+        if accumulated_eval_metrics and "map" in accumulated_eval_metrics and "map50" in accumulated_eval_metrics and "map75" in accumulated_eval_metrics:
+            # Update the existing extended_metrics entry for this epoch with validation metrics
+            # Read existing extended_metrics.jsonl and update the entry
+            ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+            try:
+                updated_lines = []
+                with ext_metrics_path.open("r") as mf:
+                    for line in mf:
+                        entry = json.loads(line)
+                        if entry.get("epoch") == last_completed_epoch:
+                            # Update with validation metrics
+                            entry.update(accumulated_eval_metrics)
+                        updated_lines.append(json.dumps(entry))
+                # Write back updated content
+                with ext_metrics_path.open("w") as mf:
+                    for line in updated_lines:
+                        mf.write(line + "\n")
+            except Exception as e:
+                _log(job_id, "WARNING", f"Failed to update extended_metrics.jsonl with validation metrics: {e}")
+            # Clear accumulated metrics
+            accumulated_eval_metrics = {}
     
     proc.wait()
     
@@ -366,13 +706,33 @@ def run_worker(payload: dict[str, Any]) -> None:
     _restore_vendor_code(root, original_slconfig)
     
     if proc.returncode != 0:
+        # Check if error was due to CUDA OOM
+        # Read log.jsonl to check for OOM error
+        log_path = job_dir / "log.jsonl"
+        is_oom = False
+        if log_path.exists():
+            try:
+                with open(log_path, 'r') as f:
+                    for line in f:
+                        if "CUDA out of memory" in line:
+                            is_oom = True
+                            break
+            except Exception:
+                pass
+        
+        if is_oom:
+            error_msg = "DINO-DETR training failed: CUDA out of memory (OOM). GPU memory insufficient for the current configuration. Try reducing batch size, image size, or using a smaller model."
+            _log_fn(f"ERROR: {error_msg}")
+        else:
+            error_msg = f"DINO-DETR training failed with code {proc.returncode}"
+        
         _set_job(
             job_id,
             status="failed",
-            message=f"DINO-DETR training failed with code {proc.returncode}",
+            message=error_msg,
             completed_at=datetime.utcnow().isoformat() + "Z",
         )
-        raise RuntimeError(f"DINO-DETR training failed with code {proc.returncode}")
+        raise RuntimeError(error_msg)
     
     # Save weight
     checkpoint_path = job_dir / "runs" / "dino_detr" / "checkpoint.pth"

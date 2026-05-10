@@ -89,9 +89,16 @@ def get_job_history(job_id: str) -> list[dict]:
                 for line in f:
                     if line.strip():
                         data = json.loads(line)
-                        if data.get("epoch"):
+                        if data.get("epoch") is not None:
                             raw_rows.append(data)
 
+            # Deduplicate by epoch - keep the last entry for each epoch
+            deduped_rows = {}
+            for data in raw_rows:
+                epoch = data.get("epoch")
+                if epoch is not None:
+                    deduped_rows[epoch] = data
+            
             history = []
             prev_ts: float | None = None
             def first_present(data: dict, *keys: str):
@@ -100,7 +107,7 @@ def get_job_history(job_id: str) -> list[dict]:
                         return data.get(key)
                 return None
 
-            for data in raw_rows:
+            for data in deduped_rows.values():
                 ts = data.get("timestamp")
                 # Compute per-epoch time from timestamp diff
                 if ts is not None and prev_ts is not None:
