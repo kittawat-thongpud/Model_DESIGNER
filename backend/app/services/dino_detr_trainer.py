@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,45 @@ def repo_dir() -> Path:
     """Get DINO-DETR vendor directory."""
     from app.config import DATA_DIR
     return DATA_DIR / "vendor" / "DINO-DETR"
+
+
+def _patch_vendor_code(root: Path, job_id: str) -> None:
+    """Patch DINO-DETR vendor code to fix IndentationError in slconfig.py."""
+    slconfig_path = root / "util" / "slconfig.py"
+    if slconfig_path.exists():
+        try:
+            original_content = slconfig_path.read_text(encoding="utf-8")
+            # Fix duplicate nested try statements and remove verify parameter
+            fixed_content = re.sub(
+                r'        try:\s+try:\s+try:\s+try:\s+try:\s+text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
+                '        try:\n            text, _ = FormatCode(text, style_config=yapf_style)',
+                original_content,
+                flags=re.DOTALL
+            )
+            # Also fix the single try case with verify parameter
+            fixed_content = re.sub(
+                r'text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
+                'text, _ = FormatCode(text, style_config=yapf_style)',
+                fixed_content
+            )
+            slconfig_path.write_text(fixed_content, encoding="utf-8")
+            _log(job_id, "INFO", "Patched DINO-DETR slconfig.py IndentationError and verify parameter")
+            return original_content
+        except Exception as e:
+            _log(job_id, "WARNING", f"Failed to patch slconfig.py: {e}")
+            return None
+    return None
+
+
+def _restore_vendor_code(root: Path, original_content: str) -> None:
+    """Restore original vendor code after training."""
+    if original_content:
+        slconfig_path = root / "util" / "slconfig.py"
+        if slconfig_path.exists():
+            try:
+                slconfig_path.write_text(original_content, encoding="utf-8")
+            except Exception:
+                pass
 
 
 def run_worker(payload: dict[str, Any]) -> None:
@@ -100,6 +140,9 @@ def run_worker(payload: dict[str, Any]) -> None:
     
     _log_fn(f"DINO-DETR detection training: epochs={epochs}, batch={batch}, workers={workers}, lr={lr}")
     
+    # Patch vendor code to fix IndentationError
+    original_slconfig = _patch_vendor_code(root, job_id)
+    
     # Build DINO-DETR training command
     cmd = [
         sys.executable,
@@ -153,6 +196,9 @@ def run_worker(payload: dict[str, Any]) -> None:
     proc.wait()
     
     elapsed = time.time() - started
+    
+    # Restore original vendor code
+    _restore_vendor_code(root, original_slconfig)
     
     if proc.returncode != 0:
         _set_job(
