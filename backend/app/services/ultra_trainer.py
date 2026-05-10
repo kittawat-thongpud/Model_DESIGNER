@@ -1443,9 +1443,11 @@ def _training_worker(
             # If the plugin has a scale key, inject it into a job-local YAML copy
             # so Ultralytics picks the correct depth/width from the scales: block.
             arch_scale = arch_plugin.scale
+            import yaml as _yaml
+            yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
+            
+            # Handle scale injection
             if arch_scale:
-                import yaml as _yaml
-                yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
                 _scale_key = str(arch_scale).upper()
                 yaml_dict["scale"] = _scale_key
                 _scales = yaml_dict.get("scales")
@@ -1458,13 +1460,47 @@ def _training_worker(
                         yaml_dict["width_multiple"] = _scale_vals[1]
                         yaml_dict["max_channels"] = _scale_vals[2]
                         yaml_dict.pop("scales", None)
-                patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
-                patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
-                yaml_path = str(patched_yaml)
+            
+            # Handle HSG-DETR V2c specific parameters
+            if arch_plugin.family == "hsg_detr_v2c":
+                # Extract HSG-DETR V2c specific config options
+                loc_quality_mode = config.get("loc_quality_mode", "area")
+                alpha_u = config.get("alpha_u", 0.3)
+                beta_s = config.get("beta_s", 0.0)
+                
+                # Update decoder parameters in YAML
+                if "head" in yaml_dict:
+                    for i, layer in enumerate(yaml_dict["head"]):
+                        if isinstance(layer, list) and len(layer) >= 4:
+                            # Check if this is the RTDETRDecoderV2 layer
+                            if layer[2] == "RTDETRDecoderV2":
+                                # Update decoder parameters: [nc, hd, nq, loc_quality_mode, alpha_u, beta_s]
+                                if len(layer) >= 4 and isinstance(layer[3], list):
+                                    # Update existing parameters
+                                    params = layer[3]
+                                    if len(params) >= 3:
+                                        params[3] = loc_quality_mode  # loc_quality_mode
+                                        if len(params) >= 5:
+                                            params[4] = alpha_u  # alpha_u
+                                            params[5] = beta_s   # beta_s
+                                        else:
+                                            params.extend([alpha_u, beta_s])
+                                break
+                
+                job_storage.append_job_log(job_id, "INFO",
+                    f"HSG-DETR V2c config: loc_quality_mode={loc_quality_mode}, alpha_u={alpha_u}, beta_s={beta_s}")
+            
+            # Write patched YAML
+            patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
+            patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            yaml_path = str(patched_yaml)
+            
+            if arch_scale:
                 job_storage.append_job_log(job_id, "INFO",
                     f"Arch YAML: {base_yaml_path.name} (scale={_scale_key})")
             else:
-                yaml_path = str(base_yaml_path)
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Arch YAML: {base_yaml_path.name}")
                 job_storage.append_job_log(job_id, "INFO",
                     f"Arch YAML: {yaml_path}")
 

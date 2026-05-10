@@ -140,6 +140,14 @@ class TrainConfig(BaseModel):
     mask_ratio: int = int(_training_default("mask_ratio", 4))
     kobj: float = float(_training_default("kobj", 1.0))
 
+    # ── HSG-DETR V2c specific ─────────────────────────────────────────────────
+    # Phase 1: Localization quality proxy
+    loc_quality_mode: Literal["area", "stability", "cls_consistency"] = "area"
+    alpha_u: float = 0.3  # uncertainty weight in query selection
+    
+    # Phase 2: SGB role separation
+    beta_s: float = 0.0  # SGB saliency weight in query selection (0 = separated roles)
+
     def to_train_kwargs(self) -> dict[str, Any]:
         """Convert to dict suitable for model.train(**kwargs)."""
         # Fields that are Model Designer-specific and NOT valid Ultralytics kwargs
@@ -147,6 +155,8 @@ class TrainConfig(BaseModel):
             "record_gradients", "gradient_interval",
             "record_weights", "weight_interval",
             "sample_per_class",
+            # HSG-DETR V2c specific
+            "loc_quality_mode", "alpha_u", "beta_s",
         }
         # Note: yolo_model and use_yolo_pretrained are NOT in _INTERNAL_KEYS
         # because ultra_trainer needs them in the config dict

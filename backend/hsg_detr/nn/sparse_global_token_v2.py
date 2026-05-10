@@ -383,12 +383,23 @@ class RTDETRDecoderV2(RTDETRDecoder):
         label_noise_ratio: float = 0.5,
         box_noise_scale: float = 1.0,
         learnt_init_query: bool = True,
+        # Phase 1: Localization quality proxy options
+        loc_quality_mode: str = "area",  # "area", "stability", "cls_consistency"
+        alpha_u: float = 0.3,  # uncertainty weight
+        # Phase 2: SGB role separation
+        beta_s: float = 0.0,  # SGB saliency weight in query selection (0 = separated roles)
     ) -> None:
         super().__init__(
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
         )
         self.register_buffer("alpha", torch.tensor(0.0), persistent=True)
+        
+        # Phase 1: Store localization quality parameters
+        self.loc_quality_mode = loc_quality_mode
+        self.alpha_u = alpha_u
+        # Phase 2: Store SGB role separation parameter
+        self.beta_s = beta_s
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -467,11 +478,24 @@ class RTDETRDecoderV2(RTDETRDecoder):
             # Classification confidence: max class sigmoid score
             cls_conf = enc_outputs_scores.detach().float().sigmoid().max(-1).values  # (bs, hw)
 
-            # Localization confidence: predicted box area proxy (w·h) from enc_bbox_head
-            # enc_bbox_head is Linear(hd→4); applying to all tokens costs hw·hd·4 FLOPs
-            # which is negligible (for N-scale: 8400 × 128 × 4 ≈ 4M ops)
+            # Phase 1: Localization confidence based on mode
             box_pred = self.enc_bbox_head(features.detach().float()).sigmoid()  # (bs, hw, 4)
-            loc_conf = (box_pred[..., 2] * box_pred[..., 3]).clamp(min=1e-6)   # w·h (bs, hw)
+            
+            if self.loc_quality_mode == "area":
+                # LQ-A: Original area proxy (w·h)
+                loc_conf = (box_pred[..., 2] * box_pred[..., 3]).clamp(min=1e-6)   # w·h (bs, hw)
+            elif self.loc_quality_mode == "stability":
+                # LQ-B: Stability proxy - exp(-abs(bbox_delta).mean())
+                # bbox_delta is the raw prediction before sigmoid
+                bbox_delta = self.enc_bbox_head(features.detach().float())
+                loc_conf = torch.exp(-bbox_delta.abs().mean(-1)).clamp(min=1e-6)   # (bs, hw)
+            elif self.loc_quality_mode == "cls_consistency":
+                # LQ-C: Class * localization consistency
+                bbox_delta = self.enc_bbox_head(features.detach().float())
+                loc_stability = torch.exp(-bbox_delta.abs().mean(-1)).clamp(min=1e-6)
+                loc_conf = cls_conf * loc_stability  # (bs, hw)
+            else:
+                raise ValueError(f"Unknown loc_quality_mode: {self.loc_quality_mode}")
 
             eps = 1e-6
             # Normalize cls to [0,1]
@@ -490,10 +514,27 @@ class RTDETRDecoderV2(RTDETRDecoder):
             u_max = uncertainty.max(1, keepdim=True).values
             uncertainty_n = (uncertainty - u_min) / (u_max - u_min).clamp(min=eps)
 
-            # Combined score: high cls, low uncertainty
-            alpha = self.alpha.to(device=feats.device, dtype=cls_n.dtype)
-            alpha = alpha.clamp(0.0, float(self.ALPHA_MAX))
-            combined = (cls_n - alpha * uncertainty_n).clamp(-20.0, 20.0)
+            # Phase 1+2: Combined score with optional SGB saliency
+            alpha_u = torch.tensor(self.alpha_u, device=feats.device, dtype=cls_n.dtype)
+            alpha_u = alpha_u.clamp(0.0, float(self.ALPHA_MAX))
+            
+            # Base score: high cls, low uncertainty
+            base_score = (cls_n - alpha_u * uncertainty_n).clamp(-20.0, 20.0)
+            
+            # Phase 2: Add SGB saliency if beta_s > 0
+            if self.beta_s > 0.0:
+                # Get SGB saliency from upstream SGTokenBlockV2 (if available)
+                # For now, use a simple proxy based on feature norm
+                sgb_saliency = features.detach().norm(dim=-1)  # (bs, hw)
+                s_min = sgb_saliency.min(1, keepdim=True).values
+                s_max = sgb_saliency.max(1, keepdim=True).values
+                sgb_saliency_n = (sgb_saliency - s_min) / (s_max - s_min).clamp(min=eps)
+                
+                beta_s = torch.tensor(self.beta_s, device=feats.device, dtype=cls_n.dtype)
+                combined = (base_score + beta_s * sgb_saliency_n).clamp(-20.0, 20.0)
+            else:
+                combined = base_score
+                
             combined = torch.nan_to_num(combined, nan=-1e4)
 
             # Mask invalid anchors
@@ -532,7 +573,99 @@ class RTDETRDecoderV2(RTDETRDecoder):
         if dn_embed is not None:
             embeddings = torch.cat([dn_embed, embeddings], 1)
 
+        # Phase 0: Instrumentation metrics - log without changing behavior
+        if self.training and hasattr(self, '_log_metrics'):
+            self._log_query_metrics(
+                cls_conf=cls_conf,
+                loc_conf=loc_conf,
+                uncertainty=uncertainty,
+                combined=combined,
+                topk_ind=topk_ind,
+                enc_bboxes=enc_bboxes,
+                shapes=shapes
+            )
+
         return embeddings, refer_bbox, enc_bboxes, enc_scores
+
+    # ------------------------------------------------------------------ #
+    # Phase 0: Instrumentation Metrics
+    # ------------------------------------------------------------------ #
+
+    def _log_query_metrics(
+        self,
+        cls_conf: torch.Tensor,
+        loc_conf: torch.Tensor,
+        uncertainty: torch.Tensor,
+        combined: torch.Tensor,
+        topk_ind: torch.Tensor,
+        enc_bboxes: torch.Tensor,
+        shapes: list[list[int]],
+    ) -> None:
+        """Log query selection metrics for analysis without changing behavior."""
+        if not hasattr(self, 'metrics_buffer'):
+            self.metrics_buffer = {}
+        
+        bs, hw = cls_conf.shape
+        
+        # Basic statistics
+        self.metrics_buffer['cls_conf_mean'] = cls_conf.mean().item()
+        self.metrics_buffer['cls_conf_std'] = cls_conf.std().item()
+        self.metrics_buffer['loc_conf_mean'] = loc_conf.mean().item()
+        self.metrics_buffer['loc_conf_std'] = loc_conf.std().item()
+        self.metrics_buffer['uncertainty_mean'] = uncertainty.mean().item()
+        self.metrics_buffer['uncertainty_std'] = uncertainty.std().item()
+        
+        # Query selection quality
+        selected_cls_conf = cls_conf.gather(1, topk_ind.view(bs, -1))
+        selected_loc_conf = loc_conf.gather(1, topk_ind.view(bs, -1))
+        selected_uncertainty = uncertainty.gather(1, topk_ind.view(bs, -1))
+        
+        self.metrics_buffer['selected_cls_conf_mean'] = selected_cls_conf.mean().item()
+        self.metrics_buffer['selected_loc_conf_mean'] = selected_loc_conf.mean().item()
+        self.metrics_buffer['selected_uncertainty_mean'] = selected_uncertainty.mean().item()
+        
+        # Score distribution analysis
+        all_scores_flat = combined.view(-1)
+        selected_scores_flat = combined.gather(1, topk_ind.view(bs, -1)).view(-1)
+        
+        self.metrics_buffer['score_mean'] = all_scores_flat.mean().item()
+        self.metrics_buffer['score_std'] = all_scores_flat.std().item()
+        self.metrics_buffer['selected_score_mean'] = selected_scores_flat.mean().item()
+        self.metrics_buffer['selected_score_std'] = selected_scores_flat.std().item()
+        
+        # Query diversity (entropy of score distribution)
+        score_probs = torch.softmax(combined, dim=1)
+        entropy = -(score_probs * torch.log(score_probs + 1e-8)).sum(dim=1)
+        self.metrics_buffer['score_entropy_mean'] = entropy.mean().item()
+        
+        # Selected query IoU statistics (if enc_bboxes available)
+        if enc_bboxes is not None:
+            # Simple box quality metric: area and aspect ratio
+            selected_boxes = enc_bboxes.view(bs, self.num_queries, 4)
+            box_areas = (selected_boxes[..., 2] * selected_boxes[..., 3]).mean().item()
+            self.metrics_buffer['selected_box_area_mean'] = box_areas
+        
+        # Phase 2: SGB role separation metrics
+        self.metrics_buffer['beta_s'] = getattr(self, 'beta_s', 0.0)
+        self.metrics_buffer['loc_quality_mode'] = getattr(self, 'loc_quality_mode', 'area')
+        self.metrics_buffer['alpha_u'] = getattr(self, 'alpha_u', 0.3)
+
+    def get_metrics(self) -> dict[str, float]:
+        """Get accumulated metrics and clear buffer."""
+        if not hasattr(self, 'metrics_buffer'):
+            return {}
+        
+        metrics = self.metrics_buffer.copy()
+        self.metrics_buffer.clear()
+        return metrics
+
+    def enable_metrics_logging(self) -> None:
+        """Enable metrics logging during training."""
+        self._log_metrics = True
+
+    def disable_metrics_logging(self) -> None:
+        """Disable metrics logging during training."""
+        self._log_metrics = False
 
     # ------------------------------------------------------------------ #
     # T1-A Look-Forward-Twice decoder

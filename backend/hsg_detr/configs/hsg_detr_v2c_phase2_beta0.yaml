@@ -1,30 +1,11 @@
 # =============================================================================
-# HSG-DETR-N V2c — Channel-Selective Sparse Global Token Block
+# HSG-DETR-N V2c Phase 2: SGB Role Separation - Beta=0 (Separated Roles)
 # =============================================================================
-# Core contribution:
-#   SGTokenBlock selects salient tokens spatially (L2 saliency → top-k)
-#   and performs global self-attention on them. V2c adds a lightweight
-#   squeeze-excitation gate on the attention output:
-#
-#     delta_se = delta × sigmoid(FC2(ReLU(FC1(avg(delta)))))
-#     out = x + gamma × delta_se
-#
-#   This channel-selective gate focuses gradient onto informative channels,
-#   allowing gamma to grow beyond the ~0.02 N-scale ceiling observed in V2/V2b.
-#
-# Paper narrative:
-#   "We propose Channel-Selective Sparse Global Attention (CS-SGA): sparse
-#   spatial self-attention on salient tokens, followed by a squeeze-excitation
-#   gate that selectively amplifies informative channels in the residual path."
-#
-# Parameters added per SGTokenBlock:
-#   se_fc1: C × (C//4)  |  se_fc2: (C//4) × C  |  bias-free
-#   P5: 1024×256 + 256×1024 = 524,288  ← still tiny vs Q/K/V (3×1024²)
-#   P4:  512×128 + 128×512  = 131,072
-#   P3:  256×64  + 64×256   =  32,768
-#
-# All other hyperparameters identical to V2b for direct comparison.
+# Phase 2 experiment: Test separated SGB roles
+# beta_s: 0.0 = No SGB saliency in query selection
+# Expected: Pure localization-aware query selection, SGB only for feature enhancement
 # =============================================================================
+
 nc: 80
 
 scales:
@@ -59,5 +40,5 @@ head:
   - [-1, 1, Conv, [512, 3, 2]]                                               # 21
   - [[-1, 9], 1, Concat, [1]]                                                # 22
   - [-1, 3, C2f, [1024, False]]                                              # 23  P5-final
-  - [[17, 20, 23], 1, RTDETRDecoderV2, [nc, 128, 100, "area", 0.3, 0.0]]         # 24
+  - [[17, 20, 23], 1, RTDETRDecoderV2, [nc, 128, 100, "area", 0.3, 0.0]]     # 24
   # Parameters: nc, hidden_dim, num_queries, loc_quality_mode, alpha_u, beta_s
