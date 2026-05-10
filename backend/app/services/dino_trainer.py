@@ -290,9 +290,11 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
             return
         
         # Create k-NN evaluation imagefolder with train/val subfolders using symlinks
+        # ImageFolder requires class subfolders (e.g., train/class1/*.jpg, train/class2/*.jpg)
+        # Since DINO is self-supervised, we create a single dummy class folder
         knn_imagefolder = imagefolder / "knn_eval"
-        train_dir = knn_imagefolder / "train"
-        val_dir = knn_imagefolder / "val"
+        train_dir = knn_imagefolder / "train" / "class0"
+        val_dir = knn_imagefolder / "val" / "class0"
         train_dir.mkdir(parents=True, exist_ok=True)
         val_dir.mkdir(parents=True, exist_ok=True)
         
