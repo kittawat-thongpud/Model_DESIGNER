@@ -437,21 +437,38 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
                 job = job_storage.load_job(job_id)
                 if job:
                     job["knn_accuracy"] = knn_accuracy
+                    
+                    # Add to history or create history array
+                    history = list(job.get("history") or [])
+                    if not history:
+                        # Create history entry for final epoch
+                        last_epoch = job.get("epoch", 0)
+                        history.append({
+                            "epoch": last_epoch,
+                            "loss": job.get("loss"),
+                            "lr": job.get("lr"),
+                            "knn_accuracy": knn_accuracy,
+                        })
+                    else:
+                        # Update last history entry
+                        history[-1]["knn_accuracy"] = knn_accuracy
+                    
+                    job["history"] = history
                     job_storage.save_job(job)
                     
-                    history = list(job.get("history") or [])
-                    if history:
-                        history[-1]["knn_accuracy"] = knn_accuracy
-                        knn_entry = {
-                            "epoch": last_epoch,
-                            "timestamp": time.time(),
-                            "knn_accuracy": knn_accuracy,
-                        }
-                        try:
-                            with ext_metrics_path.open("a") as mf:
-                                mf.write(json.dumps(knn_entry) + "\n")
-                        except Exception as e:
-                            job_storage.append_job_log(job_id, "WARNING", f"Failed to write k-NN accuracy to extended_metrics.jsonl: {e}")
+                    # Add to extended_metrics.jsonl
+                    ext_metrics_path = out_dir.parent / "extended_metrics.jsonl"
+                    last_epoch = history[-1].get("epoch") if history else 0
+                    knn_entry = {
+                        "epoch": last_epoch,
+                        "timestamp": time.time(),
+                        "knn_accuracy": knn_accuracy,
+                    }
+                    try:
+                        with ext_metrics_path.open("a") as mf:
+                            mf.write(json.dumps(knn_entry) + "\n")
+                    except Exception as e:
+                        job_storage.append_job_log(job_id, "WARNING", f"Failed to write k-NN accuracy to extended_metrics.jsonl: {e}")
                     
                     # Publish update
                     event_bus.publish_sync(job_channel(job_id), {"type": "job_update", "job_id": job_id, "knn_accuracy": knn_accuracy})
