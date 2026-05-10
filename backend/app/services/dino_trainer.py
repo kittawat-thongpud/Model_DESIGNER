@@ -268,16 +268,29 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
     Note: k-NN evaluation is only compatible with DINO self-supervised checkpoints.
     DINO-DETR (detection) checkpoints have incompatible architecture and format.
     """
+    # Load job to get partition configs
+    job = job_storage.load_job(job_id)
+    if not job:
+        job_storage.append_job_log(job_id, "WARNING", "Job not found, skipping k-NN evaluation")
+        return
+    
     try:
         job_storage.append_job_log(job_id, "INFO", "Starting k-NN evaluation for validation metrics...")
         
-        # Patch torch.load to fix PyTorch 2.6 weights_only issue
-        import torch
-        original_torch_load = torch.load
-        def patched_torch_load(f, *args, **kwargs):
-            kwargs.setdefault('weights_only', False)
-            return original_torch_load(f, *args, **kwargs)
-        torch.load = patched_torch_load
+        # Patch vendor code to fix PyTorch 2.6 weights_only issue
+        utils_path = root / "utils.py"
+        if utils_path.exists():
+            try:
+                original_content = utils_path.read_text(encoding="utf-8")
+                # Add weights_only=False to torch.load call
+                patched_content = original_content.replace(
+                    'torch.load(pretrained_weights, map_location="cpu")',
+                    'torch.load(pretrained_weights, map_location="cpu", weights_only=False)'
+                )
+                utils_path.write_text(patched_content, encoding="utf-8")
+                job_storage.append_job_log(job_id, "INFO", "Patched utils.py to fix PyTorch weights_only issue")
+            except Exception as e:
+                job_storage.append_job_log(job_id, "WARNING", f"Failed to patch utils.py: {e}")
         
         # Check if dataset has partition TXT files (train/val) for k-NN evaluation
         # Instead of checking imagefolder/train and imagefolder/val, we check partition TXT files
@@ -452,12 +465,12 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
     except Exception as e:
         job_storage.append_job_log(job_id, "WARNING", f"k-NN evaluation error: {str(e)}")
     finally:
-        # Restore original torch.load
-        try:
-            import torch
-            torch.load = original_torch_load
-        except Exception:
-            pass
+        # Restore original utils.py if patched
+        if utils_path.exists() and 'original_content' in locals():
+            try:
+                utils_path.write_text(original_content, encoding="utf-8")
+            except Exception:
+                pass
 
 
 def _checkpoint_candidates(out_dir: Path) -> list[Path]:
