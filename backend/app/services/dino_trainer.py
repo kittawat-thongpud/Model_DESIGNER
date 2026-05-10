@@ -379,7 +379,7 @@ def _save_weight(job_id: str, out_dir: Path) -> str | None:
         dataset=cfg.get("dataset_name") or cfg.get("data", ""),
         epochs_trained=job.get("total_epochs", 0),
         final_accuracy=job.get("knn_accuracy"),
-        checkpoint_path=str(checkpoint),
+        final_loss=None,  # DINO doesn't track validation loss
         weight_id=weight_id,
     )
     
