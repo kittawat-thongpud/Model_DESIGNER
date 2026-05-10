@@ -262,6 +262,147 @@ def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
     torch.save({"student": student, "teacher": teacher, "epoch": 0}, out_path)
 
 
+def _convert_yolo_to_coco(job_id: str, dataset_name: str) -> _Path:
+    """Convert YOLO annotations to COCO format for DINO-DETR validation.
+    
+    Creates COCO annotations in /tmp/{dataset_name}_coco/ without modifying original data.
+    Returns path to COCO annotations directory.
+    """
+    import json
+    from pathlib import Path as _Path
+    from app.config import DATASETS_DIR
+    
+    job = job_storage.load_job(job_id)
+    if not job:
+        raise ValueError(f"Job {job_id} not found")
+    
+    dataset_dir = DATASETS_DIR / dataset_name
+    coco_dir = _Path(f"/tmp/{dataset_name}_coco")
+    coco_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create annotations directory
+    annotations_dir = coco_dir / "annotations"
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Read class names from data.yaml
+    data_yaml = dataset_dir / "data.yaml"
+    if data_yaml.exists():
+        import yaml as _yaml
+        data = _yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+        class_names = data.get("names", {})
+        if isinstance(class_names, dict):
+            class_names = [class_names.get(i, f"class_{i}") for i in range(len(class_names))]
+        elif isinstance(class_names, list):
+            class_names = class_names
+        else:
+            class_names = ["Car", "Pedestrian", "Cyclist", "Truck", "Van", "Tram", "Misc"]
+    else:
+        class_names = ["Car", "Pedestrian", "Cyclist", "Truck", "Van", "Tram", "Misc"]
+    
+    # Process train and val splits
+    for split in ["train", "val"]:
+        # Read image paths from split file
+        split_file = dataset_dir / f"{split}.txt"
+        if not split_file.exists():
+            continue
+        
+        with split_file.open("r") as f:
+            image_paths = [line.strip() for line in f if line.strip()]
+        
+        # Create COCO annotation structure
+        coco_data = {
+            "images": [],
+            "annotations": [],
+            "categories": [{"id": i, "name": name} for i, name in enumerate(class_names)]
+        }
+        
+        annotation_id = 0
+        for img_id, image_path in enumerate(image_paths):
+            # Resolve image path (relative or absolute)
+            if not _Path(image_path).is_absolute():
+                image_path = dataset_dir / image_path
+            
+            image_path = _Path(image_path)
+            if not image_path.exists():
+                continue
+            
+            # Get image dimensions
+            try:
+                from PIL import Image
+                with Image.open(image_path) as img:
+                    width, height = img.size
+            except Exception:
+                continue
+            
+            # Add image to COCO data
+            image_filename = image_path.name
+            coco_data["images"].append({
+                "id": img_id,
+                "file_name": image_filename,
+                "width": width,
+                "height": height,
+            })
+            
+            # Read YOLO annotations
+            label_path = dataset_dir / "labels" / split / f"{image_path.stem}.txt"
+            if not label_path.exists():
+                continue
+            
+            with label_path.open("r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    
+                    class_id = int(parts[0])
+                    x_center = float(parts[1])
+                    y_center = float(parts[2])
+                    box_width = float(parts[3])
+                    box_height = float(parts[4])
+                    
+                    # Convert YOLO to COCO format (x_min, y_min, width, height)
+                    x_min = (x_center - box_width / 2) * width
+                    y_min = (y_center - box_height / 2) * height
+                    abs_width = box_width * width
+                    abs_height = box_height * height
+                    
+                    coco_data["annotations"].append({
+                        "id": annotation_id,
+                        "image_id": img_id,
+                        "category_id": class_id,
+                        "bbox": [x_min, y_min, abs_width, abs_height],
+                        "area": abs_width * abs_height,
+                        "iscrowd": 0,
+                    })
+                    annotation_id += 1
+        
+        # Write COCO annotation file
+        coco_file = annotations_dir / f"instances_{split}2017.json"
+        with coco_file.open("w") as f:
+            json.dump(coco_data, f)
+        
+        # Create image symlink
+        images_split_dir = coco_dir / f"{split}2017"
+        images_split_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Symlink images from original dataset
+        original_images_dir = dataset_dir / "images" / split
+        if original_images_dir.exists():
+            for img_path in original_images_dir.glob("*"):
+                if img_path.is_file():
+                    try:
+                        symlink = images_split_dir / img_path.name
+                        if symlink.exists():
+                            symlink.unlink()
+                        symlink.symlink_to(img_path)
+                    except Exception:
+                        # Copy if symlink fails
+                        import shutil
+                        shutil.copy2(img_path, images_split_dir / img_path.name)
+    
+    return coco_dir
+
+
 def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: str, split: str = "val") -> None:
     """Run DINO-DETR validation manually by patching vendor code and running eval."""
     import os
@@ -275,6 +416,35 @@ def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: s
         return
 
     job_storage.append_job_log(job_id, "INFO", "Starting DINO-DETR validation...")
+
+    # Convert YOLO annotations to COCO format
+    job_storage.append_job_log(job_id, "INFO", "Converting YOLO annotations to COCO format...")
+    coco_dir = _convert_yolo_to_coco(job_id, dataset_name)
+    job_storage.append_job_log(job_id, "INFO", f"COCO annotations created at {coco_dir}")
+
+    # Convert checkpoint format for DINO-DETR main.py
+    # DINO training saves checkpoints with 'student' key, but DINO-DETR expects 'model' key
+    job_storage.append_job_log(job_id, "INFO", "Converting checkpoint format for DINO-DETR validation...")
+    checkpoint_path = checkpoint
+    converted_checkpoint_path = checkpoint_path.parent / "converted_for_eval.pth"
+    try:
+        import torch
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "student" in ckpt and "model" not in ckpt:
+            # Convert DINO format to DINO-DETR format
+            converted_ckpt = {"model": ckpt["student"], "epoch": ckpt.get("epoch", 0)}
+            torch.save(converted_ckpt, converted_checkpoint_path)
+            checkpoint = converted_checkpoint_path
+            job_storage.append_job_log(job_id, "INFO", "Checkpoint converted successfully")
+        elif "model" in ckpt:
+            # Already in correct format
+            job_storage.append_job_log(job_id, "INFO", "Checkpoint already in correct format")
+        else:
+            job_storage.append_job_log(job_id, "WARNING", f"Unknown checkpoint format with keys: {list(ckpt.keys())}")
+            return
+    except Exception as e:
+        job_storage.append_job_log(job_id, "WARNING", f"Failed to convert checkpoint: {e}")
+        return
 
     # Patch IndentationError in slconfig.py
     dino_detr_dir = repo_dir()
@@ -300,23 +470,6 @@ def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: s
         except Exception as e:
             job_storage.append_job_log(job_id, "WARNING", f"Failed to patch slconfig.py: {e}")
 
-    # Prepare dataset YAML
-    from . import dataset_yaml
-    partition_configs = job.get("partition_configs")
-    if not partition_configs:
-        job_storage.append_job_log(job_id, "INFO", "No partition configs, skipping validation")
-        return
-
-    # Generate data.yaml for validation
-    data_yaml_path = _Path(f"/tmp/{job_id}_data.yaml")
-    try:
-        # Use dataset_yaml.generate_data_yaml to create data.yaml
-        data_yaml_content = dataset_yaml.generate_data_yaml(dataset_name, partition_configs=partition_configs)
-        data_yaml_path.write_text(data_yaml_content, encoding="utf-8")
-    except Exception as e:
-        job_storage.append_job_log(job_id, "WARNING", f"Failed to generate data.yaml: {e}")
-        return
-
     # Build eval command
     cmd = [
         sys.executable,
@@ -324,7 +477,7 @@ def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: s
         "-c",
         "config/DINO/DINO_4scale.py",
         "--coco_path",
-        str(data_yaml_path.parent),
+        str(coco_dir),
         "--output_dir",
         str(_Path(f"/tmp/{job_id}_eval")),
         "--eval",
