@@ -477,6 +477,8 @@ class RTDETRDecoderV2(RTDETRDecoder):
                 if len(args) >= 20:
                     beta_s = args[19]
         
+        # Debug: log values before calling parent
+        print(f"[RTDETRDecoderV2] nc={nc} (type={type(nc)}), ch={ch}, hd={hd}, nq={nq}, nh={nh}")
         super().__init__(
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
