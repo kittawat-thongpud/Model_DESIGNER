@@ -256,14 +256,81 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
     try:
         job_storage.append_job_log(job_id, "INFO", "Starting k-NN evaluation for validation metrics...")
         
-        # Check if dataset has train/val split (required for k-NN evaluation)
-        train_path = imagefolder / "train"
-        val_path = imagefolder / "val"
-        
-        if not (train_path.exists() and val_path.exists()):
-            job_storage.append_job_log(job_id, "INFO", "Dataset does not have train/val split with labels, skipping k-NN evaluation")
-            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation requires labeled dataset with train/val split")
+        # Check if dataset has partition TXT files (train/val) for k-NN evaluation
+        # Instead of checking imagefolder/train and imagefolder/val, we check partition TXT files
+        job = job_storage.load_job(job_id)
+        if not job:
             return
+        
+        dataset_name = job.get("dataset_name") or job.get("config", {}).get("data", "")
+        partition_configs = job.get("partition_configs")
+        
+        if not partition_configs:
+            job_storage.append_job_log(job_id, "INFO", "Dataset does not have partition configs, skipping k-NN evaluation")
+            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation requires train/val partition")
+            return
+        
+        # Generate partition TXT files to get paths
+        from . import dataset_yaml
+        txt_splits = dataset_yaml.generate_partition_txt_splits(dataset_name, partition_configs)
+        
+        if not txt_splits or ("train" not in txt_splits and "val" not in txt_splits):
+            job_storage.append_job_log(job_id, "INFO", "Dataset does not have train/val partition, skipping k-NN evaluation")
+            return
+        
+        # Create k-NN evaluation imagefolder with train/val subfolders using symlinks
+        knn_imagefolder = imagefolder / "knn_eval"
+        train_dir = knn_imagefolder / "train"
+        val_dir = knn_imagefolder / "val"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        val_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create symlinks for train images
+        if "train" in txt_splits:
+            train_txt = txt_splits["train"]
+            if train_txt.exists():
+                seen: set[str] = set()
+                for idx, line in enumerate(train_txt.read_text(encoding="utf-8").splitlines()):
+                    if not line.strip():
+                        continue
+                    image_path = Path(line.strip())
+                    if not image_path.exists():
+                        continue
+                    # Use original filename or indexed name
+                    suffix = image_path.suffix.lower() or ".jpg"
+                    name = f"{idx:08d}_{image_path.stem}{suffix}"
+                    while name in seen:
+                        name = f"{idx:08d}_{uuid.uuid4().hex[:8]}{suffix}"
+                    seen.add(name)
+                    _safe_link_or_copy(image_path.resolve(), train_dir / name)
+        
+        # Create symlinks for val images
+        if "val" in txt_splits:
+            val_txt = txt_splits["val"]
+            if val_txt.exists():
+                seen: set[str] = set()
+                for idx, line in enumerate(val_txt.read_text(encoding="utf-8").splitlines()):
+                    if not line.strip():
+                        continue
+                    image_path = Path(line.strip())
+                    if not image_path.exists():
+                        continue
+                    suffix = image_path.suffix.lower() or ".jpg"
+                    name = f"{idx:08d}_{image_path.stem}{suffix}"
+                    while name in seen:
+                        name = f"{idx:08d}_{uuid.uuid4().hex[:8]}{suffix}"
+                    seen.add(name)
+                    _safe_link_or_copy(image_path.resolve(), val_dir / name)
+        
+        # Check if we have both train and val images
+        train_count = len(list(train_dir.iterdir())) if train_dir.exists() else 0
+        val_count = len(list(val_dir.iterdir())) if val_dir.exists() else 0
+        
+        if train_count == 0 or val_count == 0:
+            job_storage.append_job_log(job_id, "INFO", f"Dataset has insufficient train/val images (train={train_count}, val={val_count}), skipping k-NN evaluation")
+            return
+        
+        job_storage.append_job_log(job_id, "INFO", f"k-NN evaluation imagefolder: train={train_count}, val={val_count} images (using symlinks)")
         
         # Build eval_knn.py command
         cmd = [
@@ -280,7 +347,7 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
             "--num_workers",
             str(workers),
             "--data_path",
-            str(imagefolder),
+            str(knn_imagefolder),
         ]
         
         env = os.environ.copy()
@@ -339,6 +406,22 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
                     job["history"] = history
                     job_storage.save_job(job)
                     job_storage.append_job_log(job_id, "INFO", f"k-NN accuracy: {knn_accuracy:.4f}")
+                    
+                    # Add k-NN accuracy to extended_metrics.jsonl
+                    from app.config import JOBS_DIR
+                    ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+                    try:
+                        # Get the last epoch from history
+                        last_epoch = history[-1].get("epoch") if history else 0
+                        knn_entry = {
+                            "epoch": last_epoch,
+                            "timestamp": time.time(),
+                            "knn_accuracy": knn_accuracy,
+                        }
+                        with ext_metrics_path.open("a") as mf:
+                            mf.write(json.dumps(knn_entry) + "\n")
+                    except Exception as e:
+                        job_storage.append_job_log(job_id, "WARNING", f"Failed to write k-NN accuracy to extended_metrics.jsonl: {e}")
                     
                     # Publish update
                     event_bus.publish_sync(job_channel(job_id), {"type": "job_update", "job_id": job_id, "knn_accuracy": knn_accuracy})
@@ -404,8 +487,8 @@ def _append_history_from_log(job_id: str, out_dir: Path) -> None:
         history.append(
             {
                 "epoch": epoch,
-                "loss": row.get("train_loss"),
-                "lr": row.get("train_lr"),
+                "loss": row.get("train_loss"),  # Map train_loss → loss for frontend
+                "lr": row.get("train_lr"),  # Map train_lr → lr for frontend
                 "weight_decay": row.get("train_wd"),
                 "timestamp": time.time(),
                 "metrics": row,
@@ -992,7 +1075,7 @@ def run_worker(payload: dict[str, Any]) -> None:
                 )
             
             # Write end-of-epoch row to extended_metrics.jsonl (Ultralytics-compatible field names)
-            # Only write once per epoch (when last batch is seen)
+            # Write in parallel (like RT-DETRv2) - write as soon as we see end of epoch
             if epoch is not None and total_iterations and iteration == total_iterations and epoch not in seen_epochs:
                 seen_epochs.add(epoch)
                 now_ts = time.time()
