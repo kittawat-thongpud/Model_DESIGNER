@@ -46,19 +46,49 @@ def _patch_vendor_code(root: Path, job_id: str) -> None:
     if slconfig_path.exists():
         try:
             original_content = slconfig_path.read_text(encoding="utf-8")
-            # Fix duplicate nested try statements and remove verify parameter
+            # Fix the specific IndentationError pattern: multiple nested try statements without indentation
+            # Pattern to match: "try:" repeated multiple times on consecutive lines without indentation
+            lines = original_content.split('\n')
+            fixed_lines = []
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                # Check if this is a sequence of "try:" statements
+                if line.strip() == 'try:':
+                    # Count consecutive "try:" statements
+                    try_count = 0
+                    j = i
+                    while j < len(lines) and lines[j].strip() == 'try:':
+                        try_count += 1
+                        j += 1
+                    # If we have multiple "try:" statements, keep only the first one with proper indentation
+                    if try_count > 1:
+                        # Keep the first "try:" with proper indentation
+                        fixed_lines.append(lines[i])
+                        i += 1
+                        # Skip the duplicate "try:" statements
+                        i += (try_count - 1)
+                        # Add the actual try block content (should be indented)
+                        while i < len(lines) and lines[i].strip() == '':
+                            fixed_lines.append(lines[i])
+                            i += 1
+                        # The next line should be the actual content (indented)
+                        if i < len(lines):
+                            fixed_lines.append(lines[i])
+                            i += 1
+                        continue
+                fixed_lines.append(line)
+                i += 1
+            
+            fixed_content = '\n'.join(fixed_lines)
+            
+            # Also remove verify parameter from FormatCode calls
             fixed_content = re.sub(
-                r'        try:\s+try:\s+try:\s+try:\s+try:\s+text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
-                '        try:\n            text, _ = FormatCode(text, style_config=yapf_style)',
-                original_content,
-                flags=re.DOTALL
-            )
-            # Also fix the single try case with verify parameter
-            fixed_content = re.sub(
-                r'text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
-                'text, _ = FormatCode(text, style_config=yapf_style)',
+                r'FormatCode\([^,]+,\s*style_config=yapf_style,\s*verify=True\)',
+                'FormatCode(text, style_config=yapf_style)',
                 fixed_content
             )
+            
             slconfig_path.write_text(fixed_content, encoding="utf-8")
             _log(job_id, "INFO", "Patched DINO-DETR slconfig.py IndentationError and verify parameter")
             return original_content
