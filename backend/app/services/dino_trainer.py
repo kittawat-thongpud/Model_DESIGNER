@@ -263,16 +263,30 @@ def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
 
 
 def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: Path, spec: dict, batch: int, workers: int, out_dir: Path) -> None:
-    """Run k-NN evaluation on DINO checkpoint to provide validation metrics."""
+    """Run k-NN evaluation on DINO checkpoint to provide validation metrics.
+    
+    Note: k-NN evaluation is only compatible with DINO self-supervised checkpoints.
+    DINO-DETR (detection) checkpoints have incompatible architecture and format.
+    """
     try:
         job_storage.append_job_log(job_id, "INFO", "Starting k-NN evaluation for validation metrics...")
         
-        # Check if dataset has partition TXT files (train/val) for k-NN evaluation
-        # Instead of checking imagefolder/train and imagefolder/val, we check partition TXT files
+        # Check if this is DINO-DETR (detection) or DINO self-supervised
+        # DINO-DETR checkpoints are incompatible with DINO self-supervised eval_knn.py
         job = job_storage.load_job(job_id)
         if not job:
             return
         
+        model_arch = job.get("config", {}).get("model_arch", "")
+        if model_arch.startswith("dino_"):
+            # This is DINO-DETR (detection), skip k-NN evaluation
+            job_storage.append_job_log(job_id, "INFO", "DINO-DETR (detection) checkpoints are incompatible with k-NN evaluation")
+            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation requires DINO self-supervised checkpoints")
+            job_storage.append_job_log(job_id, "INFO", "Skipping k-NN evaluation for DINO-DETR")
+            return
+        
+        # Check if dataset has partition TXT files (train/val) for k-NN evaluation
+        # Instead of checking imagefolder/train and imagefolder/val, we check partition TXT files
         dataset_name = job.get("dataset_name") or job.get("config", {}).get("data", "")
         partition_configs = job.get("partition_configs")
         
