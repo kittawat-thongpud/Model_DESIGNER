@@ -993,6 +993,22 @@ def _update_job_metrics(job_id: str, metrics: dict[str, Any], batch_size: int, s
     time_per_iter = metrics.get("time_per_iter")
     data_time = metrics.get("data_time")
     max_mem_mb = metrics.get("max_mem_mb")
+    
+    # Ultralytics-compatible metric names
+    # Map DINO metrics to Ultralytics field names
+    ultralytics_metrics = {
+        "epoch": epoch,
+        "train_loss": train_loss,  # loss
+        "train_lr": train_lr,  # lr
+        "weight_decay": weight_decay,
+        "time_per_iter": time_per_iter,
+        "data_time": data_time,
+        "max_mem_mb": max_mem_mb,
+        # Detection metrics (will be populated during validation)
+        "mAP50": job.get("best_mAP50"),
+        "mAP50_95": job.get("best_mAP50_95"),
+    }
+    
     eta = metrics.get("eta")
     
     # Calculate derived metrics
