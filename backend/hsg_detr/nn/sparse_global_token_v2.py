@@ -366,29 +366,76 @@ class RTDETRDecoderV2(RTDETRDecoder):
     REFINE_EPS: float = 1e-3
     BBOX_DELTA_LIMIT: float = 4.0
 
-    def __init__(
-        self,
-        nc: int = 80,
-        ch: tuple = (512, 1024, 2048),
-        hd: int = 256,
-        nq: int = 300,
-        ndp: int = 4,
-        nh: int = 8,
-        ndl: int = 6,
-        d_ffn: int = 1024,
-        dropout: float = 0.0,
-        act: nn.Module = nn.ReLU(),
-        eval_idx: int = -1,
-        nd: int = 100,
-        label_noise_ratio: float = 0.5,
-        box_noise_scale: float = 1.0,
-        learnt_init_query: bool = True,
-        # Phase 1: Localization quality proxy options
-        loc_quality_mode: str = "area",  # "area", "stability", "cls_consistency"
-        alpha_u: float = 0.3,  # uncertainty weight
-        # Phase 2: SGB role separation
-        beta_s: float = 0.0,  # SGB saliency weight in query selection (0 = separated roles)
-    ) -> None:
+    def __init__(self, *args) -> None:
+        # Handle variable arguments from YAML parse_model (list unpacking fix)
+        # Expected: nc, ch(list/tuple), hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
+        #           eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
+        #           loc_quality_mode, alpha_u, beta_s
+        
+        # Set defaults
+        nc = 80
+        ch = (256, 512, 1024)  # N-scale channels
+        hd = 256
+        nq = 100
+        ndp = 4
+        nh = 8
+        ndl = 6
+        d_ffn = 1024
+        dropout = 0.0
+        act = nn.ReLU()
+        eval_idx = -1
+        nd = 100
+        label_noise_ratio = 0.5
+        box_noise_scale = 1.0
+        learnt_init_query = True
+        loc_quality_mode = "area"
+        alpha_u = 0.3
+        beta_s = 0.0
+        
+        # Parse args (handle both flat args and nested list for ch)
+        if len(args) >= 1:
+            nc = args[0]
+        if len(args) >= 2:
+            # ch can be a list/tuple or individual values
+            ch_arg = args[1]
+            if isinstance(ch_arg, (list, tuple)) and len(ch_arg) == 3:
+                ch = tuple(ch_arg)
+            else:
+                # ch values spread across multiple args (list unpacking case)
+                ch = (ch_arg, args[2], args[3]) if len(args) >= 4 else (256, 512, 1024)
+        if len(args) >= 5:
+            hd = args[4]
+        if len(args) >= 6:
+            nq = args[5]
+        if len(args) >= 7:
+            ndp = args[6]
+        if len(args) >= 8:
+            nh = args[7]
+        if len(args) >= 9:
+            ndl = args[8]
+        if len(args) >= 10:
+            d_ffn = args[9]
+        if len(args) >= 11:
+            dropout = args[10]
+        if len(args) >= 12:
+            act = args[11]
+        if len(args) >= 13:
+            eval_idx = args[12]
+        if len(args) >= 14:
+            nd = args[13]
+        if len(args) >= 15:
+            label_noise_ratio = args[14]
+        if len(args) >= 16:
+            box_noise_scale = args[15]
+        if len(args) >= 17:
+            learnt_init_query = args[16]
+        if len(args) >= 18:
+            loc_quality_mode = args[17]
+        if len(args) >= 19:
+            alpha_u = args[18]
+        if len(args) >= 20:
+            beta_s = args[19]
+        
         super().__init__(
             nc, ch, hd, nq, ndp, nh, ndl, d_ffn, dropout, act,
             eval_idx, nd, label_noise_ratio, box_noise_scale, learnt_init_query,
