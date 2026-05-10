@@ -1134,6 +1134,27 @@ def run_worker(payload: dict[str, Any]) -> None:
                         mf.write(json.dumps(epoch_data) + "\n")
                 except Exception:
                     pass
+                
+                # Emit metrics to log.jsonl for frontend (type: hsg_detr_metrics)
+                # Use HsgDetrMetricsEntry-compatible field names
+                hsg_metrics: dict[str, Any] = {
+                    "type": "hsg_detr_metrics",
+                    "epoch": epoch,
+                    "timestamp": now_ts,
+                    # Map DINO metrics to HsgDetrMetricsEntry field names
+                    "decoder/alpha": metrics.get("train_loss_avg"),  # box_loss → decoder/alpha
+                    "decoder/num_queries": metrics.get("train_lr"),  # lr → decoder/num_queries
+                    "grad/backbone_norm": metrics.get("weight_decay"),  # weight_decay → grad/backbone_norm
+                    "grad/neck_norm": _avg_epoch_s,  # epoch_time → grad/neck_norm
+                    "grad/sgb_norm": metrics.get("max_mem_mb"),  # gpu_memory_mb → grad/sgb_norm
+                }
+                hsg_metrics = {k: v for k, v in hsg_metrics.items() if v is not None}
+                job_storage.append_job_log(
+                    job_id,
+                    "METRICS",
+                    "DINO training metrics",
+                    hsg_metrics,
+                )
             
             # Track best checkpoint
             train_loss = metrics.get("train_loss")
