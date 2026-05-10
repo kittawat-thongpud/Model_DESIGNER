@@ -40,6 +40,124 @@ def repo_dir() -> Path:
     return DATA_DIR / "vendor" / "DINO-DETR"
 
 
+def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
+    """Convert YOLO annotations to COCO format for DINO-DETR training."""
+    _log(job_id, "INFO", "Converting YOLO annotations to COCO format for DINO-DETR")
+    
+    # Create annotations directory
+    annotations_dir = dataset_dir / "annotations"
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if COCO annotations already exist
+    train_ann = annotations_dir / "instances_train2017.json"
+    val_ann = annotations_dir / "instances_val2017.json"
+    
+    if train_ann.exists() and val_ann.exists():
+        _log(job_id, "INFO", "COCO annotations already exist, skipping conversion")
+        return annotations_dir
+    
+    # Load YOLO annotations
+    train_labels = dataset_dir / "train" / "labels"
+    val_labels = dataset_dir / "val" / "labels"
+    
+    # Simple conversion - create minimal COCO annotations
+    # This is a basic implementation that may need refinement
+    
+    def create_coco_annotation(labels_dir: Path, images_dir: Path, output_path: Path, split_name: str):
+        """Create COCO annotation file from YOLO labels."""
+        coco_output = {
+            "images": [],
+            "annotations": [],
+            "categories": [
+                {"id": 0, "name": "Car", "supercategory": "vehicle"},
+                {"id": 1, "name": "Pedestrian", "supercategory": "person"},
+                {"id": 2, "name": "Cyclist", "supercategory": "person"},
+            ]
+        }
+        
+        annotation_id = 0
+        image_id = 0
+        
+        if not labels_dir.exists():
+            _log(job_id, "WARNING", f"Labels directory not found: {labels_dir}")
+            return
+        
+        for label_file in labels_dir.glob("*.txt"):
+            # Get corresponding image
+            image_file = label_file.stem
+            image_path = images_dir / f"{image_file}.jpg"
+            if not image_path.exists():
+                image_path = images_dir / f"{image_file}.png"
+            
+            if not image_path.exists():
+                continue
+            
+            # Get image dimensions
+            try:
+                from PIL import Image
+                with Image.open(image_path) as img:
+                    img_width, img_height = img.size
+            except Exception:
+                img_width, img_height = 640, 480  # Default dimensions
+            
+            # Add image to COCO
+            coco_output["images"].append({
+                "id": image_id,
+                "file_name": image_file,
+                "width": img_width,
+                "height": img_height,
+            })
+            
+            # Parse YOLO annotations
+            with open(label_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    
+                    class_id = int(parts[0])
+                    x_center = float(parts[1])
+                    y_center = float(parts[2])
+                    width = float(parts[3])
+                    height = float(parts[4])
+                    
+                    # Convert YOLO to COCO format
+                    x_min = (x_center - width / 2) * img_width
+                    y_min = (y_center - height / 2) * img_height
+                    box_width = width * img_width
+                    box_height = height * img_height
+                    
+                    coco_output["annotations"].append({
+                        "id": annotation_id,
+                        "image_id": image_id,
+                        "category_id": class_id if class_id < 3 else 0,
+                        "bbox": [x_min, y_min, box_width, box_height],
+                        "area": box_width * box_height,
+                        "iscrowd": 0,
+                    })
+                    annotation_id += 1
+            
+            image_id += 1
+        
+        # Write COCO annotation file
+        with open(output_path, 'w') as f:
+            json.dump(coco_output, f, indent=2)
+        
+        _log(job_id, "INFO", f"Created COCO annotation: {output_path} with {len(coco_output['images'])} images")
+    
+    # Convert train and val splits
+    train_images = dataset_dir / "train" / "images"
+    val_images = dataset_dir / "val" / "images"
+    
+    if train_labels.exists() and train_images.exists():
+        create_coco_annotation(train_labels, train_images, train_ann, "train")
+    
+    if val_labels.exists() and val_images.exists():
+        create_coco_annotation(val_labels, val_images, val_ann, "val")
+    
+    return annotations_dir
+
+
 def _patch_vendor_code(root: Path, job_id: str) -> None:
     """Patch DINO-DETR vendor code to fix IndentationError in slconfig.py."""
     slconfig_path = root / "util" / "slconfig.py"
@@ -142,6 +260,11 @@ def run_worker(payload: dict[str, Any]) -> None:
     dataset_dir = DATASETS_DIR / data_arg
     if not dataset_dir.exists():
         raise ValueError(f"Dataset not found: {dataset_dir}")
+    
+    # Convert YOLO annotations to COCO format (non-destructive)
+    # COCO annotations are created in a separate 'annotations' directory
+    # Original YOLO labels remain unchanged for other models to use
+    annotations_dir = _convert_yolo_to_coco(job_id, dataset_dir)
     
     # Create data.yaml for DINO-DETR
     data_yaml = job_dir / "data.yaml"
