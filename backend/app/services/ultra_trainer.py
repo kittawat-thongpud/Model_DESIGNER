@@ -1463,10 +1463,15 @@ def _training_worker(
             
             # Handle HSG-DETR V2c specific parameters
             if arch_plugin.family == "hsg_detr_v2c":
-                # Extract HSG-DETR V2c specific config options
-                loc_quality_mode = config.get("loc_quality_mode", "area")
-                alpha_u = config.get("alpha_u", 0.3)
-                beta_s = config.get("beta_s", 0.0)
+                # Get default config options from plugin if available
+                plugin_defaults = {}
+                if hasattr(arch_plugin, 'get_config_options'):
+                    plugin_defaults = arch_plugin.get_config_options()
+                
+                # Extract HSG-DETR V2c specific config options (plugin defaults override schema defaults)
+                loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
+                alpha_u = config.get("alpha_u", plugin_defaults.get("alpha_u", 0.3))
+                beta_s = config.get("beta_s", plugin_defaults.get("beta_s", 0.0))
                 
                 # Update decoder parameters in YAML
                 if "head" in yaml_dict:
