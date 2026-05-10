@@ -1446,6 +1446,10 @@ def _training_worker(
             import yaml as _yaml
             yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
             
+            # Use yaml_scale if available (e.g. HSG-DETR V2c variants always use "n")
+            if hasattr(arch_plugin, 'yaml_scale'):
+                arch_scale = arch_plugin.yaml_scale
+
             # Handle scale injection
             if arch_scale:
                 _scale_key = str(arch_scale).upper()

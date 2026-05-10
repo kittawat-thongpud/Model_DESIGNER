@@ -37,8 +37,6 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     def __init__(self, variant: str = ""):
         self._variant = variant
-        # Use variant name as scale key for grouping under single family
-        self._scale = variant if variant else "n"
 
     @property
     def name(self) -> str:
@@ -57,7 +55,6 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def family(self) -> str:
-        # All variants share the same family for UI grouping
         return "hsg_detr_v2c"
 
     @property
@@ -66,7 +63,8 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def scale(self) -> str:
-        return self._scale
+        # Use variant as UI scale key (for frontend grouping), base uses "n"
+        return self._variant if self._variant else "n"
 
     @property
     def scale_label(self) -> str:
@@ -75,6 +73,11 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
             variant_label, _ = _VARIANT_DESCRIPTIONS[self._variant]
             return f"{variant_label} ({params}, {flops})"
         return f"{label} ({params}, {flops})"
+
+    @property
+    def yaml_scale(self) -> str:
+        """Always 'n' for YAML patching — all variants are Nano."""
+        return "n"
 
     @property
     def description(self) -> str:
