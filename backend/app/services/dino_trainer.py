@@ -370,6 +370,8 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
         env.setdefault("RANK", "0")
         env.setdefault("WORLD_SIZE", "1")
         env.setdefault("LOCAL_RANK", "0")
+        env.setdefault("MASTER_ADDR", "127.0.0.1")
+        env.setdefault("MASTER_PORT", "29500")
         
         # Run k-NN evaluation
         job_storage.append_job_log(job_id, "INFO", f"Running k-NN evaluation: {' '.join(cmd)}")
