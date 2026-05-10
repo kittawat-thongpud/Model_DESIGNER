@@ -183,20 +183,17 @@ def run_worker(payload: dict[str, Any]) -> None:
         str(dataset_dir),
         "--output_dir",
         str(job_dir / "runs" / "dino_detr"),
-        "--epochs",
-        str(epochs),
-        "--batch_size",
-        str(batch),
         "--num_workers",
         str(workers),
-        "--lr",
-        str(lr),
-        "--weight_decay",
-        str(weight_decay),
+        "--options",
+        f"epochs={epochs}",
+        f"batch_size={batch}",
+        f"lr={lr}",
+        f"weight_decay={weight_decay}",
     ]
     
     if config.get("amp", True):
-        cmd.append("--use_fp16")
+        cmd.append("--amp")
     
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
