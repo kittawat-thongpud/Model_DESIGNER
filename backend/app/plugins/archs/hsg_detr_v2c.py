@@ -79,6 +79,10 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
         """Always 'n' for YAML patching — all variants are Nano."""
         return "n"
 
+    def pretrain_key(self) -> str | None:
+        """No YOLO pretrained by default — HSG-DETR V2c trains from scratch."""
+        return None
+
     @property
     def description(self) -> str:
         if self._variant:
