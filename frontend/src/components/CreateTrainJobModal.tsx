@@ -129,9 +129,22 @@ const HSG_DETR_V2_FALLBACK: ArchFamily = {
   ],
 };
 
+const HSG_DETR_V2C_FALLBACK: ArchFamily = {
+  family: 'hsg_detr_v2c',
+  display_name: 'HSG-DETR V2c',
+  task_type: 'detect',
+  description: 'HSG-DETR V2c channel-selective sparse global attention experiment with SE-gated sparse deltas.',
+  supported_scales: [
+    { scale: 'n', label: 'Nano (~5.9 M, ~9.6 GFLOPs) — 100 queries', plugin_name: 'hsg_detr_v2c_n' },
+  ],
+};
+
 function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
-  const hasHsgDetrV2 = families.some(f => f.family === HSG_DETR_V2_FALLBACK.family);
-  return hasHsgDetrV2 ? families : [...families, HSG_DETR_V2_FALLBACK];
+  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK];
+  return fallbacks.reduce(
+    (items, fallback) => items.some(f => f.family === fallback.family) ? items : [...items, fallback],
+    families,
+  );
 }
 
 export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: Props) {

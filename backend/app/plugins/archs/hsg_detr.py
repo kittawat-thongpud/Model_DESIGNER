@@ -32,6 +32,8 @@ class HSGDetRPlugin(ModelArchPlugin):
 
     @property
     def name(self) -> str:
+        if self._variant == "v2c":
+            return f"hsg_detr_v2c_{self._scale}"
         if self._variant == "v2":
             return f"hsg_detr_v2_{self._scale}"
         return f"hsg_detr_{self._scale}"
@@ -39,18 +41,24 @@ class HSGDetRPlugin(ModelArchPlugin):
     @property
     def display_name(self) -> str:
         label, params, flops, queries = _SCALE_DESCRIPTIONS[self._scale]
+        if self._variant == "v2c":
+            return f"HSG-DETR V2c {label} ({params}, {flops})"
         if self._variant == "v2":
             return f"HSG-DETR V2 {label} ({params}, {flops})"
         return f"HSG-DETR {label} ({params}, {flops})"
 
     @property
     def family(self) -> str:
+        if self._variant == "v2c":
+            return "hsg_detr_v2c"
         if self._variant == "v2":
             return "hsg_detr_v2"
         return "hsg_detr"
 
     @property
     def family_display_name(self) -> str:
+        if self._variant == "v2c":
+            return "HSG-DETR V2c"
         if self._variant == "v2":
             return "HSG-DETR V2"
         return "HSG-DETR"
@@ -70,6 +78,12 @@ class HSGDetRPlugin(ModelArchPlugin):
 
     @property
     def description(self) -> str:
+        if self._variant == "v2c":
+            return (
+                "HSG-DETR V2c — V2 sparse-token encoder and RT-DETR decoder with "
+                "a channel-selective SE gate on sparse attention deltas for CS-SGA "
+                "experiments. N-scale only."
+            )
         if self._variant == "v2":
             return (
                 "HSG-DETR V2 — AMP-safe sparse-token encoder with the legacy "
@@ -84,6 +98,8 @@ class HSGDetRPlugin(ModelArchPlugin):
         )
 
     def yaml_path(self) -> Path:
+        if self._variant == "v2c":
+            return _CONFIGS_DIR / f"hsg_detr_v2c_{self._scale}.yaml"
         if self._variant == "v2":
             return _CONFIGS_DIR / f"hsg_detr_v2_{self._scale}.yaml"
         return _CONFIGS_DIR / f"hsg_detr_{self._scale}.yaml"
@@ -124,6 +140,9 @@ for _scale in ("n", "s", "m", "l"):
 
 # V2 is currently installed for N-scale only while it is being validated.
 register_arch(HSGDetRPlugin("n", variant="v2"))
+
+# V2c is the channel-selective sparse global attention experiment for N-scale.
+register_arch(HSGDetRPlugin("n", variant="v2c"))
 
 # V2B-N: gamma_init=0.01 debug variant
 class HSGDetRV2BPlugin(HSGDetRPlugin):

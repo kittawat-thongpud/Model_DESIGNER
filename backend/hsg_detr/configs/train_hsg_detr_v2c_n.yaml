@@ -1,0 +1,99 @@
+# =============================================================================
+# HSG-DETR-N V2c — Channel-Selective Sparse Global Attention
+# =============================================================================
+# What's in V2c (cumulative — all previous improvements included):
+#
+#   SGTokenBlockV2 (channel_se=True):
+#     - Sparse spatial attention on L2-salient top-k tokens
+#     - SE gate on attention output: gate = σ(FC2(ReLU(FC1(avg(delta)))))
+#       → focuses gradient onto informative channels
+#       → expected: gamma grows beyond V2/V2b plateau of ~0.020
+#     - AMP-safe: all norm/proj inputs cast via .to(dtype=weight.dtype)
+#
+#   RTDETRDecoderV2:
+#     T1-A Look-Forward-Twice: no .detach() between decoder layers
+#     T2-A Uncertainty-minimal query selection (RT-DETR Eq.2):
+#       score = cls_norm - alpha × |cls_norm - loc_norm|
+#     CDN (Contrastive Denoising, DINO arXiv:2203.03605):
+#       nd=100 denoising queries per image (inherited from RTDETRDecoder)
+#       get_cdn_group → dn_embed/bbox prepended → attn_mask separates groups
+#       RTDETRDetectionLoss splits dn_meta and computes DN loss automatically
+#
+# Config identical to V2b (job 003500af07ee) for direct comparison.
+# Metric to watch: sgb/P*_gamma_abs_mean — should exceed 0.020 if SE helps.
+# =============================================================================
+
+model_id: arch:hsg_detr_v2c
+model_name: HSG-DETR V2c N (CS-SGA)
+model_scale: n
+task: detect
+dataset_name: coco
+
+# ── Core (mirrors V2b for direct comparison) ──────────────────────────────────
+imgsz: 640
+batch: 64
+workers: 8
+cache: disk
+epochs: 30
+patience: 8
+seed: 24
+deterministic: true
+amp: false
+ema: true
+pin_memory: true
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+optimizer: AdamW
+lr0: 0.0001
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.05
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.05
+cos_lr: true
+
+# ── Weights (same pretrained as V2/V2b) ───────────────────────────────────────
+pretrained: ddde7b03fbec
+use_yolo_pretrained: true
+freeze: 0
+resume: false
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+box: 7.5
+cls: 0.5
+dfl: 1.5
+pose: 12
+nbs: 64
+iou: 0.7
+max_det: 300
+agnostic_nms: false
+rect: false
+single_cls: false
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0
+translate: 0.1
+scale: 0.5
+shear: 0
+perspective: 0
+flipud: 0
+fliplr: 0.5
+bgr: 0
+mosaic: 1
+mixup: 0
+copy_paste: 0
+erasing: 0.4
+crop_fraction: 1
+close_mosaic: 10
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+save_period: -1
+val: true
+plots: true
+overlap_mask: true
+mask_ratio: 4
+kobj: 1

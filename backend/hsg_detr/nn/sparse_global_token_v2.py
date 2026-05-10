@@ -102,6 +102,8 @@ class SGTokenBlockV2(nn.Module):
         mode: str = "topk",
         debug_enabled: bool = False,
         gamma_init: float = 1e-4,
+        channel_se: bool = False,
+        se_reduction: int = 4,
     ) -> None:
         super().__init__()
         assert c1 == c2, f"SGTokenBlockV2 is channel-preserving (c1={c1}, c2={c2})"
@@ -126,6 +128,14 @@ class SGTokenBlockV2(nn.Module):
         self.k_proj = nn.Conv2d(c2, c2, 1, bias=False)
         self.v_proj = nn.Conv2d(c2, c2, 1, bias=False)
         self.out_proj = nn.Conv2d(c2, c2, 1, bias=False)
+
+        # Optional channel-selective SE gate on attention output. V2 keeps this
+        # disabled by default; V2c enables it explicitly from YAML.
+        self.channel_se = bool(channel_se)
+        if self.channel_se:
+            mid = max(1, int(c2) // int(se_reduction))
+            self.se_fc1 = nn.Linear(c2, mid, bias=False)
+            self.se_fc2 = nn.Linear(mid, c2, bias=False)
 
         # LayerScale — starts near zero so CNN path dominates early training
         self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
@@ -308,6 +318,19 @@ class SGTokenBlockV2(nn.Module):
             self._store_debug(topk_idx, importance)
 
         delta = self._sparse_attn_delta(q, k, v, topk_idx, B, C, H, W, input_dtype)
+
+        # ── Channel-selective SE gate ─────────────────────────────────────
+        # Squeeze: global avg of delta over spatial dims (only attended positions
+        # are non-zero, so this is effectively avg over selected tokens).
+        # Excitation: bottleneck FC → sigmoid → per-channel scale in (0,1).
+        # Gate is AMP-safe: FC weights cast to input dtype.
+        if self.channel_se:
+            sq = delta.mean(dim=(2, 3))                             # (B, C)
+            sq_f = sq.to(dtype=self.se_fc1.weight.dtype)
+            gate = torch.relu(self.se_fc1(sq_f))                   # (B, mid)
+            gate = torch.sigmoid(self.se_fc2(gate))                 # (B, C) ∈ (0,1)
+            delta = delta * gate.to(dtype=input_dtype).view(B, C, 1, 1)
+
         return x + gamma * delta
 
 

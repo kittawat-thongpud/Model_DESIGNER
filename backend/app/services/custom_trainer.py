@@ -652,6 +652,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
+                        "se_fc",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
@@ -1438,6 +1439,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "k_proj",
                         "v_proj",
                         "out_proj",
+                        "se_fc",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith("norm"):
