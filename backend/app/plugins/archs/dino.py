@@ -36,7 +36,7 @@ class DINOPlugin(ModelArchPlugin):
     @property
     def display_name(self) -> str:
         label, _, _, _ = _DINO_SCALES[self._scale]
-        return f"DINO-DETR {label}"
+        return f"DINO {label}"
 
     @property
     def family(self) -> str:
@@ -44,7 +44,7 @@ class DINOPlugin(ModelArchPlugin):
 
     @property
     def family_display_name(self) -> str:
-        return "DINO-DETR"
+        return "DINO"
 
     @property
     def scale(self) -> str:

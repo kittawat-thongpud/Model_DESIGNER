@@ -262,319 +262,6 @@ def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
     torch.save({"student": student, "teacher": teacher, "epoch": 0}, out_path)
 
 
-def _convert_yolo_to_coco(job_id: str, dataset_name: str) -> _Path:
-    """Convert YOLO annotations to COCO format for DINO-DETR validation.
-    
-    Creates COCO annotations in /tmp/{dataset_name}_coco/ without modifying original data.
-    Returns path to COCO annotations directory.
-    """
-    import json
-    from pathlib import Path as _Path
-    from app.config import DATASETS_DIR
-    
-    job = job_storage.load_job(job_id)
-    if not job:
-        raise ValueError(f"Job {job_id} not found")
-    
-    dataset_dir = DATASETS_DIR / dataset_name
-    coco_dir = _Path(f"/tmp/{dataset_name}_coco")
-    coco_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create annotations directory
-    annotations_dir = coco_dir / "annotations"
-    annotations_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Read class names from data.yaml
-    data_yaml = dataset_dir / "data.yaml"
-    if data_yaml.exists():
-        import yaml as _yaml
-        data = _yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
-        class_names = data.get("names", {})
-        if isinstance(class_names, dict):
-            class_names = [class_names.get(i, f"class_{i}") for i in range(len(class_names))]
-        elif isinstance(class_names, list):
-            class_names = class_names
-        else:
-            class_names = ["Car", "Pedestrian", "Cyclist", "Truck", "Van", "Tram", "Misc"]
-    else:
-        class_names = ["Car", "Pedestrian", "Cyclist", "Truck", "Van", "Tram", "Misc"]
-    
-    # Process train and val splits
-    for split in ["train", "val"]:
-        # Read image paths from split file
-        split_file = dataset_dir / f"{split}.txt"
-        if not split_file.exists():
-            continue
-        
-        with split_file.open("r") as f:
-            image_paths = [line.strip() for line in f if line.strip()]
-        
-        # Create COCO annotation structure
-        coco_data = {
-            "images": [],
-            "annotations": [],
-            "categories": [{"id": i, "name": name} for i, name in enumerate(class_names)]
-        }
-        
-        annotation_id = 0
-        for img_id, image_path in enumerate(image_paths):
-            # Resolve image path (relative or absolute)
-            if not _Path(image_path).is_absolute():
-                image_path = dataset_dir / image_path
-            
-            image_path = _Path(image_path)
-            if not image_path.exists():
-                continue
-            
-            # Get image dimensions
-            try:
-                from PIL import Image
-                with Image.open(image_path) as img:
-                    width, height = img.size
-            except Exception:
-                continue
-            
-            # Add image to COCO data
-            image_filename = image_path.name
-            coco_data["images"].append({
-                "id": img_id,
-                "file_name": image_filename,
-                "width": width,
-                "height": height,
-            })
-            
-            # Read YOLO annotations
-            label_path = dataset_dir / "labels" / split / f"{image_path.stem}.txt"
-            if not label_path.exists():
-                continue
-            
-            with label_path.open("r") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) < 5:
-                        continue
-                    
-                    class_id = int(parts[0])
-                    x_center = float(parts[1])
-                    y_center = float(parts[2])
-                    box_width = float(parts[3])
-                    box_height = float(parts[4])
-                    
-                    # Convert YOLO to COCO format (x_min, y_min, width, height)
-                    x_min = (x_center - box_width / 2) * width
-                    y_min = (y_center - box_height / 2) * height
-                    abs_width = box_width * width
-                    abs_height = box_height * height
-                    
-                    coco_data["annotations"].append({
-                        "id": annotation_id,
-                        "image_id": img_id,
-                        "category_id": class_id,
-                        "bbox": [x_min, y_min, abs_width, abs_height],
-                        "area": abs_width * abs_height,
-                        "iscrowd": 0,
-                    })
-                    annotation_id += 1
-        
-        # Write COCO annotation file
-        coco_file = annotations_dir / f"instances_{split}2017.json"
-        with coco_file.open("w") as f:
-            json.dump(coco_data, f)
-        
-        # Create image symlink
-        images_split_dir = coco_dir / f"{split}2017"
-        images_split_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Symlink images from original dataset
-        original_images_dir = dataset_dir / "images" / split
-        if original_images_dir.exists():
-            for img_path in original_images_dir.glob("*"):
-                if img_path.is_file():
-                    try:
-                        symlink = images_split_dir / img_path.name
-                        if symlink.exists():
-                            symlink.unlink()
-                        symlink.symlink_to(img_path)
-                    except Exception:
-                        # Copy if symlink fails
-                        import shutil
-                        shutil.copy2(img_path, images_split_dir / img_path.name)
-    
-    return coco_dir
-
-
-def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: str, split: str = "val") -> None:
-    """Run DINO-DETR validation manually by patching vendor code and running eval."""
-    import os
-    import subprocess
-    import sys
-    import re
-    from pathlib import Path as _Path
-
-    job = job_storage.load_job(job_id)
-    if not job:
-        return
-
-    job_storage.append_job_log(job_id, "INFO", "Starting DINO-DETR validation...")
-
-    # Convert YOLO annotations to COCO format
-    job_storage.append_job_log(job_id, "INFO", "Converting YOLO annotations to COCO format...")
-    coco_dir = _convert_yolo_to_coco(job_id, dataset_name)
-    job_storage.append_job_log(job_id, "INFO", f"COCO annotations created at {coco_dir}")
-
-    # Convert checkpoint format for DINO-DETR main.py
-    # DINO training saves checkpoints with 'student' key, but DINO-DETR expects 'model' key
-    job_storage.append_job_log(job_id, "INFO", "Converting checkpoint format for DINO-DETR validation...")
-    checkpoint_path = checkpoint
-    converted_checkpoint_path = checkpoint_path.parent / "converted_for_eval.pth"
-    try:
-        import torch
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if "student" in ckpt and "model" not in ckpt:
-            # Convert DINO format to DINO-DETR format
-            converted_ckpt = {"model": ckpt["student"], "epoch": ckpt.get("epoch", 0)}
-            torch.save(converted_ckpt, converted_checkpoint_path)
-            checkpoint = converted_checkpoint_path
-            job_storage.append_job_log(job_id, "INFO", "Checkpoint converted successfully")
-        elif "model" in ckpt:
-            # Already in correct format
-            job_storage.append_job_log(job_id, "INFO", "Checkpoint already in correct format")
-        else:
-            job_storage.append_job_log(job_id, "WARNING", f"Unknown checkpoint format with keys: {list(ckpt.keys())}")
-            return
-    except Exception as e:
-        job_storage.append_job_log(job_id, "WARNING", f"Failed to convert checkpoint: {e}")
-        return
-
-    # Patch IndentationError in slconfig.py
-    dino_detr_dir = repo_dir()
-    slconfig_path = dino_detr_dir / "util" / "slconfig.py"
-    if slconfig_path.exists():
-        try:
-            original_content = slconfig_path.read_text(encoding="utf-8")
-            # Fix duplicate nested try statements and remove verify parameter
-            fixed_content = re.sub(
-                r'        try:\s+try:\s+try:\s+try:\s+try:\s+text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
-                '        try:\n            text, _ = FormatCode(text, style_config=yapf_style)',
-                original_content,
-                flags=re.DOTALL
-            )
-            # Also fix the single try case with verify parameter
-            fixed_content = re.sub(
-                r'text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
-                'text, _ = FormatCode(text, style_config=yapf_style)',
-                fixed_content
-            )
-            slconfig_path.write_text(fixed_content, encoding="utf-8")
-            job_storage.append_job_log(job_id, "INFO", "Patched slconfig.py IndentationError and verify parameter")
-        except Exception as e:
-            job_storage.append_job_log(job_id, "WARNING", f"Failed to patch slconfig.py: {e}")
-
-    # Build eval command
-    cmd = [
-        sys.executable,
-        "main.py",
-        "-c",
-        "config/DINO/DINO_4scale.py",
-        "--coco_path",
-        str(coco_dir),
-        "--output_dir",
-        str(_Path(f"/tmp/{job_id}_eval")),
-        "--eval",
-        "--resume",
-        str(checkpoint),
-        "--device",
-        "cuda:0" if __import__("torch").cuda.is_available() else "cpu",
-        "--num_workers",
-        "0",
-    ]
-
-    env = os.environ.copy()
-    backend_root = str(_Path(__file__).resolve().parents[2])
-    env["PYTHONPATH"] = os.pathsep.join([str(dino_detr_dir), backend_root, env.get("PYTHONPATH", "")])
-    env["PYTHONFAULTHANDLER"] = "1"
-    env.setdefault("RANK", "0")
-    env.setdefault("WORLD_SIZE", "1")
-    env.setdefault("LOCAL_RANK", "0")
-    env.setdefault("MASTER_ADDR", "127.0.0.1")
-    env.setdefault("MASTER_PORT", "29600")
-
-    job_storage.append_job_log(job_id, "INFO", f"Running DINO-DETR validation: {' '.join(cmd)}")
-
-    proc = subprocess.run(
-        cmd,
-        cwd=str(dino_detr_dir),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    job_storage.append_job_log(job_id, "INFO", f"Validation return code: {proc.returncode}")
-    if proc.stdout:
-        job_storage.append_job_log(job_id, "INFO", f"Validation stdout (last 2000 chars): {proc.stdout[-2000:]}")
-    if proc.stderr:
-        job_storage.append_job_log(job_id, "INFO", f"Validation stderr: {proc.stderr}")
-
-    # Parse results from log.txt
-    log_path = _Path(f"/tmp/{job_id}_eval/log.txt")
-    if log_path.exists():
-        log_content = log_path.read_text(encoding="utf-8")
-        job_storage.append_job_log(job_id, "INFO", f"Validation log: {log_content[-1000:]}")
-
-        # Parse mAP from output
-        mAP50 = None
-        mAP50_95 = None
-        for line in log_content.splitlines():
-            if "AP" in line and "50" in line:
-                try:
-                    mAP50 = float(line.split(":")[-1].strip())
-                except (ValueError, IndexError):
-                    pass
-            if "AP" in line and "50:95" in line:
-                try:
-                    mAP50_95 = float(line.split(":")[-1].strip())
-                except (ValueError, IndexError):
-                    pass
-
-        if mAP50 is not None:
-            job_storage.append_job_log(job_id, "INFO", f"Validation mAP50: {mAP50:.4f}")
-            job_storage.append_job_log(job_id, "INFO", f"Validation mAP50_95: {mAP50_95:.4f if mAP50_95 else 'N/A'}")
-
-            # Update job record
-            job["best_mAP50"] = mAP50
-            job["best_mAP50_95"] = mAP50_95
-            job_storage.save_job(job)
-
-            # Add to extended_metrics.jsonl
-            from app.config import JOBS_DIR
-            ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
-            try:
-                history = list(job.get("history") or [])
-                last_epoch = history[-1].get("epoch") if history else 0
-                val_entry = {
-                    "epoch": last_epoch,
-                    "timestamp": time.time(),
-                    "mAP50": mAP50,
-                    "mAP50_95": mAP50_95,
-                }
-                with ext_metrics_path.open("a") as mf:
-                    mf.write(json.dumps(val_entry) + "\n")
-            except Exception as e:
-                job_storage.append_job_log(job_id, "WARNING", f"Failed to write validation metrics to extended_metrics.jsonl: {e}")
-        else:
-            job_storage.append_job_log(job_id, "WARNING", "Could not parse mAP from validation output")
-    else:
-        job_storage.append_job_log(job_id, "WARNING", "Validation log.txt not found")
-
-    # Restore original slconfig.py
-    if slconfig_path.exists():
-        try:
-            slconfig_path.write_text(original_content, encoding="utf-8")
-        except Exception:
-            pass
-
-
 def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: Path, spec: dict, batch: int, workers: int, out_dir: Path) -> None:
     """Run k-NN evaluation on DINO checkpoint to provide validation metrics.
     
@@ -584,19 +271,13 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
     try:
         job_storage.append_job_log(job_id, "INFO", "Starting k-NN evaluation for validation metrics...")
         
-        # Check if this is DINO-DETR (detection) or DINO self-supervised
-        # DINO-DETR checkpoints are incompatible with DINO self-supervised eval_knn.py
-        job = job_storage.load_job(job_id)
-        if not job:
-            return
-        
-        model_arch = job.get("config", {}).get("model_arch", "")
-        if model_arch.startswith("dino_"):
-            # This is DINO-DETR (detection), skip k-NN evaluation
-            job_storage.append_job_log(job_id, "INFO", "DINO-DETR (detection) checkpoints are incompatible with k-NN evaluation")
-            job_storage.append_job_log(job_id, "INFO", "k-NN evaluation requires DINO self-supervised checkpoints")
-            job_storage.append_job_log(job_id, "INFO", "Skipping k-NN evaluation for DINO-DETR")
-            return
+        # Patch torch.load to fix PyTorch 2.6 weights_only issue
+        import torch
+        original_torch_load = torch.load
+        def patched_torch_load(f, *args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return original_torch_load(f, *args, **kwargs)
+        torch.load = patched_torch_load
         
         # Check if dataset has partition TXT files (train/val) for k-NN evaluation
         # Instead of checking imagefolder/train and imagefolder/val, we check partition TXT files
@@ -770,6 +451,13 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
         
     except Exception as e:
         job_storage.append_job_log(job_id, "WARNING", f"k-NN evaluation error: {str(e)}")
+    finally:
+        # Restore original torch.load
+        try:
+            import torch
+            torch.load = original_torch_load
+        except Exception:
+            pass
 
 
 def _checkpoint_candidates(out_dir: Path) -> list[Path]:
@@ -1447,27 +1135,6 @@ def run_worker(payload: dict[str, Any]) -> None:
                         mf.write(json.dumps(epoch_data) + "\n")
                 except Exception:
                     pass
-                
-                # Emit metrics to log.jsonl for frontend (type: hsg_detr_metrics)
-                # Use HsgDetrMetricsEntry-compatible field names
-                hsg_metrics: dict[str, Any] = {
-                    "type": "hsg_detr_metrics",
-                    "epoch": epoch,
-                    "timestamp": now_ts,
-                    # Map DINO metrics to HsgDetrMetricsEntry field names
-                    "decoder/alpha": metrics.get("train_loss_avg"),  # box_loss → decoder/alpha
-                    "decoder/num_queries": metrics.get("train_lr"),  # lr → decoder/num_queries
-                    "grad/backbone_norm": metrics.get("weight_decay"),  # weight_decay → grad/backbone_norm
-                    "grad/neck_norm": _avg_epoch_s,  # epoch_time → grad/neck_norm
-                    "grad/sgb_norm": metrics.get("max_mem_mb"),  # gpu_memory_mb → grad/sgb_norm
-                }
-                hsg_metrics = {k: v for k, v in hsg_metrics.items() if v is not None}
-                job_storage.append_job_log(
-                    job_id,
-                    "METRICS",
-                    "DINO training metrics",
-                    hsg_metrics,
-                )
             
             # Track best checkpoint
             train_loss = metrics.get("train_loss")
@@ -1500,9 +1167,9 @@ def run_worker(payload: dict[str, Any]) -> None:
         shutil.copy2(final_ckpt, last_path)
         job_storage.append_job_log(job_id, "INFO", f"DINO final checkpoint: {final_ckpt.name}")
         
-        # Run DINO-DETR validation for detection metrics (mAP)
-        # This provides validation metrics similar to benchmark
-        _run_dino_detector_validation(job_id, final_ckpt, dataset_name)
+        # Run k-NN evaluation if dataset has train/val split with labels
+        # This provides validation metrics similar to mAP for self-supervised learning
+        _run_knn_evaluation(job_id, root, imagefolder, final_ckpt, spec, batch, workers, out_dir)
     
     _append_history_from_log(job_id, out_dir)
     weight_id = _save_weight(job_id, out_dir)
