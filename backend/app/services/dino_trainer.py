@@ -85,6 +85,17 @@ def _read_data_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+def repo_dir() -> Path:
+    from app.config import DATA_DIR
+    return DATA_DIR / "vendor" / "DINO-DETR"
+
+
+def dino_selfsup_dir() -> Path:
+    """Return path to DINO self-supervised directory (for eval_knn.py)."""
+    from app.config import DATA_DIR
+    return DATA_DIR / "vendor" / "DINO"
+
+
 def _resolve_split_paths(data: dict[str, Any], split: str) -> list[Path]:
     root = Path(str(data.get("path") or "."))
     raw = data.get(split) or data.get("train")
@@ -332,10 +343,10 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
         
         job_storage.append_job_log(job_id, "INFO", f"k-NN evaluation imagefolder: train={train_count}, val={val_count} images (using symlinks)")
         
-        # Build eval_knn.py command
+        # Build eval_knn.py command (use DINO self-supervised directory for eval_knn.py)
         cmd = [
             sys.executable,
-            "eval_knn.py",
+            str(dino_selfsup_dir() / "eval_knn.py"),
             "--arch",
             str(spec["arch"]),
             "--patch_size",
@@ -352,7 +363,7 @@ def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: 
         
         env = os.environ.copy()
         backend_root = str(Path(__file__).resolve().parents[2])
-        pythonpath = [str(root), backend_root]
+        pythonpath = [str(dino_selfsup_dir()), backend_root]
         if env.get("PYTHONPATH"):
             pythonpath.append(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(pythonpath)
