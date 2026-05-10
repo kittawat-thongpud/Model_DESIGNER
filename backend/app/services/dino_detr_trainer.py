@@ -57,8 +57,8 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
         return annotations_dir
     
     # Load YOLO annotations
-    train_labels = dataset_dir / "train" / "labels"
-    val_labels = dataset_dir / "val" / "labels"
+    train_labels = dataset_dir / "labels" / "train"
+    val_labels = dataset_dir / "labels" / "val"
     
     # Simple conversion - create minimal COCO annotations
     # This is a basic implementation that may need refinement
@@ -103,7 +103,7 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
             # Add image to COCO
             coco_output["images"].append({
                 "id": image_id,
-                "file_name": image_file,
+                "file_name": f"{split_name}/{image_file}.jpg",
                 "width": img_width,
                 "height": img_height,
             })
@@ -146,8 +146,8 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
         _log(job_id, "INFO", f"Created COCO annotation: {output_path} with {len(coco_output['images'])} images")
     
     # Convert train and val splits
-    train_images = dataset_dir / "train" / "images"
-    val_images = dataset_dir / "val" / "images"
+    train_images = dataset_dir / "images" / "train"
+    val_images = dataset_dir / "images" / "val"
     
     if train_labels.exists() and train_images.exists():
         create_coco_annotation(train_labels, train_images, train_ann, "train")
