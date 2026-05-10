@@ -56,10 +56,16 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def family(self) -> str:
+        # Each variant is treated as a separate family for UI clarity
+        if self._variant:
+            return f"hsg_detr_v2c_{self._variant}"
         return "hsg_detr_v2c"
 
     @property
     def family_display_name(self) -> str:
+        if self._variant:
+            variant_label, _ = _VARIANT_DESCRIPTIONS[self._variant]
+            return f"HSG-DETR V2c - {variant_label}"
         return "HSG-DETR V2c"
 
     @property
