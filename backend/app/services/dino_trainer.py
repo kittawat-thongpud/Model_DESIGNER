@@ -262,6 +262,166 @@ def _stage_dino_backbone_pretrained(url: str, out_path: Path) -> None:
     torch.save({"student": student, "teacher": teacher, "epoch": 0}, out_path)
 
 
+def _run_dino_detector_validation(job_id: str, checkpoint: Path, dataset_name: str, split: str = "val") -> None:
+    """Run DINO-DETR validation manually by patching vendor code and running eval."""
+    import os
+    import subprocess
+    import sys
+    import re
+    from pathlib import Path as _Path
+
+    job = job_storage.load_job(job_id)
+    if not job:
+        return
+
+    job_storage.append_job_log(job_id, "INFO", "Starting DINO-DETR validation...")
+
+    # Patch IndentationError in slconfig.py
+    dino_detr_dir = repo_dir()
+    slconfig_path = dino_detr_dir / "util" / "slconfig.py"
+    if slconfig_path.exists():
+        try:
+            original_content = slconfig_path.read_text(encoding="utf-8")
+            # Fix duplicate nested try statements and remove verify parameter
+            fixed_content = re.sub(
+                r'        try:\s+try:\s+try:\s+try:\s+try:\s+text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
+                '        try:\n            text, _ = FormatCode(text, style_config=yapf_style)',
+                original_content,
+                flags=re.DOTALL
+            )
+            # Also fix the single try case with verify parameter
+            fixed_content = re.sub(
+                r'text, _ = FormatCode\(text, style_config=yapf_style, verify=True\)',
+                'text, _ = FormatCode(text, style_config=yapf_style)',
+                fixed_content
+            )
+            slconfig_path.write_text(fixed_content, encoding="utf-8")
+            job_storage.append_job_log(job_id, "INFO", "Patched slconfig.py IndentationError and verify parameter")
+        except Exception as e:
+            job_storage.append_job_log(job_id, "WARNING", f"Failed to patch slconfig.py: {e}")
+
+    # Prepare dataset YAML
+    from . import dataset_yaml
+    partition_configs = job.get("partition_configs")
+    if not partition_configs:
+        job_storage.append_job_log(job_id, "INFO", "No partition configs, skipping validation")
+        return
+
+    # Generate data.yaml for validation
+    data_yaml_path = _Path(f"/tmp/{job_id}_data.yaml")
+    try:
+        # Use dataset_yaml.generate_data_yaml to create data.yaml
+        data_yaml_content = dataset_yaml.generate_data_yaml(dataset_name, partition_configs=partition_configs)
+        data_yaml_path.write_text(data_yaml_content, encoding="utf-8")
+    except Exception as e:
+        job_storage.append_job_log(job_id, "WARNING", f"Failed to generate data.yaml: {e}")
+        return
+
+    # Build eval command
+    cmd = [
+        sys.executable,
+        "main.py",
+        "-c",
+        "config/DINO/DINO_4scale.py",
+        "--coco_path",
+        str(data_yaml_path.parent),
+        "--output_dir",
+        str(_Path(f"/tmp/{job_id}_eval")),
+        "--eval",
+        "--resume",
+        str(checkpoint),
+        "--device",
+        "cuda:0" if __import__("torch").cuda.is_available() else "cpu",
+        "--num_workers",
+        "0",
+    ]
+
+    env = os.environ.copy()
+    backend_root = str(_Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join([str(dino_detr_dir), backend_root, env.get("PYTHONPATH", "")])
+    env["PYTHONFAULTHANDLER"] = "1"
+    env.setdefault("RANK", "0")
+    env.setdefault("WORLD_SIZE", "1")
+    env.setdefault("LOCAL_RANK", "0")
+    env.setdefault("MASTER_ADDR", "127.0.0.1")
+    env.setdefault("MASTER_PORT", "29600")
+
+    job_storage.append_job_log(job_id, "INFO", f"Running DINO-DETR validation: {' '.join(cmd)}")
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(dino_detr_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    job_storage.append_job_log(job_id, "INFO", f"Validation return code: {proc.returncode}")
+    if proc.stdout:
+        job_storage.append_job_log(job_id, "INFO", f"Validation stdout (last 2000 chars): {proc.stdout[-2000:]}")
+    if proc.stderr:
+        job_storage.append_job_log(job_id, "INFO", f"Validation stderr: {proc.stderr}")
+
+    # Parse results from log.txt
+    log_path = _Path(f"/tmp/{job_id}_eval/log.txt")
+    if log_path.exists():
+        log_content = log_path.read_text(encoding="utf-8")
+        job_storage.append_job_log(job_id, "INFO", f"Validation log: {log_content[-1000:]}")
+
+        # Parse mAP from output
+        mAP50 = None
+        mAP50_95 = None
+        for line in log_content.splitlines():
+            if "AP" in line and "50" in line:
+                try:
+                    mAP50 = float(line.split(":")[-1].strip())
+                except (ValueError, IndexError):
+                    pass
+            if "AP" in line and "50:95" in line:
+                try:
+                    mAP50_95 = float(line.split(":")[-1].strip())
+                except (ValueError, IndexError):
+                    pass
+
+        if mAP50 is not None:
+            job_storage.append_job_log(job_id, "INFO", f"Validation mAP50: {mAP50:.4f}")
+            job_storage.append_job_log(job_id, "INFO", f"Validation mAP50_95: {mAP50_95:.4f if mAP50_95 else 'N/A'}")
+
+            # Update job record
+            job["best_mAP50"] = mAP50
+            job["best_mAP50_95"] = mAP50_95
+            job_storage.save_job(job)
+
+            # Add to extended_metrics.jsonl
+            from app.config import JOBS_DIR
+            ext_metrics_path = JOBS_DIR / job_id / "extended_metrics.jsonl"
+            try:
+                history = list(job.get("history") or [])
+                last_epoch = history[-1].get("epoch") if history else 0
+                val_entry = {
+                    "epoch": last_epoch,
+                    "timestamp": time.time(),
+                    "mAP50": mAP50,
+                    "mAP50_95": mAP50_95,
+                }
+                with ext_metrics_path.open("a") as mf:
+                    mf.write(json.dumps(val_entry) + "\n")
+            except Exception as e:
+                job_storage.append_job_log(job_id, "WARNING", f"Failed to write validation metrics to extended_metrics.jsonl: {e}")
+        else:
+            job_storage.append_job_log(job_id, "WARNING", "Could not parse mAP from validation output")
+    else:
+        job_storage.append_job_log(job_id, "WARNING", "Validation log.txt not found")
+
+    # Restore original slconfig.py
+    if slconfig_path.exists():
+        try:
+            slconfig_path.write_text(original_content, encoding="utf-8")
+        except Exception:
+            pass
+
+
 def _run_knn_evaluation(job_id: str, root: Path, imagefolder: Path, checkpoint: Path, spec: dict, batch: int, workers: int, out_dir: Path) -> None:
     """Run k-NN evaluation on DINO checkpoint to provide validation metrics.
     
@@ -1187,9 +1347,9 @@ def run_worker(payload: dict[str, Any]) -> None:
         shutil.copy2(final_ckpt, last_path)
         job_storage.append_job_log(job_id, "INFO", f"DINO final checkpoint: {final_ckpt.name}")
         
-        # Run k-NN evaluation if dataset has train/val split with labels
-        # This provides validation metrics similar to mAP for self-supervised learning
-        _run_knn_evaluation(job_id, root, imagefolder, final_ckpt, spec, batch, workers, out_dir)
+        # Run DINO-DETR validation for detection metrics (mAP)
+        # This provides validation metrics similar to benchmark
+        _run_dino_detector_validation(job_id, final_ckpt, dataset_name)
     
     _append_history_from_log(job_id, out_dir)
     weight_id = _save_weight(job_id, out_dir)
