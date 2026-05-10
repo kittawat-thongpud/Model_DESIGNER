@@ -141,8 +141,8 @@ for _scale in ("n", "s", "m", "l"):
 # V2 is currently installed for N-scale only while it is being validated.
 register_arch(HSGDetRPlugin("n", variant="v2"))
 
-# V2c is the channel-selective sparse global attention experiment for N-scale.
-register_arch(HSGDetRPlugin("n", variant="v2c"))
+# V2c variants are now registered separately in hsg_detr_v2c.py with Phase 1-2 experimental options
+# register_arch(HSGDetRPlugin("n", variant="v2c"))  # Removed - replaced by hsg_detr_v2c.py
 
 # V2B-N: gamma_init=0.01 debug variant
 class HSGDetRV2BPlugin(HSGDetRPlugin):
