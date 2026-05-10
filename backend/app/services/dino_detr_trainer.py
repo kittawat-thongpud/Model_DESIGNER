@@ -103,7 +103,7 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
             # Add image to COCO
             coco_output["images"].append({
                 "id": image_id,
-                "file_name": f"{split_name}/{image_file}.jpg",
+                "file_name": f"{image_file}.jpg",
                 "width": img_width,
                 "height": img_height,
             })
@@ -154,6 +154,19 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
     
     if val_labels.exists() and val_images.exists():
         create_coco_annotation(val_labels, val_images, val_ann, "val")
+    
+    # Create symlinks for COCO directory structure (train2017, val2017)
+    # DINO-DETR expects images in train2017/ and val2017/ directories
+    train2017_link = dataset_dir / "train2017"
+    val2017_link = dataset_dir / "val2017"
+    
+    if not train2017_link.exists():
+        train2017_link.symlink_to(train_images)
+        _log(job_id, "INFO", f"Created symlink: {train2017_link} -> {train_images}")
+    
+    if not val2017_link.exists():
+        val2017_link.symlink_to(val_images)
+        _log(job_id, "INFO", f"Created symlink: {val2017_link} -> {val_images}")
     
     return annotations_dir
 
