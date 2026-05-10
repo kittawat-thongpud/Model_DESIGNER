@@ -395,7 +395,12 @@ class RTDETRDecoderV2(RTDETRDecoder):
         
         # Parse args - support both simple (6 args) and extended (20 args) formats
         if len(args) >= 1:
-            nc = args[0]
+            # Handle nc - could be int or string "nc" from YAML
+            nc_arg = args[0]
+            if isinstance(nc_arg, str) and nc_arg.lower() == "nc":
+                nc = 80  # Default COCO classes
+            else:
+                nc = int(nc_arg)
         
         if len(args) == 6:
             # Simple format: [nc, hd, nq, loc_quality_mode, alpha_u, beta_s]
