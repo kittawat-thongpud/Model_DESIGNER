@@ -86,8 +86,10 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
             # Get corresponding image
             image_file = label_file.stem
             image_path = images_dir / f"{image_file}.jpg"
+            image_ext = ".jpg"
             if not image_path.exists():
                 image_path = images_dir / f"{image_file}.png"
+                image_ext = ".png"
             
             if not image_path.exists():
                 continue
@@ -103,7 +105,7 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
             # Add image to COCO
             coco_output["images"].append({
                 "id": image_id,
-                "file_name": f"{image_file}.jpg",
+                "file_name": f"{image_file}{image_ext}",
                 "width": img_width,
                 "height": img_height,
             })
