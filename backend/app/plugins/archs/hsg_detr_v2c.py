@@ -83,6 +83,16 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
         """No YOLO pretrained by default — HSG-DETR V2c trains from scratch."""
         return None
 
+    def register_modules(self) -> None:
+        """Inject HSG-DETR V2c custom modules into ultralytics.nn.modules."""
+        try:
+            import hsg_detr.nn  # noqa: F401 — triggers register() on import
+        except ImportError as e:
+            raise ImportError(
+                "Could not import hsg_detr package. "
+                "Ensure the backend/hsg_detr/ directory is on PYTHONPATH."
+            ) from e
+
     @property
     def description(self) -> str:
         if self._variant:
