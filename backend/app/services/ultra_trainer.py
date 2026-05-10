@@ -3263,11 +3263,26 @@ def _run_worker_from_args_file(args_path: str) -> int:
             rtdetrv2_trainer.run_worker(payload)
             return 0
         if arch_plugin and arch_plugin.family == "dino":
-            from . import dino_trainer
-
-            job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO trainer: {model_arch}")
-            dino_trainer.run_worker(payload)
-            return 0
+            # Check if this is DINO-DETR detection (based on task and model_arch)
+            task = str(payload.get("task") or str(_MODEL_DEFAULTS.get("task", "detect")))
+            model_arch = str(payload.get("model_arch") or "")
+            
+            # DINO-DETR detection uses "dino_resnet50" for detection task
+            # DINO self-supervised uses "dino_resnet50" for self-supervised learning
+            # We distinguish by checking if it's a detection task
+            if task == "detect" and "resnet50" in model_arch.lower():
+                # This is DINO-DETR detection - use DINO-DETR training
+                # For now, we still use dino_trainer but it should handle DINO-DETR detection
+                from . import dino_trainer
+                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO-DETR detection trainer: {model_arch}")
+                dino_trainer.run_worker(payload)
+                return 0
+            else:
+                # This is DINO self-supervised
+                from . import dino_trainer
+                job_storage.append_job_log(job_id, "INFO", f"Routing worker to DINO self-supervised trainer: {model_arch}")
+                dino_trainer.run_worker(payload)
+                return 0
     except Exception:
         raise
 
