@@ -37,7 +37,8 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     def __init__(self, variant: str = ""):
         self._variant = variant
-        self._scale = "n"  # V2c only has nano scale for now
+        # Use variant name as scale key for grouping under single family
+        self._scale = variant if variant else "n"
 
     @property
     def name(self) -> str:
@@ -47,7 +48,7 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def display_name(self) -> str:
-        label, params, flops = _SCALE_DESCRIPTIONS[self._scale]
+        label, params, flops = _SCALE_DESCRIPTIONS["n"]
         if self._variant:
             variant_label, _ = _VARIANT_DESCRIPTIONS[self._variant]
             return f"HSG-DETR V2c {label} - {variant_label} ({params}, {flops})"
@@ -56,16 +57,11 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def family(self) -> str:
-        # Each variant is treated as a separate family for UI clarity
-        if self._variant:
-            return f"hsg_detr_v2c_{self._variant}"
+        # All variants share the same family for UI grouping
         return "hsg_detr_v2c"
 
     @property
     def family_display_name(self) -> str:
-        if self._variant:
-            variant_label, _ = _VARIANT_DESCRIPTIONS[self._variant]
-            return f"HSG-DETR V2c - {variant_label}"
         return "HSG-DETR V2c"
 
     @property
@@ -74,7 +70,10 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
 
     @property
     def scale_label(self) -> str:
-        label, params, flops = _SCALE_DESCRIPTIONS[self._scale]
+        label, params, flops = _SCALE_DESCRIPTIONS["n"]
+        if self._variant:
+            variant_label, _ = _VARIANT_DESCRIPTIONS[self._variant]
+            return f"{variant_label} ({params}, {flops})"
         return f"{label} ({params}, {flops})"
 
     @property
