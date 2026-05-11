@@ -997,6 +997,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             for m in model.modules():
                 if m.__class__.__name__ in {'SGTokenBlock', 'SGTokenBlockV2'} and hasattr(m, 'set_debug'):
                     m.set_debug(capture_sparse_debug, cpu=True)
+                elif m.__class__.__name__ == 'CrossScaleSGA' and hasattr(m, 'set_debug'):
+                    m.set_debug(True)
         except Exception:
             pass
 
@@ -1323,6 +1325,30 @@ class CustomDetectionTrainer(DetectionTrainer):
             saliency = getattr(blk, 'last_saliency', None)
             if saliency is not None and saliency.numel():
                 metrics[f'{tag}_saliency_mean'] = float(saliency.detach().float().mean())
+
+        # ── CS²GA cross-scale attention metrics ─────────────────────────
+        cs2ga_blocks = [
+            m for m in model.modules()
+            if m.__class__.__name__ == 'CrossScaleSGA'
+        ]
+        for i, blk in enumerate(cs2ga_blocks):
+            tag = f'cs2ga/{i}'
+            state = blk.get_debug_state() if hasattr(blk, 'get_debug_state') else {}
+            if state.get('gate_p3') is not None:
+                metrics[f'{tag}/gate_p3'] = float(state['gate_p3'])
+                metrics[f'{tag}/gate_p4'] = float(state['gate_p4'])
+                metrics[f'{tag}/gate_p5'] = float(state['gate_p5'])
+            if state.get('k3') is not None:
+                metrics[f'{tag}/k3'] = float(state['k3'])
+                metrics[f'{tag}/k4'] = float(state['k4'])
+                metrics[f'{tag}/k5'] = float(state['k5'])
+            if state.get('attn_within_frac') is not None:
+                metrics[f'{tag}/attn_within_frac'] = float(state['attn_within_frac'])
+                metrics[f'{tag}/attn_cross_frac'] = float(state['attn_cross_frac'])
+            if state.get('delta_abs_p3') is not None:
+                metrics[f'{tag}/delta_abs_p3'] = float(state['delta_abs_p3'])
+                metrics[f'{tag}/delta_abs_p4'] = float(state['delta_abs_p4'])
+                metrics[f'{tag}/delta_abs_p5'] = float(state['delta_abs_p5'])
 
         # ── Decoder metrics ──────────────────────────────────────────────
         for dec in decoder_modules:

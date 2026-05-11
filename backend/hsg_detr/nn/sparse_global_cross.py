@@ -67,6 +67,7 @@ class CrossScaleSGA(nn.Module):
         ratio_p3: float = 0.05,
         ratio_p4: float = 0.10,
         ratio_p5: float = 0.25,
+        debug: bool = False,
     ) -> None:
         super().__init__()
         if isinstance(c1, int):
@@ -80,6 +81,20 @@ class CrossScaleSGA(nn.Module):
         self.ratio_p3 = float(ratio_p3)
         self.ratio_p4 = float(ratio_p4)
         self.ratio_p5 = float(ratio_p5)
+        self.debug_enabled: bool = bool(debug)
+
+        # Debug state — updated each forward pass when debug_enabled=True
+        self.last_gate_p3: float | None = None
+        self.last_gate_p4: float | None = None
+        self.last_gate_p5: float | None = None
+        self.last_k3: int | None = None
+        self.last_k4: int | None = None
+        self.last_k5: int | None = None
+        self.last_attn_within_frac: float | None = None   # mass on within-scale blocks
+        self.last_attn_cross_frac: float | None = None    # mass on cross-scale blocks
+        self.last_delta_abs_p3: float | None = None       # mean |delta| before gate
+        self.last_delta_abs_p4: float | None = None
+        self.last_delta_abs_p5: float | None = None
 
         d = self.shared_dim
 
@@ -241,6 +256,29 @@ class CrossScaleSGA(nn.Module):
             g4 = torch.sigmoid(self.gate_p4.float())
             g5 = torch.sigmoid(self.gate_p5.float())
 
+            if self.debug_enabled:
+                self.last_gate_p3 = float(g3.item())
+                self.last_gate_p4 = float(g4.item())
+                self.last_gate_p5 = float(g5.item())
+                self.last_k3 = int(k3)
+                self.last_k4 = int(k4)
+                self.last_k5 = int(k5)
+                # Attention distribution: mean over batch of within-scale vs cross-scale mass
+                with torch.no_grad():
+                    _a = attn.detach().mean(0)  # (K, K) mean over batch
+                    _within = (
+                        _a[:k3, :k3].sum()
+                        + _a[k3:k3+k4, k3:k3+k4].sum()
+                        + _a[k3+k4:, k3+k4:].sum()
+                    )
+                    _total = float(_a.sum().clamp(min=1e-8))
+                    self.last_attn_within_frac = float(_within / _total)
+                    self.last_attn_cross_frac = float(1.0 - self.last_attn_within_frac)
+                # Delta magnitude (mean absolute value before gate scaling)
+                self.last_delta_abs_p3 = float(p3_delta.detach().abs().mean().item())
+                self.last_delta_abs_p4 = float(p4_delta.detach().abs().mean().item())
+                self.last_delta_abs_p5 = float(p5_delta.detach().abs().mean().item())
+
             p3_out = p3_f + g3 * p3_delta
             p4_out = p4_f + g4 * p4_delta
             p5_out = p5_f + g5 * p5_delta
@@ -273,3 +311,25 @@ class CrossScaleSGA(nn.Module):
         w = gn.weight.float() if gn.weight is not None else None
         b = gn.bias.float() if gn.bias is not None else None
         return F.group_norm(x, gn.num_groups, w, b, gn.eps)
+
+    # ------------------------------------------------------------------ #
+
+    def set_debug(self, enabled: bool = True) -> None:
+        """Enable or disable debug state recording."""
+        self.debug_enabled = enabled
+
+    def get_debug_state(self) -> dict:
+        """Return last recorded debug values (None if debug_enabled=False or no forward yet)."""
+        return {
+            "gate_p3": self.last_gate_p3,
+            "gate_p4": self.last_gate_p4,
+            "gate_p5": self.last_gate_p5,
+            "k3": self.last_k3,
+            "k4": self.last_k4,
+            "k5": self.last_k5,
+            "attn_within_frac": self.last_attn_within_frac,
+            "attn_cross_frac": self.last_attn_cross_frac,
+            "delta_abs_p3": self.last_delta_abs_p3,
+            "delta_abs_p4": self.last_delta_abs_p4,
+            "delta_abs_p5": self.last_delta_abs_p5,
+        }
