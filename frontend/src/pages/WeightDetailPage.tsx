@@ -191,8 +191,12 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
   const isSelfSupervised = (job as any)?.model === 'dino' || false;
   const hasHistory = history.length > 0;
   const hsgMetricsHistory: HsgDetrMetricsEntry[] = history
-    .filter((h: any) => typeof h.epoch === 'number' && h.hsg_detr)
-    .map((h: any) => ({ ...h.hsg_detr, epoch: h.epoch }));
+    .map((h: any) => ({
+      payload: h.hsg_detr ?? h.plot?.hsg_detr ?? h.plots?.hsg_detr ?? h.plot,
+      epoch: h.epoch,
+    }))
+    .filter(({ epoch, payload }) => typeof epoch === 'number' && payload && typeof payload === 'object' && !Array.isArray(payload))
+    .map(({ payload, epoch }) => ({ ...payload, epoch }));
 
   // Usage code snippet
   const usageCode = `import torch

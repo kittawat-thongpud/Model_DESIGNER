@@ -182,15 +182,18 @@ class EpochMetrics(BaseModel):
     epoch: int
     timestamp: float | None = None  # Unix timestamp when epoch completed
 
-    # Training losses (from trainer.loss_items)
-    box_loss: float | None = None           # Train box loss
-    cls_loss: float | None = None           # Train classification loss
-    dfl_loss: float | None = None           # Train DFL loss
+    # Training losses (from trainer.loss_items). For Ultralytics end2end
+    # detectors this is the already-summed one2many + one2one loss_items
+    # vector; branch-level losses are not available unless separately hooked.
+    box_loss: float | None = None           # Train box loss (end2end: one2many + one2one)
+    cls_loss: float | None = None           # Train classification loss (end2end: one2many + one2one)
+    dfl_loss: float | None = None           # Train DFL loss (end2end: one2many + one2one)
 
-    # Validation losses (from metrics dict)
-    val_box_loss: float | None = None       # Validation box loss
-    val_cls_loss: float | None = None       # Validation classification loss
-    val_dfl_loss: float | None = None       # Validation DFL loss
+    # Validation losses (from metrics dict). For end2end YOLO heads,
+    # validation uses the one2one/NMS-free path.
+    val_box_loss: float | None = None       # Validation box loss (end2end: one2one path)
+    val_cls_loss: float | None = None       # Validation classification loss (end2end: one2one path)
+    val_dfl_loss: float | None = None       # Validation DFL loss (end2end: one2one path)
 
     # Basic validation metrics (from validator.metrics)
     precision: float | None = None          # Mean precision

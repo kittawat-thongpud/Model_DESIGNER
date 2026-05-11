@@ -25,14 +25,16 @@ When loading job history, the system uses this priority:
 ## Captured Metrics
 
 ### Training Losses
-- `train_box_loss` - Bounding box regression loss
-- `train_cls_loss` - Classification loss
-- `train_dfl_loss` - Distribution Focal Loss
+- `train_box_loss` - Bounding box regression loss from `trainer.loss_items`; for Ultralytics `end2end=True` heads this is `box_loss(one2many) + box_loss(one2one)`
+- `train_cls_loss` - Classification loss from `trainer.loss_items`; for `end2end=True` this is `cls_loss(one2many) + cls_loss(one2one)`
+- `train_dfl_loss` - Distribution Focal Loss from `trainer.loss_items`; for `end2end=True` this is `dfl_loss(one2many) + dfl_loss(one2one)`
+
+Branch-level keys such as `train_box_loss_one2many` or `train_box_loss_one2one` are not emitted by default because Ultralytics `E2EDetectLoss.__call__` returns the summed `loss_items` vector.
 
 ### Validation Losses
-- `val_box_loss` - Validation bounding box loss
-- `val_cls_loss` - Validation classification loss
-- `val_dfl_loss` - Validation DFL loss
+- `val_box_loss` - Validation bounding box loss; for `end2end=True` this comes from the one2one/NMS-free validation path
+- `val_cls_loss` - Validation classification loss; for `end2end=True` this comes from the one2one/NMS-free validation path
+- `val_dfl_loss` - Validation DFL loss; for `end2end=True` this comes from the one2one/NMS-free validation path
 
 ### Validation Metrics
 - `map50` - mAP@0.5

@@ -141,7 +141,7 @@ const SmallLossChart: React.FC<SmallLossChartProps> = ({ title, data, trainKey, 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition-colors">
       <div className="flex justify-between items-center mb-2">
-        <span className="text-xs font-bold text-slate-400 uppercase">{title}</span>
+        <span className="text-xs font-bold text-slate-400 uppercase" title="Train uses trainer.loss_items. For end2end heads this is one2many + one2one summed; validation uses the validator path, typically one2one for end2end.">{title}</span>
         <div className="flex gap-2 items-center">
            <div className="w-2 h-2 rounded-full" style={{backgroundColor: color}}></div>
            <span className="text-[10px] text-slate-500">Train</span>

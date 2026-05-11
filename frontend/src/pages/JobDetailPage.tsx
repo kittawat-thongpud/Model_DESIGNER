@@ -70,7 +70,13 @@ const hsgMetricsFromHistory = (history: EpochMetrics[] | undefined): HsgDetrMetr
   const entries: HsgDetrMetricsEntry[] = [];
   for (const h of history) {
     const epoch = h.epoch;
-    const hsgData = (h as any).hsg_detr as Record<string, number> | undefined;
+    const hAny = h as any;
+    const hsgData = (
+      hAny.hsg_detr
+      ?? hAny.plot?.hsg_detr
+      ?? hAny.plots?.hsg_detr
+      ?? hAny.plot
+    ) as Record<string, unknown> | undefined;
     if (typeof epoch === 'number' && hsgData) {
       entries.push({ ...hsgData, epoch });
     }

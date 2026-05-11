@@ -430,6 +430,8 @@ class CustomDetectionTrainer(DetectionTrainer):
         # HSG-DETR sparse metrics caches for extended_metrics.jsonl persistence
         self._last_hsg_metrics: dict[str, Any] | None = None
         self._last_grad_norms: dict[str, float] = {}
+        self._last_grad_has_nan = False
+        self._last_grad_has_inf = False
 
         def _on_train_batch_end_cb(trainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
@@ -1419,8 +1421,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             metrics[f'grad/{k}_norm'] = v
 
         # ── NaN/Inf flags ────────────────────────────────────────────────
-        has_nan = False
-        has_inf = False
+        has_nan = bool(getattr(self, '_last_grad_has_nan', False))
+        has_inf = bool(getattr(self, '_last_grad_has_inf', False))
         for n, p in model.named_parameters():
             if p.grad is not None:
                 if torch.isnan(p.grad).any():
@@ -1505,10 +1507,11 @@ class CustomDetectionTrainer(DetectionTrainer):
             )
             return
 
+        # Cache grad norms while gradients are definitely still attached.
+        # Some optimizer/scaler paths may mutate or clear grads during step.
+        self._cache_last_step_grad_norms()
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        # Cache grad norms BEFORE zero_grad clears them (for _log_hsg_detr_metrics)
-        self._cache_last_step_grad_norms()
         self.optimizer.zero_grad()
         self._nonfinite_grad_steps = 0
         self._assert_batchnorm_buffers_finite("before EMA update")
@@ -1559,6 +1562,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                 payload,
             )
 
+        self._cache_last_step_grad_norms()
         self.optimizer.zero_grad(set_to_none=True)
 
         if self._nonfinite_grad_steps <= self._max_nonfinite_grad_skips:
@@ -1585,6 +1589,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             model = unwrap_model(self.model)
         except Exception:
             return
+        self._last_grad_has_nan = False
+        self._last_grad_has_inf = False
 
         sgb_roles: dict[int, str] = {}
         decoder_ids: set[int] = set()
@@ -1601,7 +1607,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         if isinstance(parsed_layers, torch.nn.Sequential) or isinstance(parsed_layers, torch.nn.ModuleList):
             for layer_idx, module in enumerate(parsed_layers):
                 cls_name = module.__class__.__name__
-                if cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
+                if cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} or "Detect" in cls_name:
                     region = "decoder"
                 elif backbone_count and layer_idx < backbone_count:
                     region = "backbone"
@@ -1628,6 +1634,24 @@ class CustomDetectionTrainer(DetectionTrainer):
                         sgb_roles[id(param)] = "sgb_norm"
                     else:
                         sgb_roles[id(param)] = "sgb"
+            elif cls_name == "CrossScaleSGA":
+                for local_name, param in module.named_parameters(recurse=True):
+                    if local_name.startswith("gate_"):
+                        sgb_roles[id(param)] = "sgb_gamma"
+                    elif local_name.startswith((
+                        "proj_",
+                        "out_proj_",
+                        "scale_embed",
+                    )):
+                        sgb_roles[id(param)] = "sgb_sparse"
+                    elif local_name.startswith((
+                        "norm",
+                        "pre_norm",
+                        "delta_norm",
+                    )):
+                        sgb_roles[id(param)] = "sgb_norm"
+                    else:
+                        sgb_roles[id(param)] = "sgb"
             elif cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
                 for _, param in module.named_parameters(recurse=True):
                     decoder_ids.add(id(param))
@@ -1636,7 +1660,15 @@ class CustomDetectionTrainer(DetectionTrainer):
         for n, p in model.named_parameters():
             if p.grad is None:
                 continue
-            gn = float(p.grad.norm())
+            grad = p.grad.detach().float()
+            if torch.isnan(grad).any():
+                self._last_grad_has_nan = True
+            if torch.isinf(grad).any():
+                self._last_grad_has_inf = True
+            finite_grad = grad[torch.isfinite(grad)]
+            if finite_grad.numel() == 0:
+                continue
+            gn = float(finite_grad.norm())
             role = sgb_roles.get(id(p))
             if role:
                 grad_norms[role] = max(grad_norms.get(role, 0), gn)
@@ -1651,6 +1683,24 @@ class CustomDetectionTrainer(DetectionTrainer):
             elif 'neck' in n.lower() or 'head' in n.lower():
                 grad_norms['neck'] = max(grad_norms.get('neck', 0), gn)
         
+        if 'sgb' not in grad_norms:
+            sgb_component_norms = [
+                grad_norms[k]
+                for k in ('sgb_sparse', 'sgb_gamma', 'sgb_norm')
+                if k in grad_norms
+            ]
+            if sgb_component_norms:
+                grad_norms['sgb'] = max(sgb_component_norms)
+        for expected_key in (
+            'backbone',
+            'neck',
+            'decoder',
+            'sgb',
+            'sgb_gamma',
+            'sgb_sparse',
+            'sgb_norm',
+        ):
+            grad_norms.setdefault(expected_key, 0.0)
         self._last_grad_norms = grad_norms
 
     def _collect_nonfinite_grad_diagnostics(self, limit: int = 12) -> list[dict[str, Any]]:
@@ -2361,12 +2411,15 @@ class CustomDetectionTrainer(DetectionTrainer):
             "epoch": self.epoch + 1,
             "timestamp": time.time(),
             
-            # Training losses (from trainer.loss_items)
+            # Training losses from trainer.loss_items.
+            # Ultralytics end2end Detect returns loss_items after summing
+            # one2many + one2one branches, so these are aggregate values.
             "train_box_loss": metrics.get('train_box_loss'),
             "train_cls_loss": metrics.get('train_cls_loss'),
             "train_dfl_loss": metrics.get('train_dfl_loss'),
             
-            # Validation losses (from metrics dict)
+            # Validation losses from metrics dict. End2end validation uses the
+            # one2one/NMS-free path; branch-level val losses are not separated.
             "val_box_loss": metrics.get('val_box_loss'),
             "val_cls_loss": metrics.get('val_cls_loss'),
             "val_dfl_loss": metrics.get('val_dfl_loss'),
