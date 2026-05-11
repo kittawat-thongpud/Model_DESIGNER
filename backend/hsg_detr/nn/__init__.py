@@ -21,6 +21,7 @@ from .sparse_global_token_v2 import (
     SGTokenBlockV2,
     RTDETRDecoderV2,
 )
+from .sparse_global_cross import CrossScaleSGA
 
 # Also include hsg_det's SparseGlobalTokenBlock so that when hsg_detr
 # rebuilds parse_model via source-patch, SparseGlobalTokenBlock stays
@@ -46,6 +47,7 @@ _MODULES: dict[str, type] = {
     "RTDETRDecoderSGB": RTDETRDecoderSGB,
     "SGTokenBlockV2": SGTokenBlockV2,
     "RTDETRDecoderV2": RTDETRDecoderV2,
+    "CrossScaleSGA": CrossScaleSGA,
     **_HSG_DET_MODULES,
 }
 
@@ -91,10 +93,10 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
     except Exception:
         return False
 
-    # RTDETRDecoderSGB and RTDETRDecoderV2 must NOT be in base_modules — they
-    # need the special RTDETRDecoder channel-injection path.
-    _rtdetr_variants = {"RTDETRDecoderSGB", "RTDETRDecoderV2"}
-    base_names = [n for n in modules.keys() if n not in _rtdetr_variants]
+    # These modules must NOT be in base_modules — they need special
+    # channel-injection paths handled by their own elif cases below.
+    _special_modules = {"RTDETRDecoderSGB", "RTDETRDecoderV2", "CrossScaleSGA"}
+    base_names = [n for n in modules.keys() if n not in _special_modules]
 
     # ── 1. Insert into base_modules frozenset ────────────────────────────
     base_marker = "\n        }\n    )\n    repeat_modules"
@@ -111,6 +113,54 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
         print("[HSG-DETR] Patched RTDETRDecoder special case for RTDETRDecoderSGB + RTDETRDecoderV2")
     else:
         print("[HSG-DETR] WARNING: RTDETRDecoder check NOT FOUND in parse_model source!")
+
+    # ── 3. Add CrossScaleSGA special-case (injects c1 list, stores c2 as list) ──
+    # Insert after the RTDETRDecoder args.insert line so c2=list is set before ch.append
+    rtdetr_insert_line = "            args.insert(1, [ch[x] for x in f])"
+    cs2ga_case = (
+        "\n        elif m is CrossScaleSGA:"
+        "\n            _cs_ch = [ch[x] for x in f]"
+        "\n            args.insert(0, _cs_ch)"
+        "\n            args.insert(1, _cs_ch)"
+        "\n            c2 = _cs_ch"
+    )
+    if rtdetr_insert_line in src:
+        src = src.replace(rtdetr_insert_line, rtdetr_insert_line + cs2ga_case, 1)
+        print("[HSG-DETR] Added CrossScaleSGA special case to parse_model")
+    else:
+        print("[HSG-DETR] WARNING: RTDETRDecoder args.insert line NOT FOUND — CrossScaleSGA not patched!")
+
+    # ── 4. Patch Detect args to flatten list-channels from CrossScaleSGA ──
+    # Main Detect group uses args.extend([reg_max, end2end, [ch[x]...]])
+    detect_args_old = "            args.extend([reg_max, end2end, [ch[x] for x in f]])"
+    detect_args_new = (
+        "            _dch = []\n"
+        "            for _x in (f if hasattr(f, '__iter__') else [f]):\n"
+        "                _c = ch[_x]\n"
+        "                _dch.extend(_c if isinstance(_c, (list, tuple)) else [_c])\n"
+        "            args.extend([reg_max, end2end, _dch])"
+    )
+    if detect_args_old in src:
+        src = src.replace(detect_args_old, detect_args_new, 1)
+        print("[HSG-DETR] Patched Detect args to handle CrossScaleSGA list channels")
+    else:
+        print("[HSG-DETR] WARNING: Detect args.extend line NOT FOUND — list channel handling not patched!")
+
+    # v10Detect uses args.append([ch[x]...])
+    v10_block_old = "        elif m is v10Detect:\n            args.append([ch[x] for x in f])"
+    v10_block_new = (
+        "        elif m is v10Detect:\n"
+        "            _dch = []\n"
+        "            for _x in (f if hasattr(f, '__iter__') else [f]):\n"
+        "                _c = ch[_x]\n"
+        "                _dch.extend(_c if isinstance(_c, (list, tuple)) else [_c])\n"
+        "            args.append(_dch)"
+    )
+    if v10_block_old in src:
+        src = src.replace(v10_block_old, v10_block_new, 1)
+        print("[HSG-DETR] Patched v10Detect args to handle CrossScaleSGA list channels")
+    else:
+        print("[HSG-DETR] WARNING: v10Detect block NOT FOUND — skipping v10 patch")
 
     # ── 3. Compile and install the patched function ───────────────────────
     new_globals = dict(fn.__globals__)

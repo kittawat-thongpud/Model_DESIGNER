@@ -1,0 +1,92 @@
+# =============================================================================
+# HSG-DETR-N V2c — Long Run (resume from best checkpoint)
+# =============================================================================
+# Resume from V2c short run best checkpoint (ep13, mAP50=0.45634).
+# Goal: determine if 0.456 is the true N-scale ceiling or just early stopping.
+#
+# Key differences from train_hsg_detr_v2c_n.yaml:
+#   pretrained:  fbb8c3a03b0c  (V2c ep13 best weights)
+#   epochs:      100           (was 30)
+#   patience:    25            (was 8)
+#   lr0:         0.00003       (3e-5, ~3× lower — cosine resumes from a warm point)
+#   warmup_epochs: 0           (no warmup — weights already converged)
+#   use_yolo_pretrained: false (checkpoint is HSG-DETR, not YOLO backbone)
+#
+# Metric to watch: whether mAP50 breaks 0.460 by ep30 of this run.
+# If plateau persists at 0.456–0.458, proceed to T1-A (token ratio scaling).
+# =============================================================================
+
+model_id: arch:hsg_detr_v2c
+model_name: HSG-DETR V2c N (CS-SGA, long run)
+model_scale: n
+task: detect
+dataset_name: coco
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+imgsz: 640
+batch: 64
+workers: 8
+cache: disk
+epochs: 100
+patience: 25
+seed: 24
+deterministic: true
+amp: false
+ema: true
+pin_memory: true
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+optimizer: AdamW
+lr0: 0.00003
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.05
+warmup_epochs: 0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.0
+cos_lr: true
+
+# ── Weights ───────────────────────────────────────────────────────────────────
+pretrained: fbb8c3a03b0c
+use_yolo_pretrained: false
+freeze: 0
+resume: false
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+box: 7.5
+cls: 0.5
+dfl: 1.5
+pose: 12
+nbs: 64
+iou: 0.7
+max_det: 300
+agnostic_nms: false
+rect: false
+single_cls: false
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0
+translate: 0.1
+scale: 0.5
+shear: 0
+perspective: 0
+flipud: 0
+fliplr: 0.5
+bgr: 0
+mosaic: 1
+mixup: 0
+copy_paste: 0
+erasing: 0.4
+crop_fraction: 1
+close_mosaic: 10
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+save_period: -1
+val: true
+plots: true
+overlap_mask: true
+mask_ratio: 4
+kobj: 1
