@@ -139,8 +139,23 @@ const HSG_DETR_V2C_FALLBACK: ArchFamily = {
   ],
 };
 
+const HSG_DETR_V3_FALLBACK: ArchFamily = {
+  family: 'hsg_detr_v3',
+  display_name: 'HSG-DETR V3',
+  task_type: 'detect',
+  description: 'HSG-DETR V3 selective detector family. Full V3 keeps Top-M soft-hard routing, SE-gated sparse deltas, and DAM debug metrics; Lean/Ultra trade those pieces away for lower GFLOPs.',
+  supported_scales: [
+    { scale: 'ultra_n', label: 'Ultra Nano (~5.9 M, ~10 GFLOPs) — hd128, no SE, no P3-SGB', plugin_name: 'hsg_detr_v3_ultra_n' },
+    { scale: 'lean_n', label: 'Lean Nano (~5.9 M, ~10.2 GFLOPs) — hd128, no SE, lower SGB ratios', plugin_name: 'hsg_detr_v3_lean_n' },
+    { scale: 'n', label: 'Nano (~10.5 M, ~19 GFLOPs) — full V3, Top-M + SE + DAM metrics', plugin_name: 'hsg_detr_v3_n' },
+    { scale: 's', label: 'Small (~21 M, ~42 GFLOPs) — 150 queries', plugin_name: 'hsg_detr_v3_s' },
+    { scale: 'm', label: 'Medium (~34 M, ~87 GFLOPs) — 200 queries', plugin_name: 'hsg_detr_v3_m' },
+    { scale: 'l', label: 'Large (~56 M, ~185 GFLOPs) — 300 queries', plugin_name: 'hsg_detr_v3_l' },
+  ],
+};
+
 function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
-  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK];
+  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK, HSG_DETR_V3_FALLBACK];
   return fallbacks.reduce(
     (items, fallback) => items.some(f => f.family === fallback.family) ? items : [...items, fallback],
     families,

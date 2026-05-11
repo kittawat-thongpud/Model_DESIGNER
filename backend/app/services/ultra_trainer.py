@@ -1465,39 +1465,68 @@ def _training_worker(
                         yaml_dict["max_channels"] = _scale_vals[2]
                         yaml_dict.pop("scales", None)
             
-            # Handle HSG-DETR V2c specific parameters
-            if arch_plugin.family == "hsg_detr_v2c":
+            # Handle HSG-DETR V2c/V3 specific parameters
+            if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
                 # Get default config options from plugin if available
                 plugin_defaults = {}
                 if hasattr(arch_plugin, 'get_config_options'):
                     plugin_defaults = arch_plugin.get_config_options()
                 
-                # Extract HSG-DETR V2c specific config options (plugin defaults override schema defaults)
+                # Extract HSG-DETR decoder config options (plugin defaults override schema defaults)
                 loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
                 alpha_u = config.get("alpha_u", plugin_defaults.get("alpha_u", 0.3))
                 beta_s = config.get("beta_s", plugin_defaults.get("beta_s", 0.0))
+                soft_hard = config.get("soft_hard", plugin_defaults.get("soft_hard", None))
+                top_m_ratio = config.get("top_m_ratio", plugin_defaults.get("top_m_ratio", None))
+                max_top_k = config.get("max_top_k", plugin_defaults.get("max_top_k", None))
+                max_top_m = config.get("max_top_m", plugin_defaults.get("max_top_m", None))
+                tau = config.get("tau", plugin_defaults.get("tau", None))
+                lambda_soft = config.get("lambda_soft", plugin_defaults.get("lambda_soft", None))
+                eta = config.get("eta", plugin_defaults.get("eta", None))
+                for _metric_key in ("enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics"):
+                    if _metric_key not in config and _metric_key in plugin_defaults:
+                        config[_metric_key] = plugin_defaults[_metric_key]
                 
-                # Update decoder parameters in YAML
                 if "head" in yaml_dict:
                     for i, layer in enumerate(yaml_dict["head"]):
                         if isinstance(layer, list) and len(layer) >= 4:
-                            # Check if this is the RTDETRDecoderV2 layer
                             if layer[2] == "RTDETRDecoderV2":
-                                # Update decoder parameters: [nc, hd, nq, loc_quality_mode, alpha_u, beta_s]
                                 if len(layer) >= 4 and isinstance(layer[3], list):
-                                    # Update existing parameters
                                     params = layer[3]
                                     if len(params) >= 3:
+                                        while len(params) < 6:
+                                            params.append(None)
                                         params[3] = loc_quality_mode  # loc_quality_mode
-                                        if len(params) >= 5:
-                                            params[4] = alpha_u  # alpha_u
-                                            params[5] = beta_s   # beta_s
-                                        else:
-                                            params.extend([alpha_u, beta_s])
-                                break
+                                        params[4] = alpha_u  # alpha_u
+                                        params[5] = beta_s   # beta_s
+                            elif layer[2] == "SGTokenBlockV2" and isinstance(layer[3], list):
+                                params = layer[3]
+                                # SGTokenBlockV2 args after parse_model channel injection:
+                                # [c2, ratio, mode, debug, gamma, channel_se, se_reduction,
+                                #  soft_hard, top_m_ratio, max_top_k, max_top_m, tau, lambda_soft, eta]
+                                while len(params) < 14:
+                                    defaults = [None, 0.25, "topk", False, 0.0001, False, 4,
+                                                False, 1.0, 768, 1024, 1.0, 0.0, 0.0]
+                                    params.append(defaults[len(params)])
+                                if soft_hard is not None:
+                                    params[7] = soft_hard
+                                if top_m_ratio is not None:
+                                    params[8] = top_m_ratio
+                                if max_top_k is not None:
+                                    params[9] = max_top_k
+                                if max_top_m is not None:
+                                    params[10] = max_top_m
+                                if tau is not None:
+                                    params[11] = tau
+                                if lambda_soft is not None:
+                                    params[12] = lambda_soft
+                                if eta is not None:
+                                    params[13] = eta
                 
                 job_storage.append_job_log(job_id, "INFO",
-                    f"HSG-DETR V2c config: loc_quality_mode={loc_quality_mode}, alpha_u={alpha_u}, beta_s={beta_s}")
+                    f"HSG-DETR config: loc_quality_mode={loc_quality_mode}, alpha_u={alpha_u}, beta_s={beta_s}, "
+                    f"soft_hard={soft_hard}, top_m_ratio={top_m_ratio}, lambda_soft={lambda_soft}, eta={eta}, "
+                    f"dam_metrics={config.get('enable_dam_metrics', False)}")
             
             # Write patched YAML
             patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
@@ -1931,6 +1960,9 @@ def _training_worker(
             'record_weights': config.pop('record_weights', False),
             'weight_interval': config.pop('weight_interval', 1),
             'sample_per_class': config.pop('sample_per_class', 0),
+            'enable_query_metrics': config.pop('enable_query_metrics', True),
+            'enable_gt_metrics': config.pop('enable_gt_metrics', False),
+            'enable_dam_metrics': config.pop('enable_dam_metrics', False),
         }
 
         # ── Pop Model Designer fields that are NOT valid Ultralytics kwargs ───

@@ -29,9 +29,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import nullcontext
 
 from ultralytics.nn.modules.head import RTDETRDecoder
+from ultralytics.nn.modules.transformer import MSDeformAttn
+from ultralytics.nn.modules.utils import multi_scale_deformable_attn_pytorch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,13 +55,6 @@ def _safe_inverse_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return torch.log(x / (1.0 - x))
 
 
-def _fp32_island(device: torch.device):
-    """Disable AMP autocast for numerically sensitive FP32 ops."""
-    if device.type in {"cuda", "cpu"}:
-        return torch.autocast(device_type=device.type, enabled=False)
-    return nullcontext()
-
-
 def _cast_to_param_dtype(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
     """Cast x to match the first parameter dtype of module.  AMP-safe."""
     try:
@@ -72,6 +66,57 @@ def _cast_to_param_dtype(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
 
 def _finite_guard(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     return torch.nan_to_num(x, nan=0.0, posinf=limit, neginf=-limit).clamp(-limit, limit)
+
+
+def _norm01(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x_min = x.min(dim=1, keepdim=True).values
+    x_max = x.max(dim=1, keepdim=True).values
+    return (x - x_min) / (x_max - x_min).clamp(min=eps)
+
+
+class HSGMSDeformAttn(MSDeformAttn):
+    """MSDeformAttn variant that stores approximate DAM sampling tensors."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        refer_bbox: torch.Tensor,
+        value: torch.Tensor,
+        value_shapes: list,
+        value_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        bs, len_q = query.shape[:2]
+        len_v = value.shape[1]
+        assert sum(s[0] * s[1] for s in value_shapes) == len_v
+
+        value_proj = self.value_proj(value)
+        if value_mask is not None:
+            value_proj = value_proj.masked_fill(value_mask[..., None], float(0))
+        value_proj = value_proj.view(bs, len_v, self.n_heads, self.d_model // self.n_heads)
+        sampling_offsets = self.sampling_offsets(query).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points, 2
+        )
+        attention_weights = self.attention_weights(query).view(
+            bs, len_q, self.n_heads, self.n_levels * self.n_points
+        )
+        attention_weights = F.softmax(attention_weights, -1).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points
+        )
+        num_points = refer_bbox.shape[-1]
+        if num_points == 2:
+            offset_normalizer = torch.as_tensor(value_shapes, dtype=query.dtype, device=query.device).flip(-1)
+            add = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            sampling_locations = refer_bbox[:, :, None, :, None, :] + add
+        elif num_points == 4:
+            add = sampling_offsets / self.n_points * refer_bbox[:, :, None, :, None, 2:] * 0.5
+            sampling_locations = refer_bbox[:, :, None, :, None, :2] + add
+        else:
+            raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {num_points}.")
+
+        self.last_attention_weights = attention_weights.detach()
+        self.last_sampling_locations = sampling_locations.detach()
+        output = multi_scale_deformable_attn_pytorch(value_proj, value_shapes, sampling_locations, attention_weights)
+        return self.output_proj(output)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +149,13 @@ class SGTokenBlockV2(nn.Module):
         gamma_init: float = 1e-4,
         channel_se: bool = False,
         se_reduction: int = 4,
+        soft_hard: bool = False,
+        top_m_ratio: float = 1.0,
+        max_top_k: int = 768,
+        max_top_m: int = 1024,
+        tau: float = 1.0,
+        lambda_soft: float = 0.0,
+        eta: float = 0.0,
     ) -> None:
         super().__init__()
         assert c1 == c2, f"SGTokenBlockV2 is channel-preserving (c1={c1}, c2={c2})"
@@ -137,6 +189,27 @@ class SGTokenBlockV2(nn.Module):
             self.se_fc1 = nn.Linear(c2, mid, bias=False)
             self.se_fc2 = nn.Linear(mid, c2, bias=False)
 
+        # V3 selector head: zero-init keeps eta=0/early warmup identical to
+        # the parameter-free L2 selector while giving Phase 4 a learnable path.
+        selector_mid = max(1, int(c2) // 4)
+        self.selector_head = nn.Sequential(
+            nn.Conv2d(c2, selector_mid, 1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(selector_mid, 1, 1, bias=True),
+        )
+        nn.init.zeros_(self.selector_head[-1].weight)
+        nn.init.zeros_(self.selector_head[-1].bias)
+
+        # Phase 3 Top-M soft-hard selector controls. Defaults preserve V2c.
+        self.soft_hard = bool(soft_hard)
+        self.top_m_ratio = max(1.0, float(top_m_ratio))
+        self.max_top_k = max(1, int(max_top_k))
+        self.max_top_m = max(1, int(max_top_m))
+        self.tau = max(float(tau), 1e-4)
+        self.lambda_soft = max(0.0, min(float(lambda_soft), 1.0))
+        self.eta = float(eta)
+        self.lambda_selector = 0.0
+
         # LayerScale — starts near zero so CNN path dominates early training
         self.gamma = nn.Parameter(torch.full((1, c2, 1, 1), float(gamma_init)))
         self._attn_scale = float(c2 ** -0.5)
@@ -151,6 +224,17 @@ class SGTokenBlockV2(nn.Module):
         self.last_k: int | None = None
         self.last_N: int | None = None
         self.last_score_std: float | None = None   # T2-B: σ for budget formula
+        self.last_top_m: int | None = None
+        self.last_k_eff: int | None = None
+        self.last_tau: float | None = None
+        self.last_lambda_soft: float | None = None
+        self.last_soft_nonhard_mass: float | None = None
+        self.last_topm_extra_mass: float | None = None
+        self.last_hard_delta_norm: float | None = None
+        self.last_nonhard_delta_norm: float | None = None
+        self.last_selected_indices: torch.Tensor | None = None
+        self.last_selector_logits: torch.Tensor | None = None
+        self.last_selector_logits_detached: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -167,6 +251,18 @@ class SGTokenBlockV2(nn.Module):
             "last_k": None,
             "last_N": None,
             "last_score_std": None,
+            "last_top_m": None,
+            "last_k_eff": None,
+            "last_tau": None,
+            "last_lambda_soft": None,
+            "last_soft_nonhard_mass": None,
+            "last_topm_extra_mass": None,
+            "last_hard_delta_norm": None,
+            "last_nonhard_delta_norm": None,
+            "last_selected_indices": None,
+            "last_selector_logits": None,
+            "last_selector_logits_detached": None,
+            "lambda_selector": 0.0,
         }
         for k, v in defaults.items():
             if not hasattr(self, k):
@@ -186,6 +282,8 @@ class SGTokenBlockV2(nn.Module):
             "k": self.last_k,
             "N": self.last_N,
             "score_std": self.last_score_std,
+            "top_m": self.last_top_m,
+            "k_eff": self.last_k_eff,
         }
 
     def set_debug(self, enabled: bool = True, cpu: bool = False) -> None:
@@ -214,6 +312,21 @@ class SGTokenBlockV2(nn.Module):
             return N
         return max(1, min(int(round(self.ratio * N)), N))
 
+    def set_soft_hard_schedule(self, tau: float | None = None, lambda_soft: float | None = None) -> None:
+        if tau is not None:
+            self.tau = max(float(tau), 1e-4)
+        if lambda_soft is not None:
+            self.lambda_soft = max(0.0, min(float(lambda_soft), 1.0))
+
+    def set_selector_schedule(self, eta: float | None = None, lambda_selector: float | None = None) -> None:
+        if eta is not None:
+            self.eta = float(eta)
+        if lambda_selector is not None:
+            self.lambda_selector = max(0.0, float(lambda_selector))
+
+    def clear_aux_state(self) -> None:
+        self.last_selector_logits = None
+
     # ------------------------------------------------------------------ #
     # Core attention (FP32 island — numerically explicit)
     # ------------------------------------------------------------------ #
@@ -223,13 +336,15 @@ class SGTokenBlockV2(nn.Module):
         q: torch.Tensor,   # (B, C, N)
         k: torch.Tensor,   # (B, C, N)
         v: torch.Tensor,   # (B, C, N)
-        topk_idx: torch.Tensor,  # (B, k)
+        select_idx: torch.Tensor,  # (B, k or M)
         B: int, C: int, H: int, W: int,
         input_dtype: torch.dtype,
+        gate: torch.Tensor | None = None,  # (B, k or M)
+        hard_mask: torch.Tensor | None = None,  # (B, k or M)
     ) -> torch.Tensor:
         """Run selected-token self-attention. Returns delta in input_dtype."""
         N = H * W
-        idx_exp = topk_idx.unsqueeze(1).expand(-1, C, -1)  # (B, C, k)
+        idx_exp = select_idx.unsqueeze(1).expand(-1, C, -1)  # (B, C, k/M)
         idx_exp = idx_exp.clamp(0, N - 1)
 
         q_sel = torch.gather(q, 2, idx_exp).transpose(1, 2)   # (B, k, C)
@@ -265,12 +380,32 @@ class SGTokenBlockV2(nn.Module):
         # GroupNorm on delta — AMP-safe: cast to GN weight dtype
         delta = self.delta_norm(delta.to(dtype=self.delta_norm.weight.dtype))
 
-        # Mask: keep only selected positions (GroupNorm can pollute zeros)
+        # Mask/gate after GroupNorm so normalization does not erase the
+        # soft-hard weighting. gate=None is the legacy hard top-k mask.
         delta_mask = torch.zeros(B, 1, N, device=delta.device, dtype=delta.dtype)
-        delta_mask.scatter_(2, topk_idx.unsqueeze(1), 1.0)
-        delta = delta * delta_mask.view(B, 1, H, W)
+        if gate is None:
+            gate_values = torch.ones_like(select_idx, dtype=delta.dtype)
+            hard_values = gate_values
+        else:
+            gate_values = gate.to(device=delta.device, dtype=delta.dtype)
+            hard_values = (
+                hard_mask.to(device=delta.device, dtype=delta.dtype)
+                if hard_mask is not None
+                else (gate_values > 0).to(dtype=delta.dtype)
+            )
+        delta_mask.scatter_(2, select_idx.unsqueeze(1), gate_values.unsqueeze(1))
+        gated_delta = delta * delta_mask.view(B, 1, H, W)
 
-        return delta.to(dtype=input_dtype)
+        with torch.no_grad():
+            hard_map = torch.zeros(B, 1, N, device=delta.device, dtype=delta.dtype)
+            hard_map.scatter_(2, select_idx.unsqueeze(1), hard_values.unsqueeze(1))
+            nonhard_map = (delta_mask - hard_map).clamp_min(0.0)
+            hard_norm = (gated_delta * hard_map.view(B, 1, H, W)).detach().float().norm()
+            nonhard_norm = (gated_delta * nonhard_map.view(B, 1, H, W)).detach().float().norm()
+            self.last_hard_delta_norm = float(hard_norm.item())
+            self.last_nonhard_delta_norm = float(nonhard_norm.item())
+
+        return gated_delta.to(dtype=input_dtype)
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -300,24 +435,77 @@ class SGTokenBlockV2(nn.Module):
         k = self.k_proj(x_p).view(B, C, N)
         v = self.v_proj(x_p).view(B, C, N)
 
-        # ── L2 saliency (parameter-free, detached) ────────────────────────
+        # ── L2 prior + optional learnable selector logits ─────────────────
+        selector_dtype = self.selector_head[0].weight.dtype
+        learned_score = self.selector_head(x_norm.to(dtype=selector_dtype)).flatten(1).float()
         with torch.no_grad():
-            importance = x_norm.float().view(B, C, N).pow(2).sum(dim=1)  # (B, N)
-            importance = torch.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+            l2_score = x_norm.detach().float().view(B, C, N).pow(2).sum(dim=1)  # (B, N)
+            l2_score = torch.nan_to_num(l2_score, nan=0.0, posinf=0.0, neginf=0.0)
+            l2_score_n = _norm01(l2_score)
             # T2-B: log σ for token budget formula k_ε/n ≈ Φ_c(σ + Φ⁻¹(ε))
-            self.last_score_std = float(importance.std(dim=1).mean().item())
+            self.last_score_std = float(l2_score.std(dim=1, unbiased=False).mean().item())
+
+        eta = float(getattr(self, "eta", 0.0))
+        selector_logits = l2_score_n + eta * learned_score
+        selector_logits = torch.nan_to_num(selector_logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        if self.training and float(getattr(self, "lambda_selector", 0.0)) > 0.0:
+            self.last_selector_logits = selector_logits
+        else:
+            self.last_selector_logits = None
+        self.last_selector_logits_detached = selector_logits.detach()
+        importance = selector_logits
 
         if self.mode == "dense":
             topk_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
             self._store_debug(topk_idx, None)
+            self.last_selected_indices = topk_idx.detach()
+            select_idx = topk_idx
+            gate = hard_mask = None
+            k_eff = k_actual
+            top_m = k_actual
         else:
             if not torch.isfinite(importance).any():
                 importance = torch.ones_like(importance)
-            topk_idx = torch.topk(importance, k_actual, dim=1).indices
+            lambda_soft = max(0.0, min(float(getattr(self, "lambda_soft", 0.0)), 1.0))
+            tau = max(float(getattr(self, "tau", 1.0)), 1e-4)
+            use_soft_hard = bool(getattr(self, "soft_hard", False)) and self.training and lambda_soft > 0.0
+            if use_soft_hard:
+                max_top_k = max(1, int(getattr(self, "max_top_k", k_actual)))
+                max_top_m = max(1, int(getattr(self, "max_top_m", max_top_k)))
+                k_eff = max(1, min(k_actual, max_top_k, N))
+                top_m_ratio = max(1.0, float(getattr(self, "top_m_ratio", 1.0)))
+                top_m = max(k_eff, min(int(round(top_m_ratio * k_eff)), N, max_top_m))
+                select_idx = torch.topk(importance, top_m, dim=1).indices.clamp(0, N - 1).long()
+                score_m = torch.gather(importance, 1, select_idx)
+                hard_pos = torch.topk(score_m, k_eff, dim=1).indices
+                hard_mask = torch.zeros_like(score_m)
+                hard_mask.scatter_(1, hard_pos, 1.0)
+                soft_gate = float(k_eff) * torch.softmax(score_m / tau, dim=-1)
+                gate = (1.0 - lambda_soft) * hard_mask + lambda_soft * soft_gate
+                with torch.no_grad():
+                    nonhard_mass = (gate * (1.0 - hard_mask)).sum(dim=1).mean()
+                    total_mass = gate.sum(dim=1).clamp_min(1e-6).mean()
+                    self.last_soft_nonhard_mass = float(nonhard_mass.detach().item())
+                    self.last_topm_extra_mass = float((nonhard_mass / total_mass).detach().item())
+                topk_idx = torch.gather(select_idx, 1, hard_pos).clamp(0, N - 1).long()
+            else:
+                k_eff = k_actual
+                top_m = k_actual
+                topk_idx = torch.topk(importance, k_actual, dim=1).indices
+                select_idx = topk_idx.clamp(0, N - 1).long()
+                gate = hard_mask = None
+                self.last_soft_nonhard_mass = 0.0
+                self.last_topm_extra_mass = 0.0
             topk_idx = topk_idx.clamp(0, N - 1).long()
             self._store_debug(topk_idx, importance)
+            self.last_selected_indices = topk_idx.detach()
 
-        delta = self._sparse_attn_delta(q, k, v, topk_idx, B, C, H, W, input_dtype)
+        self.last_k_eff = int(k_eff)
+        self.last_top_m = int(top_m)
+        self.last_tau = float(getattr(self, "tau", 1.0))
+        self.last_lambda_soft = 0.0 if not self.training else float(getattr(self, "lambda_soft", 0.0))
+
+        delta = self._sparse_attn_delta(q, k, v, select_idx, B, C, H, W, input_dtype, gate=gate, hard_mask=hard_mask)
 
         # ── Channel-selective SE gate ─────────────────────────────────────
         # Squeeze: global avg of delta over spatial dims (only attended positions
@@ -404,6 +592,13 @@ class RTDETRDecoderV2(RTDETRDecoder):
         self.alpha_u = alpha_u
         # Phase 2: Store SGB role separation parameter
         self.beta_s = beta_s
+        self.enable_query_metrics = True
+        self.enable_gt_metrics = False
+        self.enable_dam_metrics = False
+        self.last_dam_by_level: list[torch.Tensor] | None = None
+        self.last_dam_metrics: dict[str, float] = {}
+        self.metrics_buffer: dict[str, float] = {}
+        self._install_dam_capture()
 
     def __setstate__(self, state: dict) -> None:
         super().__setstate__(state)
@@ -411,22 +606,122 @@ class RTDETRDecoderV2(RTDETRDecoder):
 
     def _ensure_runtime_attrs(self) -> None:
         alpha = getattr(self, "alpha", None)
-        if isinstance(alpha, torch.Tensor) and "alpha" in getattr(self, "_buffers", {}):
+        alpha_ok = isinstance(alpha, torch.Tensor) and "alpha" in getattr(self, "_buffers", {})
+        if not alpha_ok:
+            legacy_alpha_logit = getattr(self, "alpha_logit", None)
+            if isinstance(legacy_alpha_logit, torch.Tensor):
+                value = float(self.ALPHA_MAX) * torch.sigmoid(legacy_alpha_logit.detach().float())
+                value = value.reshape(())
+            elif isinstance(alpha, torch.Tensor):
+                value = alpha.detach().float().reshape(())
+            else:
+                value = torch.tensor(0.0)
+            if "alpha" in getattr(self, "_buffers", {}):
+                self._buffers["alpha"] = value
+            else:
+                if hasattr(self, "alpha"):
+                    delattr(self, "alpha")
+                self.register_buffer("alpha", value, persistent=True)
+        if not hasattr(self, "loc_quality_mode"):
+            self.loc_quality_mode = "area"
+        if not hasattr(self, "alpha_u"):
+            self.alpha_u = 0.3
+        if not hasattr(self, "beta_s"):
+            self.beta_s = 0.0
+        if not hasattr(self, "enable_query_metrics"):
+            self.enable_query_metrics = True
+        if not hasattr(self, "enable_gt_metrics"):
+            self.enable_gt_metrics = False
+        if not hasattr(self, "enable_dam_metrics"):
+            self.enable_dam_metrics = False
+        if not hasattr(self, "last_dam_by_level"):
+            self.last_dam_by_level = None
+        if not hasattr(self, "last_dam_metrics"):
+            self.last_dam_metrics = {}
+        if not hasattr(self, "metrics_buffer"):
+            self.metrics_buffer = {}
+
+    def _install_dam_capture(self) -> None:
+        """Store approximate MSDeformAttn sampling mass without changing outputs."""
+        for layer in getattr(getattr(self, "decoder", None), "layers", []):
+            attn = getattr(layer, "cross_attn", None)
+            if attn is None or getattr(attn, "_hsg_dam_capture", False):
+                continue
+            if isinstance(attn, MSDeformAttn) and not isinstance(attn, HSGMSDeformAttn):
+                attn.__class__ = HSGMSDeformAttn
+            attn._hsg_dam_capture = True
+
+    def _dam_levels_from_cross_attn(self, shapes: list[list[int]]) -> list[torch.Tensor] | None:
+        """Approximate deformable-attention occupancy per encoder level.
+
+        This is a sampling-mass map from MSDeformAttn sampling points, not a
+        dense cross-attention matrix over every encoder token.
+        """
+        levels_accum: list[torch.Tensor] | None = None
+        used = 0
+        layers = list(getattr(getattr(self, "decoder", None), "layers", []))[-2:]
+        for layer in layers:
+            attn = getattr(layer, "cross_attn", None)
+            loc = getattr(attn, "last_sampling_locations", None)
+            weights = getattr(attn, "last_attention_weights", None)
+            if loc is None or weights is None:
+                continue
+            bs, nq, nh, nl, np_, _ = loc.shape
+            current: list[torch.Tensor] = []
+            for li, shape in enumerate(shapes):
+                h, w = int(shape[0]), int(shape[1])
+                loc_l = loc[:, :, :, li, :, :].float()
+                mass_l = weights[:, :, :, li, :].float()
+                valid = (
+                    (loc_l[..., 0] >= 0.0)
+                    & (loc_l[..., 0] <= 1.0)
+                    & (loc_l[..., 1] >= 0.0)
+                    & (loc_l[..., 1] <= 1.0)
+                )
+                x_idx = (loc_l[..., 0] * max(w - 1, 1)).round().long().clamp(0, w - 1)
+                y_idx = (loc_l[..., 1] * max(h - 1, 1)).round().long().clamp(0, h - 1)
+                flat_idx = (y_idx * w + x_idx).reshape(bs * nq, nh * np_)
+                flat_mass = (mass_l * valid.to(dtype=mass_l.dtype)).reshape(bs * nq, nh * np_)
+                dam = torch.zeros(bs * nq, h * w, device=loc.device, dtype=torch.float32)
+                dam.scatter_add_(1, flat_idx, flat_mass)
+                current.append(dam.view(bs, nq, h * w))
+            if levels_accum is None:
+                levels_accum = current
+            else:
+                levels_accum = [a + b for a, b in zip(levels_accum, current)]
+            used += 1
+        if not levels_accum or used == 0:
+            return None
+        return [x / float(used) for x in levels_accum]
+
+    def _store_dam_metrics(self, dam_levels: list[torch.Tensor] | None, dec_scores: torch.Tensor) -> None:
+        if not dam_levels:
+            self.last_dam_by_level = None
+            self.last_dam_metrics = {}
             return
-        legacy_alpha_logit = getattr(self, "alpha_logit", None)
-        if isinstance(legacy_alpha_logit, torch.Tensor):
-            value = float(self.ALPHA_MAX) * torch.sigmoid(legacy_alpha_logit.detach().float())
-            value = value.reshape(())
-        elif isinstance(alpha, torch.Tensor):
-            value = alpha.detach().float().reshape(())
-        else:
-            value = torch.tensor(0.0)
-        if "alpha" in getattr(self, "_buffers", {}):
-            self._buffers["alpha"] = value
-        else:
-            if hasattr(self, "alpha"):
-                delattr(self, "alpha")
-            self.register_buffer("alpha", value, persistent=True)
+        with torch.no_grad():
+            query_conf = dec_scores[-1].detach().float().sigmoid().max(-1).values
+            topq = max(1, min(query_conf.shape[1], query_conf.shape[1] // 4 or 1))
+            topq_idx = torch.topk(query_conf, topq, dim=1).indices
+            summarized: list[torch.Tensor] = []
+            metrics: dict[str, float] = {}
+            names = ("P3", "P4", "P5")
+            for i, dam in enumerate(dam_levels):
+                gather_idx = topq_idx.unsqueeze(-1).expand(-1, -1, dam.shape[-1])
+                dam_top = torch.gather(dam, 1, gather_idx).mean(dim=1)
+                dam_top = torch.nan_to_num(dam_top, nan=0.0, posinf=0.0, neginf=0.0)
+                summarized.append(dam_top.detach())
+                level = names[i] if i < len(names) else f"L{i}"
+                metrics[f"dam/{level}_sampling_mass"] = float(dam_top.sum(dim=1).mean().item())
+            self.last_dam_by_level = summarized
+            self.last_dam_metrics = metrics
+
+    def clear_aux_state(self) -> None:
+        for layer in getattr(getattr(self, "decoder", None), "layers", []):
+            attn = getattr(layer, "cross_attn", None)
+            if attn is not None:
+                attn.last_attention_weights = None
+                attn.last_sampling_locations = None
 
     def set_alpha(self, value: float) -> None:
         self._ensure_runtime_attrs()
@@ -518,24 +813,30 @@ class RTDETRDecoderV2(RTDETRDecoder):
             u_max = uncertainty.max(1, keepdim=True).values
             uncertainty_n = (uncertainty - u_min) / (u_max - u_min).clamp(min=eps)
 
-            # Phase 1+2: Combined score with optional SGB saliency
-            alpha_u = torch.tensor(self.alpha_u, device=feats.device, dtype=cls_n.dtype)
-            alpha_u = alpha_u.clamp(0.0, float(self.ALPHA_MAX))
+            # Phase 1+2: Combined score with scheduled uncertainty penalty.
+            alpha_progress = (self.alpha / self.ALPHA_MAX).to(device=feats.device, dtype=cls_n.dtype)
+            alpha_progress = alpha_progress.clamp(0.0, 1.0)
+            alpha_u = torch.tensor(float(self.alpha_u), device=feats.device, dtype=cls_n.dtype).clamp(0.0, 1.0)
+            alpha_eff = alpha_progress * alpha_u
             
             # Base score: high cls, low uncertainty
-            base_score = (cls_n - alpha_u * uncertainty_n).clamp(-20.0, 20.0)
+            base_score = (cls_n - alpha_eff * uncertainty_n).clamp(-20.0, 20.0)
             
-            # Phase 2: Add SGB saliency if beta_s > 0
+            # Phase 2: optional feature-norm saliency proxy. This is not the
+            # SGTokenBlock selector saliency; keep beta_s=0 for clean LQ ablations.
             if self.beta_s > 0.0:
-                # Get SGB saliency from upstream SGTokenBlockV2 (if available)
-                # For now, use a simple proxy based on feature norm
-                sgb_saliency = features.detach().norm(dim=-1)  # (bs, hw)
-                s_min = sgb_saliency.min(1, keepdim=True).values
-                s_max = sgb_saliency.max(1, keepdim=True).values
-                sgb_saliency_n = (sgb_saliency - s_min) / (s_max - s_min).clamp(min=eps)
+                feature_norm_saliency = torch.nan_to_num(
+                    features.detach().float().norm(dim=-1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )  # (bs, hw)
+                s_min = feature_norm_saliency.min(1, keepdim=True).values
+                s_max = feature_norm_saliency.max(1, keepdim=True).values
+                feature_norm_saliency_n = (feature_norm_saliency - s_min) / (s_max - s_min).clamp(min=eps)
                 
                 beta_s = torch.tensor(self.beta_s, device=feats.device, dtype=cls_n.dtype)
-                combined = (base_score + beta_s * sgb_saliency_n).clamp(-20.0, 20.0)
+                combined = (base_score + beta_s * feature_norm_saliency_n.to(dtype=cls_n.dtype)).clamp(-20.0, 20.0)
             else:
                 combined = base_score
                 
@@ -578,7 +879,7 @@ class RTDETRDecoderV2(RTDETRDecoder):
             embeddings = torch.cat([dn_embed, embeddings], 1)
 
         # Phase 0: Instrumentation metrics - log without changing behavior
-        if self.training and hasattr(self, '_log_metrics'):
+        if self.training and getattr(self, "enable_query_metrics", True):
             self._log_query_metrics(
                 cls_conf=cls_conf,
                 loc_conf=loc_conf,
@@ -586,7 +887,10 @@ class RTDETRDecoderV2(RTDETRDecoder):
                 combined=combined,
                 topk_ind=topk_ind,
                 enc_bboxes=enc_bboxes,
-                shapes=shapes
+                shapes=shapes,
+                alpha_progress=alpha_progress,
+                alpha_u=alpha_u,
+                alpha_eff=alpha_eff,
             )
 
         return embeddings, refer_bbox, enc_bboxes, enc_scores
@@ -604,12 +908,21 @@ class RTDETRDecoderV2(RTDETRDecoder):
         topk_ind: torch.Tensor,
         enc_bboxes: torch.Tensor,
         shapes: list[list[int]],
+        alpha_progress: torch.Tensor | None = None,
+        alpha_u: torch.Tensor | None = None,
+        alpha_eff: torch.Tensor | None = None,
     ) -> None:
         """Log query selection metrics for analysis without changing behavior."""
         if not hasattr(self, 'metrics_buffer'):
             self.metrics_buffer = {}
         
         bs, hw = cls_conf.shape
+        combined_metric = torch.nan_to_num(
+            combined.detach().float(),
+            nan=0.0,
+            posinf=20.0,
+            neginf=-20.0,
+        ).clamp(-20.0, 20.0)
         
         # Basic statistics
         self.metrics_buffer['cls_conf_mean'] = cls_conf.mean().item()
@@ -629,8 +942,8 @@ class RTDETRDecoderV2(RTDETRDecoder):
         self.metrics_buffer['selected_uncertainty_mean'] = selected_uncertainty.mean().item()
         
         # Score distribution analysis
-        all_scores_flat = combined.view(-1)
-        selected_scores_flat = combined.gather(1, topk_ind.view(bs, -1)).view(-1)
+        all_scores_flat = combined_metric.view(-1)
+        selected_scores_flat = combined_metric.gather(1, topk_ind.view(bs, -1)).view(-1)
         
         self.metrics_buffer['score_mean'] = all_scores_flat.mean().item()
         self.metrics_buffer['score_std'] = all_scores_flat.std().item()
@@ -638,7 +951,7 @@ class RTDETRDecoderV2(RTDETRDecoder):
         self.metrics_buffer['selected_score_std'] = selected_scores_flat.std().item()
         
         # Query diversity (entropy of score distribution)
-        score_probs = torch.softmax(combined, dim=1)
+        score_probs = torch.softmax(combined_metric, dim=1)
         entropy = -(score_probs * torch.log(score_probs + 1e-8)).sum(dim=1)
         self.metrics_buffer['score_entropy_mean'] = entropy.mean().item()
         
@@ -653,6 +966,12 @@ class RTDETRDecoderV2(RTDETRDecoder):
         self.metrics_buffer['beta_s'] = getattr(self, 'beta_s', 0.0)
         self.metrics_buffer['loc_quality_mode'] = getattr(self, 'loc_quality_mode', 'area')
         self.metrics_buffer['alpha_u'] = getattr(self, 'alpha_u', 0.3)
+        if alpha_progress is not None:
+            self.metrics_buffer['alpha_progress'] = float(alpha_progress.detach().float().item())
+        if alpha_u is not None:
+            self.metrics_buffer['alpha_u'] = float(alpha_u.detach().float().item())
+        if alpha_eff is not None:
+            self.metrics_buffer['alpha_eff'] = float(alpha_eff.detach().float().item())
 
     def get_metrics(self) -> dict[str, float]:
         """Get accumulated metrics and clear buffer."""
@@ -665,11 +984,11 @@ class RTDETRDecoderV2(RTDETRDecoder):
 
     def enable_metrics_logging(self) -> None:
         """Enable metrics logging during training."""
-        self._log_metrics = True
+        self.enable_query_metrics = True
 
     def disable_metrics_logging(self) -> None:
         """Disable metrics logging during training."""
-        self._log_metrics = False
+        self.enable_query_metrics = False
 
     # ------------------------------------------------------------------ #
     # T1-A Look-Forward-Twice decoder
@@ -780,6 +1099,12 @@ class RTDETRDecoderV2(RTDETRDecoder):
         dec_bboxes, dec_scores = self._decoder_forward_lft(
             embed, refer_bbox, feats, shapes, attn_mask=attn_mask,
         )
+        if getattr(self, "enable_dam_metrics", False):
+            self._store_dam_metrics(self._dam_levels_from_cross_attn(shapes), dec_scores)
+        else:
+            self.last_dam_by_level = None
+            self.last_dam_metrics = {}
+            self.clear_aux_state()
 
         # Cast to embed dtype for AMP compatibility
         out_dtype = embed.dtype

@@ -3,11 +3,8 @@ HSG-DETR V2c Model Architecture Plugin.
 
 CNN hybrid detector with SparseGlobalTokenBlockV2 at P3/P4/P5.
 Channel-selective squeeze-excitation gate in V2c.
-Supports Phase 1-2 experiments: localization quality proxy and SGB role separation.
-
-Registers as: "hsg_detr_v2c", "hsg_detr_v2c_phase1_lq_stability", 
-           "hsg_detr_v2c_phase1_lq_consistency", "hsg_detr_v2c_phase2_beta0",
-           "hsg_detr_v2c_phase2_beta05", "hsg_detr_v2c_phase2_beta15"
+Old Phase 1-2 experiment YAMLs remain readable for job reproducibility, but
+only the stable base V2c architecture is registered for new jobs.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -141,10 +138,6 @@ class HSGDETRV2cPlugin(HSGDetPlugin):
             }
 
 
-# Register all variants
+# Register stable base only. Phase experiment variants are archived/hidden
+# from new API/plugin discovery to keep the V2 surface clean.
 register_arch(HSGDETRV2cPlugin(""))  # Base V2c
-register_arch(HSGDETRV2cPlugin("phase1_lq_stability"))
-register_arch(HSGDETRV2cPlugin("phase1_lq_consistency"))
-register_arch(HSGDETRV2cPlugin("phase2_beta0"))
-register_arch(HSGDETRV2cPlugin("phase2_beta05"))
-register_arch(HSGDETRV2cPlugin("phase2_beta15"))

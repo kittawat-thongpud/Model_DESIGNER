@@ -1,0 +1,72 @@
+# =============================================================================
+# HSG-DETR-N V2b — gamma debug variant (gamma_init = 0.01)
+# =============================================================================
+# Identical to hsg_detr_v2_n.yaml EXCEPT gamma_init = 0.01 (vs 1e-4 default).
+#
+# Hypothesis being tested (Option B):
+#   In V2 run, sgb/P*_gamma_abs_mean converged at ~0.020 and stopped growing.
+#   Possible causes:
+#     A) 1e-4 init → optimizer overshoots and finds a flat basin at 0.02
+#     B) 0.02 is the true optimal scale for N-size channels at this LR
+#     C) sgb_gamma LR (5× base) is still too low to escape the basin
+#
+#   By starting at gamma_init=0.01 we skip the early "near-zero" phase
+#   and directly test whether gamma CAN grow beyond 0.02 given a head start.
+#   If gamma saturates at 0.02 again → cause B (architecture limit, N-scale).
+#   If gamma grows further → cause A (init-induced local minimum).
+#
+# gamma_init = 0.01 means:
+#   - attention residual starts at ~1% of CNN signal (vs 0.01% at 1e-4)
+#   - CNN still dominates early training (fine for stability)
+#   - gradient to gamma is non-negligible from epoch 1
+#
+# !! Same LFT warning: keep clip_grad_norm ≤ 0.1 in training config !!
+# =============================================================================
+nc: 80
+
+scales:
+  n: [0.33, 0.25, 1024]
+
+backbone:
+  - [-1, 1, SGStem, [128]]          # 0-P2/4
+  - [-1, 3, C2f, [128, True]]       # 1
+  - [-1, 1, SGDown, [256]]          # 2-P3/8
+  - [-1, 6, C2f, [256, True]]       # 3
+  - [-1, 1, SGDown, [512]]          # 4-P4/16
+  - [-1, 6, C2f, [512, True]]       # 5
+  - [-1, 1, SGDown, [1024]]         # 6-P5/32
+  - [-1, 3, C2f, [1024, True]]      # 7
+  - [-1, 1, SPPF, [1024, 5]]        # 8
+
+head:
+  # P5-SGB: 48% tokens, gamma_init=0.01
+  - [-1, 1, SGTokenBlockV2, [1024, 0.480, "topk", false, 0.01]]   # 9  P5-SGB
+
+  # FPN P5 → P4
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                    # 10
+  - [[-1, 5], 1, Concat, [1]]                                     # 11
+  - [-1, 3, C2f, [512, False]]                                    # 12
+
+  # P4-SGB: 24% tokens, gamma_init=0.01
+  - [-1, 1, SGTokenBlockV2, [512, 0.240, "topk", false, 0.01]]    # 13 P4-SGB
+
+  # FPN P4 → P3
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                    # 14
+  - [[-1, 3], 1, Concat, [1]]                                     # 15
+  - [-1, 3, C2f, [256, False]]                                    # 16  P3
+
+  # P3-SGB: 12% tokens, gamma_init=0.01
+  - [-1, 1, SGTokenBlockV2, [256, 0.120, "topk", false, 0.01]]    # 17 P3-SGB
+
+  # PAN P3 → P4
+  - [-1, 1, Conv, [256, 3, 2]]                                    # 18
+  - [[-1, 13], 1, Concat, [1]]                                    # 19
+  - [-1, 3, C2f, [512, False]]                                    # 20  P4-final
+
+  # PAN P4 → P5
+  - [-1, 1, Conv, [512, 3, 2]]                                    # 21
+  - [[-1, 9], 1, Concat, [1]]                                     # 22
+  - [-1, 3, C2f, [1024, False]]                                   # 23  P5-final
+
+  # RT-DETR V2 decoder (identical to V2)
+  - [[17, 20, 23], 1, RTDETRDecoderV2, [nc, 128, 100]]            # 24  n: hd=128, nq=100

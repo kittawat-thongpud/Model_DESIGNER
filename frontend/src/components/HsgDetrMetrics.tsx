@@ -7,7 +7,11 @@ import { Brain, Activity, AlertTriangle, Zap, Layers, ShieldCheck, Crosshair } f
 export interface HsgDetrMetricsEntry {
   epoch: number;
   'decoder/alpha'?: number;
+  'decoder/alpha_progress'?: number;
+  'decoder/alpha_u'?: number;
+  'decoder/alpha_eff'?: number;
   'decoder/num_queries'?: number;
+  'decoder/hidden_dim'?: number;
   'grad/backbone_norm'?: number;
   'grad/neck_norm'?: number;
   'grad/sgb_norm'?: number;
@@ -40,10 +44,27 @@ const fmt = (v: number | undefined, digits = 4) =>
 const isReferenceGuided = (entry: HsgDetrMetricsEntry, scale: string) =>
   Number(entry[metricKey(scale, 'reference_guided')] ?? 0) >= 0.5;
 
+const hasMetric = (entry: HsgDetrMetricsEntry, suffix: string) =>
+  SCALES.some(scale => entry[metricKey(scale, suffix)] != null);
+
+const hasScale = (entry: HsgDetrMetricsEntry, scale: string) =>
+  entry[metricKey(scale, 'N')] != null || entry[metricKey(scale, 'ratio')] != null;
+
+const isSoftHardActive = (entry: HsgDetrMetricsEntry, scale: string) =>
+  Number(entry[metricKey(scale, 'soft_hard_active')] ?? 0) >= 0.5
+  || (
+    entry[metricKey(scale, 'top_m')] != null
+    && entry[metricKey(scale, 'K_eff')] != null
+    && Number(entry[metricKey(scale, 'top_m')]) > Number(entry[metricKey(scale, 'K_eff')])
+    && Number(entry[metricKey(scale, 'lambda_soft')] ?? 0) > 0
+  );
+
 const blockLabel = (entry: HsgDetrMetricsEntry, scale: string) =>
   isReferenceGuided(entry, scale)
     ? 'Ref-guided local'
-    : entry[metricKey(scale, 'score_std')] != null
+    : entry[metricKey(scale, 'top_m')] != null
+      ? isSoftHardActive(entry, scale) ? 'V3 Top-M soft-hard' : 'V3 hard top-K'
+      : entry[metricKey(scale, 'score_std')] != null
       ? 'V2 selected-token'
       : 'Selected-token';
 
@@ -117,7 +138,7 @@ const ChartPanel = ({
   </div>
 );
 
-const scaleLines = (name: string) => SCALES.map(scale => (
+const scaleLines = (name: string, scales: readonly string[] = SCALES) => scales.map(scale => (
   <Line
     key={`${scale}-${name}`}
     type="monotone"
@@ -134,19 +155,39 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
   if (!history || history.length === 0) return null;
 
   const latest = history[history.length - 1];
+  const activeScales = SCALES.filter(scale => hasScale(latest, scale));
   const hasNan = latest['grad/has_nan'] === 1;
   const hasInf = latest['grad/has_inf'] === 1;
-  const anyFiniteGuard = SCALES.some(s => (latest[metricKey(s, 'finite_guard_count')] ?? 0) > 0);
+  const anyFiniteGuard = activeScales.some(s => (latest[metricKey(s, 'finite_guard_count')] ?? 0) > 0);
   const sparseGrad = latest['grad/sgb_sparse_norm'];
   const gammaGrad = latest['grad/sgb_gamma_norm'];
-  const alphaMax = Math.max(0.55, ...history.map(h => Number(h['decoder/alpha'] ?? 0) * 1.1));
-  const hasGammaFloorMetrics = SCALES.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
-  const hasScaledDeltaMetrics = SCALES.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
-  const referenceGuidedCount = SCALES.filter(scale => isReferenceGuided(latest, scale)).length;
-  const hasV2ScoreStats = SCALES.some(scale => latest[metricKey(scale, 'score_std')] != null);
+  const alphaMax = Math.max(
+    0.55,
+    ...history.map(h => Number(h['decoder/alpha'] ?? 0) * 1.1),
+    ...history.map(h => Number(h['decoder/alpha_eff'] ?? 0) * 1.1),
+  );
+  const hasGammaFloorMetrics = activeScales.some(scale => latest[metricKey(scale, 'gamma_floor')] != null);
+  const hasScaledDeltaMetrics = activeScales.some(scale => latest[metricKey(scale, 'delta_scaled_norm_selected')] != null);
+  const referenceGuidedCount = activeScales.filter(scale => isReferenceGuided(latest, scale)).length;
+  const hasV2ScoreStats = activeScales.some(scale => latest[metricKey(scale, 'score_std')] != null);
+  const hasV3TopM = activeScales.some(scale => latest[metricKey(scale, 'top_m')] != null);
+  const hasV3SoftHard = activeScales.some(scale => isSoftHardActive(latest, scale));
+  const hasV3Dam = activeScales.some(scale => latest[`dam/${scale}_sampling_mass`] != null || latest[metricKey(scale, 'selector_DAM_corr')] != null);
+  const seBlocks = activeScales.filter(scale => Number(latest[metricKey(scale, 'channel_se')] ?? 0) >= 0.5).length;
+  const variantSummary = hasV3TopM
+    ? hasV3SoftHard
+      ? `Full V3: hd=${fmt(latest['decoder/hidden_dim'], 0)}, SE ${seBlocks}/${activeScales.length}, Top-M training, DAM ${hasV3Dam ? 'on' : 'off'}`
+      : activeScales.length < 3
+        ? `Ultra V3: hd=${fmt(latest['decoder/hidden_dim'], 0)}, no P3-SGB, hard top-K, SE ${seBlocks}/${activeScales.length}`
+        : `Lean V3: hd=${fmt(latest['decoder/hidden_dim'], 0)}, three SGB levels, hard top-K, SE ${seBlocks}/${activeScales.length}`
+    : '';
   const sparseVariant = referenceGuidedCount > 0
     ? 'reference-guided local aggregation'
-    : hasV2ScoreStats
+    : hasV3SoftHard
+      ? 'V3 Top-M soft-hard sparse attention'
+      : hasV3TopM
+      ? 'V3 lean hard top-K sparse attention'
+      : hasV2ScoreStats
       ? 'V2 AMP-safe selected-token sparse attention'
       : 'legacy selected-token sparse attention';
 
@@ -159,7 +200,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
         <div>
           <h3 className="text-white font-semibold text-sm">HSG-DETR Sparse Debug</h3>
           <p className="text-[10px] text-slate-500 uppercase tracking-wider">
-            {sparseVariant} | stride-labeled blocks, sparse selection, decoder alpha, gradient contract
+            {variantSummary || sparseVariant} | stride-labeled blocks, sparse selection, decoder alpha, gradient contract
           </p>
         </div>
         <div className="ml-auto flex gap-2">
@@ -168,7 +209,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
               : 'bg-violet-500/10 text-violet-300 border-violet-500/20'
           }`}>
-            {referenceGuidedCount > 0 ? 'Local sparse' : hasV2ScoreStats ? 'V2 token' : 'Legacy token'}
+            {referenceGuidedCount > 0 ? 'Local sparse' : hasV3SoftHard ? 'V3 Top-M' : hasV3TopM ? 'V3 hard' : hasV2ScoreStats ? 'V2 token' : 'Legacy token'}
           </span>
           <StatusBadge ok={!hasNan} label={hasNan ? 'NaN' : 'No NaN'} />
           <StatusBadge ok={!hasInf} label={hasInf ? 'Inf' : 'No Inf'} />
@@ -186,9 +227,9 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
       <div className="flex flex-wrap gap-3">
         <MetricCard
           label="Decoder alpha"
-          value={fmt(latest['decoder/alpha'], 3)}
+          value={fmt(latest['decoder/alpha_eff'] ?? latest['decoder/alpha'], 3)}
           color="text-emerald-400"
-          sub={`queries=${fmt(latest['decoder/num_queries'], 0)} | epoch ${latest.epoch}`}
+          sub={`progress=${fmt(latest['decoder/alpha_progress'], 2)} | max=${fmt(latest['decoder/alpha_u'], 2)} | q=${fmt(latest['decoder/num_queries'], 0)} | hd=${fmt(latest['decoder/hidden_dim'], 0)}`}
         />
         <MetricCard
           label="SGB sparse grad"
@@ -202,23 +243,31 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           color={metricColor(gammaGrad)}
           sub="LayerScale update"
         />
-        {SCALES.map(scale => {
+        {activeScales.map(scale => {
           const selected = latest[metricKey(scale, 'selected_ratio')];
           const gamma = latest[metricKey(scale, 'gamma_abs_mean')];
           const gammaRaw = latest[metricKey(scale, 'gamma_raw_abs_mean')];
           const gammaFloor = latest[metricKey(scale, 'gamma_floor')];
           const delta = latest[metricKey(scale, 'delta_scaled_norm_selected')] ?? latest[metricKey(scale, 'delta_norm_selected')];
           const scoreStd = latest[metricKey(scale, 'score_std')];
-          const isV2 = scoreStd != null;
+          const topM = latest[metricKey(scale, 'top_m')];
+          const kEff = latest[metricKey(scale, 'K_eff')];
+          const lambdaSoft = latest[metricKey(scale, 'lambda_soft')];
+          const isV3 = topM != null;
+          const isV2 = scoreStd != null && !isV3;
+          const softHard = isSoftHardActive(latest, scale);
+          const channelSe = Number(latest[metricKey(scale, 'channel_se')] ?? 0) >= 0.5;
 
           // V2 shows different sub-label and value
-          const subLabel = isV2
+          const subLabel = isV3
+            ? `${SCALE_HELP[scale]} | ${softHard ? 'soft-hard' : 'hard'} | M=${fmt(topM, 0)} K=${fmt(kEff, 0)} | SE=${channelSe ? 'on' : 'off'} | gamma=${fmt(gamma, 4)}`
+            : isV2
             ? `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | score_std=${fmt(scoreStd, 2)} | gamma=${fmt(gamma, 3)}`
             : `${SCALE_HELP[scale]} | ${blockSubLabel(latest, scale)} | gamma=${fmt(gamma, 3)} raw=${fmt(gammaRaw, 3)} floor=${fmt(gammaFloor, 3)} | delta=${fmt(delta, 3)}`;
 
-          const cardValue = isV2 ? fmt(scoreStd, 3) : fmt(selected, 4);
-          const cardColor = isV2 ? '#a78bfa' : metricColor(delta);
-          const cardLabel = isV2 ? `${scale} score_std` : `${scale} selected`;
+          const cardValue = isV3 ? fmt(latest[metricKey(scale, 'top_m_over_N')], 3) : isV2 ? fmt(scoreStd, 3) : fmt(selected, 4);
+          const cardColor = isV3 ? 'text-cyan-300' : isV2 ? '#a78bfa' : metricColor(delta);
+          const cardLabel = isV3 ? `${scale} ${softHard ? 'M/N' : 'K/N'}` : isV2 ? `${scale} score_std` : `${scale} selected`;
 
           return (
             <MetricCard
@@ -245,6 +294,97 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
           </ResponsiveContainer>
         </ChartPanel>
 
+        {hasV3TopM && (
+          <ChartPanel title="Top-M Soft-Hard Coverage" icon={<Crosshair size={14} className="text-cyan-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 1]} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('top_m_over_N', activeScales)}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        {hasV3TopM && (
+          <ChartPanel title="Soft Non-hard Mass" icon={<Activity size={14} className="text-sky-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('soft_nonhard_mass', activeScales)}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        {hasV3TopM && (
+          <ChartPanel title="Hard vs Non-hard Delta" icon={<Activity size={14} className="text-rose-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('hard_delta_norm', activeScales)}
+                {scaleLines('nonhard_delta_norm', activeScales).map(line => React.cloneElement(line, {
+                  strokeDasharray: '3 3',
+                  strokeWidth: 1,
+                  name: `${line.props.name} non-hard`,
+                }))}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        {hasV3Dam && (
+          <ChartPanel title="Approx DAM Sampling Mass" icon={<Crosshair size={14} className="text-emerald-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {activeScales.map(scale => (
+                  <Line
+                    key={`${scale}-dam-mass`}
+                    type="monotone"
+                    dataKey={`dam/${scale}_sampling_mass`}
+                    name={`${scale} DAM mass`}
+                    stroke={SCALE_COLORS[scale]}
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
+        {hasV3Dam && (
+          <ChartPanel title="Selector ↔ DAM Alignment" icon={<Brain size={14} className="text-violet-400" />}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                <XAxis dataKey="epoch" stroke="#475569" tick={{ fontSize: 9 }} />
+                <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[-1, 1]} />
+                <Tooltip content={<CustomTooltip />} />
+                <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                {scaleLines('selector_DAM_corr', activeScales)}
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartPanel>
+        )}
+
         <ChartPanel title="Sparse LayerScale Gamma" icon={<Layers size={14} className="text-violet-400" />}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
@@ -253,8 +393,8 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('gamma_abs_mean')}
-              {hasGammaFloorMetrics && scaleLines('gamma_floor').map(line => React.cloneElement(line, {
+              {scaleLines('gamma_abs_mean', activeScales)}
+              {hasGammaFloorMetrics && scaleLines('gamma_floor', activeScales).map(line => React.cloneElement(line, {
                 strokeDasharray: '3 3',
                 strokeWidth: 1,
                 name: `${line.props.name} floor`,
@@ -272,7 +412,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines('score_std')}
+                {scaleLines('score_std', activeScales)}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -287,7 +427,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected')}
+                {scaleLines(hasScaledDeltaMetrics ? 'delta_scaled_norm_selected' : 'delta_norm_selected', activeScales)}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -302,7 +442,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <YAxis stroke="#475569" tick={{ fontSize: 9 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines('selected_grad_norm')}
+                {scaleLines('selected_grad_norm', activeScales)}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -316,7 +456,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
               <YAxis stroke="#475569" tick={{ fontSize: 9 }} domain={[0, 1]} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-              {scaleLines('k_over_N')}
+              {scaleLines('k_over_N', activeScales)}
             </LineChart>
           </ResponsiveContainer>
         </ChartPanel>
@@ -330,7 +470,7 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 <YAxis stroke="#475569" tick={{ fontSize: 9 }} allowDecimals={false} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
-                {scaleLines('window_size')}
+                {scaleLines('window_size', activeScales)}
               </LineChart>
             </ResponsiveContainer>
           </ChartPanel>
@@ -377,12 +517,17 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Selected grad</th>}
                 {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Non-selected sparse grad</th>}
                 {!hasV2ScoreStats && <th className="px-4 py-2 text-right">Guard hits</th>}
-                {hasV2ScoreStats && <th className="px-4 py-2 text-right">Score std</th>}
+                {hasV3TopM && <th className="px-4 py-2 text-right">Top-M</th>}
+                {hasV3TopM && <th className="px-4 py-2 text-right">λ soft</th>}
+                {hasV3TopM && <th className="px-4 py-2 text-right">Non-hard Δ</th>}
+                {hasV3Dam && <th className="px-4 py-2 text-right">DAM mass@k</th>}
+                {hasV3Dam && <th className="px-4 py-2 text-right">DAM corr</th>}
+                {hasV2ScoreStats && !hasV3TopM && <th className="px-4 py-2 text-right">Score std</th>}
                 <th className="px-4 py-2 text-center">Contract</th>
               </tr>
             </thead>
             <tbody>
-              {SCALES.map(scale => {
+              {activeScales.map(scale => {
                 const deltaNon = latest[metricKey(scale, 'delta_norm_nonselected')];
                 const deltaSelected = latest[metricKey(scale, 'delta_norm_selected')];
                 const deltaScaled = latest[metricKey(scale, 'delta_scaled_norm_selected')];
@@ -393,7 +538,14 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                 const refGuided = isReferenceGuided(latest, scale);
                 const windowSize = latest[metricKey(scale, 'window_size')];
                 const scoreStd = latest[metricKey(scale, 'score_std')];
-                const isV2 = scoreStd != null;
+                const topM = latest[metricKey(scale, 'top_m')];
+                const kEff = latest[metricKey(scale, 'K_eff')];
+                const lambdaSoft = latest[metricKey(scale, 'lambda_soft')];
+                const nonhardDelta = latest[metricKey(scale, 'nonhard_delta_norm')];
+                const damMass = latest[metricKey(scale, 'selected_DAM_mass@k')];
+                const damCorr = latest[metricKey(scale, 'selector_DAM_corr')];
+                const isV3 = topM != null;
+                const isV2 = scoreStd != null && !isV3;
 
                 // For V2, contract is always OK (no delta/sparse grad checks)
                 const v2ContractOk = true;
@@ -428,7 +580,12 @@ const HsgDetrMetrics: React.FC<Props> = ({ history }) => {
                     {!isV2 && <td className={`px-4 py-2 text-right font-mono ${metricColor(selectedGrad)}`}>{fmt(selectedGrad, 4)}</td>}
                     {!isV2 && <td className={`px-4 py-2 text-right font-mono ${(sparseNon ?? 0) <= EPS ? 'text-emerald-400' : 'text-red-400'}`}>{fmt(sparseNon, 4)}</td>}
                     {!isV2 && <td className={`px-4 py-2 text-right font-mono ${guardHits === 0 ? 'text-slate-400' : 'text-red-400'}`}>{fmt(guardHits, 0)}</td>}
-                    {isV2 && <td className="px-4 py-2 text-right font-mono text-violet-400">{fmt(scoreStd, 2)}</td>}
+                    {hasV3TopM && <td className="px-4 py-2 text-right font-mono text-cyan-300">{isV3 ? `${fmt(topM, 0)}/${fmt(kEff, 0)}` : '-'}</td>}
+                    {hasV3TopM && <td className="px-4 py-2 text-right font-mono text-sky-300">{fmt(lambdaSoft, 3)}</td>}
+                    {hasV3TopM && <td className={`px-4 py-2 text-right font-mono ${metricColor(nonhardDelta)}`}>{fmt(nonhardDelta, 4)}</td>}
+                    {hasV3Dam && <td className="px-4 py-2 text-right font-mono text-emerald-300">{fmt(damMass, 4)}</td>}
+                    {hasV3Dam && <td className="px-4 py-2 text-right font-mono text-violet-300">{fmt(damCorr, 4)}</td>}
+                    {isV2 && !hasV3TopM && <td className="px-4 py-2 text-right font-mono text-violet-400">{fmt(scoreStd, 2)}</td>}
                     <td className="px-4 py-2 text-center">
                       {(isV2 ? v2ContractOk : contractOk)
                         ? <span className="text-emerald-400 text-[10px]">PASS</span>

@@ -1,0 +1,91 @@
+# =============================================================================
+# HSG-DETR-N V2b — gamma debug run
+# =============================================================================
+# Purpose: isolate whether gamma_abs_mean plateau at ~0.02 is due to
+#   (A) bad init basin (gamma_init=1e-4 overshoots → flat region)
+#   (B) true N-scale architecture limit (0.02 is genuinely optimal)
+#
+# MUST be identical to the V2 run (job 1d620e753c13) in every hyperparameter
+# except model_id, so results are directly comparable epoch-by-epoch.
+#
+# Key change: model uses hsg_detr_v2b_n.yaml → gamma_init=0.01 (100× larger)
+# Watch: sgb/P*_gamma_abs_mean trajectory vs V2 run
+#   - grows beyond 0.02 → cause A (use V2b going forward)
+#   - stays at 0.02    → cause B (token ratio is the lever, not gamma_init)
+#   - shrinks to ~0    → attention doesn't help N-scale at all
+# =============================================================================
+
+model_id: arch:hsg_detr_v2b
+model_name: HSG-DETR V2b N (gamma debug)
+model_scale: n
+task: detect
+dataset_name: coco
+
+# ── Core (mirrors V2 job 1d620e753c13 exactly) ────────────────────────────────
+imgsz: 640
+batch: 64
+workers: 8
+cache: disk
+epochs: 30
+patience: 8
+seed: 24
+deterministic: true
+amp: false
+ema: true
+pin_memory: true
+
+# ── Optimizer (mirrors V2 job exactly) ────────────────────────────────────────
+optimizer: AdamW
+lr0: 0.0001
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.05
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.05
+cos_lr: true
+
+# ── Weights (same pretrained as V2 job) ───────────────────────────────────────
+pretrained: ddde7b03fbec
+use_yolo_pretrained: true
+freeze: 0
+resume: false
+
+# ── Loss weights (mirrors V2 job exactly) ─────────────────────────────────────
+box: 7.5
+cls: 0.5
+dfl: 1.5
+pose: 12
+nbs: 64
+iou: 0.7
+max_det: 300
+agnostic_nms: false
+rect: false
+single_cls: false
+
+# ── Augmentation (mirrors V2 job exactly) ─────────────────────────────────────
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0
+translate: 0.1
+scale: 0.5
+shear: 0
+perspective: 0
+flipud: 0
+fliplr: 0.5
+bgr: 0
+mosaic: 1
+mixup: 0
+copy_paste: 0
+erasing: 0.4
+crop_fraction: 1
+close_mosaic: 10
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+save_period: -1
+val: true
+plots: true
+overlap_mask: true
+mask_ratio: 4
+kobj: 1

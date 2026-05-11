@@ -323,6 +323,18 @@ class CustomDetectionTrainer(DetectionTrainer):
         self.gradient_interval = _get('gradient_interval', 1)
         self.weight_interval = _get('weight_interval', 1)
         self.sample_per_class = _get('sample_per_class', 0)
+        self.hsg_tau_start = float(_get('tau_start', 1.0))
+        self.hsg_tau_end = float(_get('tau_end', 0.2))
+        self.hsg_lambda_soft_start = float(_get('lambda_soft_start', 0.10))
+        self.hsg_lambda_soft_end = float(_get('lambda_soft_end', 0.0))
+        self.hsg_soft_hard_anneal_epochs = max(1, int(_get('anneal_epochs', 30)))
+        self.hsg_eta_start = float(_get('eta_start', 0.0))
+        self.hsg_eta_end = float(_get('eta_end', 0.1))
+        self.hsg_eta_warmup_epochs = max(1, int(_get('eta_warmup_epochs', 10)))
+        self.hsg_lambda_selector = float(_get('lambda_selector', 0.0))
+        self.hsg_enable_query_metrics = bool(_get('enable_query_metrics', True))
+        self.hsg_enable_gt_metrics = bool(_get('enable_gt_metrics', False))
+        self.hsg_enable_dam_metrics = bool(_get('enable_dam_metrics', False))
         
         # _partition_configs / _dataset_name no longer needed — TXT splits in data.yaml handle partition filtering
         clean_overrides.pop('_partition_configs', None)
@@ -342,6 +354,11 @@ class CustomDetectionTrainer(DetectionTrainer):
             'session', 'job_id',
             'sample_per_class', 'record_gradients', 'gradient_interval',
             'record_weights', 'weight_interval',
+            'tau_start', 'tau_end', 'lambda_soft_start', 'lambda_soft_end',
+            'anneal_epochs', 'eta_start', 'eta_end', 'eta_warmup_epochs',
+            'lambda_selector', 'T_teacher', 'T_student', 'selector_loss_start_epoch',
+            'selector_loss_warmup_epochs',
+            'enable_query_metrics', 'enable_gt_metrics', 'enable_dam_metrics',
             '_partition_configs', '_dataset_name',
         }
         
@@ -418,6 +435,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             # Detect NaN/Inf early (every batch) before emitting rate-limited progress logs.
             trainer._check_nan_loss_items()
             trainer._on_batch_end()
+            trainer._clear_hsg_aux_graph_state()
 
         def _on_train_epoch_start_cb(trainer):
             trainer._on_train_epoch_start()
@@ -969,6 +987,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         import time as _time
         self._epoch_start_time = _time.time()
         self._update_hsg_detr_alpha()
+        self._update_hsg_v3_schedules()
         # Full selector tensors are expensive; only capture them when gradient
         # recording is explicitly enabled. Scalar SGB metrics are always stored
         # by the block itself.
@@ -981,9 +1000,65 @@ class CustomDetectionTrainer(DetectionTrainer):
         except Exception:
             pass
 
+    def _update_hsg_v3_schedules(self) -> None:
+        """Apply V3 Top-M and selector-head schedules to SGTokenBlockV2 blocks."""
+        try:
+            model = unwrap_model(self.model)
+        except Exception:
+            return
+
+        epoch = max(0, int(getattr(self, "epoch", 0)))
+        soft_progress = min(epoch / float(getattr(self, "hsg_soft_hard_anneal_epochs", 30)), 1.0)
+        tau = self.hsg_tau_start + (self.hsg_tau_end - self.hsg_tau_start) * soft_progress
+        lambda_soft = self.hsg_lambda_soft_start + (
+            self.hsg_lambda_soft_end - self.hsg_lambda_soft_start
+        ) * soft_progress
+
+        eta_progress = min(epoch / float(getattr(self, "hsg_eta_warmup_epochs", 10)), 1.0)
+        eta = self.hsg_eta_start + (self.hsg_eta_end - self.hsg_eta_start) * eta_progress
+
+        updated = 0
+        soft_hard_enabled = 0
+        for module in model.modules():
+            if module.__class__.__name__ == "SGTokenBlockV2":
+                module_lambda_soft = lambda_soft if bool(getattr(module, "soft_hard", False)) else 0.0
+                if hasattr(module, "set_soft_hard_schedule"):
+                    module.set_soft_hard_schedule(tau=tau, lambda_soft=module_lambda_soft)
+                if hasattr(module, "set_selector_schedule"):
+                    module.set_selector_schedule(eta=eta, lambda_selector=self.hsg_lambda_selector)
+                updated += 1
+                if module_lambda_soft > 0.0:
+                    soft_hard_enabled += 1
+            elif module.__class__.__name__ == "RTDETRDecoderV2":
+                module.enable_query_metrics = bool(getattr(self, "hsg_enable_query_metrics", True))
+                module.enable_gt_metrics = bool(getattr(self, "hsg_enable_gt_metrics", False))
+                module.enable_dam_metrics = bool(getattr(self, "hsg_enable_dam_metrics", False))
+
+        if updated and self.job_id:
+            job_storage.append_job_log(
+                self.job_id,
+                "INFO",
+                f"HSG-DETR V3 schedule: tau={tau:.4f}, lambda_soft={lambda_soft:.4f}, "
+                f"soft_hard_blocks={soft_hard_enabled}/{updated}, "
+                f"eta={eta:.4f}, lambda_selector={self.hsg_lambda_selector:.6f}, "
+                f"dam_metrics={bool(getattr(self, 'hsg_enable_dam_metrics', False))}",
+            )
+
+    def _clear_hsg_aux_graph_state(self) -> None:
+        try:
+            model = unwrap_model(self.model)
+            for module in model.modules():
+                if hasattr(module, "clear_aux_state"):
+                    module.clear_aux_state()
+        except Exception:
+            pass
+
     def _on_train_epoch_end(self):
         """Log HSG-DETR metrics at epoch end when gradients are fresh."""
-        self._log_hsg_detr_metrics()
+        try:
+            self._log_hsg_detr_metrics()
+        finally:
+            self._clear_hsg_aux_graph_state()
 
     def _update_hsg_detr_alpha(self) -> None:
         """Warm up RTDETRDecoderSGB saliency selection without resume-time jumps."""
@@ -1139,7 +1214,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         # spatial token count so Job Detail and analysis do not invert levels.
         def _sgb_level(block, fallback_idx: int) -> str:
             N = getattr(block, 'last_N', None)
-            if N is not None:
+            if N is not None and len(sgb_blocks) >= 3:
                 try:
                     n_val = int(N)
                     known = sorted(
@@ -1184,6 +1259,31 @@ class CustomDetectionTrainer(DetectionTrainer):
                 last_score_std = getattr(blk, 'last_score_std', None)
                 if last_score_std is not None:
                     metrics[f'{tag}_score_std'] = float(last_score_std)
+                for attr, suffix in (
+                    ('last_k_eff', 'K_eff'),
+                    ('last_top_m', 'top_m'),
+                    ('last_tau', 'tau'),
+                    ('last_lambda_soft', 'lambda_soft'),
+                    ('last_soft_nonhard_mass', 'soft_nonhard_mass'),
+                    ('last_topm_extra_mass', 'topm_extra_mass'),
+                    ('last_hard_delta_norm', 'hard_delta_norm'),
+                    ('last_nonhard_delta_norm', 'nonhard_delta_norm'),
+                ):
+                    value = getattr(blk, attr, None)
+                    if value is not None:
+                        metrics[f'{tag}_{suffix}'] = float(value)
+                top_m = getattr(blk, 'last_top_m', None)
+                if N is not None and top_m is not None and N > 0:
+                    metrics[f'{tag}_top_m_over_N'] = float(top_m) / float(N)
+                k_eff = getattr(blk, 'last_k_eff', None)
+                lambda_soft = float(getattr(blk, 'last_lambda_soft', 0.0) or 0.0)
+                metrics[f'{tag}_channel_se'] = 1.0 if bool(getattr(blk, 'channel_se', False)) else 0.0
+                metrics[f'{tag}_soft_hard_config'] = 1.0 if bool(getattr(blk, 'soft_hard', False)) else 0.0
+                metrics[f'{tag}_soft_hard_active'] = (
+                    1.0
+                    if top_m is not None and k_eff is not None and int(top_m) > int(k_eff) and lambda_soft > 0.0
+                    else 0.0
+                )
             else:
                 # V1/Legacy attributes
                 selected_ratio = getattr(blk, 'last_selected_ratio', None)
@@ -1228,8 +1328,60 @@ class CustomDetectionTrainer(DetectionTrainer):
         for dec in decoder_modules:
             alpha = getattr(dec, 'alpha', None)
             if alpha is not None:
-                metrics['decoder/alpha'] = float(alpha.detach())
+                alpha_value = float(alpha.detach())
+                alpha_max = float(getattr(dec, 'ALPHA_MAX', 0.5) or 0.5)
+                alpha_progress = max(0.0, min(alpha_value / alpha_max, 1.0))
+                alpha_u = float(getattr(dec, 'alpha_u', 0.3))
+                metrics['decoder/alpha'] = alpha_value
+                metrics['decoder/alpha_progress'] = alpha_progress
+                metrics['decoder/alpha_u'] = alpha_u
+                metrics['decoder/alpha_eff'] = alpha_progress * alpha_u
             metrics['decoder/num_queries'] = int(getattr(dec, 'num_queries', 0))
+            metrics['decoder/hidden_dim'] = int(getattr(dec, 'hidden_dim', 0) or 0)
+            if hasattr(dec, 'get_metrics'):
+                for k, v in dec.get_metrics().items():
+                    if isinstance(v, (int, float)):
+                        metrics[f'decoder/{k}'] = float(v)
+            for k, v in getattr(dec, 'last_dam_metrics', {}).items():
+                if isinstance(v, (int, float)):
+                    metrics[k] = float(v)
+
+        # ── V3 approximate DAM ↔ selector metrics ───────────────────────
+        if decoder_modules:
+            dam_levels = getattr(decoder_modules[-1], 'last_dam_by_level', None)
+            if dam_levels:
+                blocks_by_n = {
+                    int(getattr(blk, 'last_N', 0) or 0): blk
+                    for blk in sgb_blocks
+                    if blk.__class__.__name__ == 'SGTokenBlockV2'
+                }
+                for dam in dam_levels:
+                    try:
+                        n_tokens = int(dam.shape[-1])
+                        blk = blocks_by_n.get(n_tokens)
+                        if blk is None:
+                            continue
+                        level = _sgb_level(blk, 0)
+                        logits = getattr(blk, 'last_selector_logits_detached', None)
+                        indices = getattr(blk, 'last_selected_indices', None)
+                        if logits is None or indices is None:
+                            continue
+                        dam_f = dam.detach().float()
+                        logits_f = logits.detach().float()
+                        if dam_f.shape != logits_f.shape:
+                            continue
+                        dam_n = dam_f / dam_f.sum(dim=1, keepdim=True).clamp_min(1e-6)
+                        log_n = logits_f - logits_f.mean(dim=1, keepdim=True)
+                        dam_c = dam_n - dam_n.mean(dim=1, keepdim=True)
+                        corr = (log_n * dam_c).sum(dim=1) / (
+                            log_n.norm(dim=1) * dam_c.norm(dim=1)
+                        ).clamp_min(1e-6)
+                        metrics[f'sgb/{level}_selector_DAM_corr'] = float(corr.mean().item())
+                        idx = indices.to(device=dam_n.device).clamp(0, dam_n.shape[1] - 1)
+                        selected_mass = dam_n.gather(1, idx).sum(dim=1).mean()
+                        metrics[f'sgb/{level}_selected_DAM_mass@k'] = float(selected_mass.item())
+                    except Exception:
+                        continue
 
         # ── Gradient norms (from cached _last_grad_norms) ───────────────
         # Cached in optimizer_step() before zero_grad clears gradients

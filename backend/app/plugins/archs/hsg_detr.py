@@ -144,38 +144,5 @@ register_arch(HSGDetRPlugin("n", variant="v2"))
 # V2c variants are now registered separately in hsg_detr_v2c.py with Phase 1-2 experimental options
 # register_arch(HSGDetRPlugin("n", variant="v2c"))  # Removed - replaced by hsg_detr_v2c.py
 
-# V2B-N: gamma_init=0.01 debug variant
-class HSGDetRV2BPlugin(HSGDetRPlugin):
-    """V2B variant with gamma_init=0.01 for gamma convergence debugging."""
-    
-    def __init__(self):
-        super().__init__("n", variant="v2")
-    
-    @property
-    def name(self) -> str:
-        return "hsg_detr_v2_v2b"
-    
-    @property
-    def scale(self) -> str:
-        return "v2b"
-    
-    @property
-    def scale_label(self) -> str:
-        return "V2B (gamma_init=0.01 debug)"
-    
-    @property
-    def family(self) -> str:
-        return "hsg_detr_v2"
-    
-    @property
-    def description(self) -> str:
-        return (
-            "HSG-DETR V2B — gamma_init=0.01 debug variant for gamma convergence testing. "
-            "Same architecture as V2-N but starts gamma at 0.01 instead of 1e-4 to test "
-            "whether gamma can grow beyond the 0.02 saturation point observed in V2 runs."
-        )
-    
-    def yaml_path(self) -> Path:
-        return _CONFIGS_DIR / "hsg_detr_v2b_n.yaml"
-
-register_arch(HSGDetRV2BPlugin())
+# V2B debug YAML remains in configs for old job reproducibility, but is no
+# longer registered for new API/plugin discovery.

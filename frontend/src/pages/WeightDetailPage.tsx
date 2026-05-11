@@ -190,6 +190,9 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
   const isDetection = (job?.task ?? weight.dataset_name ?? '').toLowerCase().includes('detect');
   const isSelfSupervised = (job as any)?.model === 'dino' || false;
   const hasHistory = history.length > 0;
+  const hsgMetricsHistory: HsgDetrMetricsEntry[] = history
+    .filter((h: any) => typeof h.epoch === 'number' && h.hsg_detr)
+    .map((h: any) => ({ ...h.hsg_detr, epoch: h.epoch }));
 
   // Usage code snippet
   const usageCode = `import torch
@@ -414,14 +417,9 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                   <JobCharts history={history} isDetection={isDetection} isSelfSupervised={isSelfSupervised} />
 
                   {/* HSG-DETR Internals */}
-                  {(() => {
-                    // Parse HSG-DETR metrics from job logs if available
-                    const hsgEntries: HsgDetrMetricsEntry[] = [];
-                    if ((job as any)?._hsgMetrics) {
-                      // Already parsed (future optimization)
-                    }
-                    return null;
-                  })()}
+                  {hsgMetricsHistory.length > 0 && (
+                    <HsgDetrMetrics history={hsgMetricsHistory} />
+                  )}
 
                   {/* Per-Class Metrics */}
                   {history.length > 0 && (history[history.length - 1] as any).ap_per_class && (
