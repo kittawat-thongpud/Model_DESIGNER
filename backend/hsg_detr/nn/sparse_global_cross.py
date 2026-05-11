@@ -48,6 +48,12 @@ def _nan_guard(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     return torch.nan_to_num(x, nan=0.0, posinf=limit, neginf=-limit).clamp(-limit, limit)
 
 
+def _score_guard(x: torch.Tensor) -> torch.Tensor:
+    """Guard saliency scores without destroying their rank ordering."""
+    max_val = torch.finfo(x.dtype).max if x.is_floating_point() else 1e20
+    return torch.nan_to_num(x, nan=0.0, posinf=max_val, neginf=0.0).clamp_min(0.0)
+
+
 _FP16_SAFE = 60000.0
 
 
@@ -83,6 +89,9 @@ class CrossScaleSGA(nn.Module):
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
         attn_scale_mult: float = 0.1,
+        max_k3: int = 384,
+        max_k4: int = 192,
+        max_k5: int = 128,
     ) -> None:
         super().__init__()
         if isinstance(c1, int):
@@ -100,6 +109,9 @@ class CrossScaleSGA(nn.Module):
         self.debug_enabled: bool = bool(debug)
         self.scale_embed_alpha = float(scale_embed_alpha)
         self.attn_scale_mult = float(attn_scale_mult)
+        self.max_k3 = int(max_k3) if max_k3 is not None else 0
+        self.max_k4 = int(max_k4) if max_k4 is not None else 0
+        self.max_k5 = int(max_k5) if max_k5 is not None else 0
 
         # Debug state — updated each forward pass when debug_enabled=True
         self.last_ls_p3: float | None = None    # mean |LayerScale| for P3
@@ -113,6 +125,16 @@ class CrossScaleSGA(nn.Module):
         self.last_delta_abs_p3: float | None = None
         self.last_delta_abs_p4: float | None = None
         self.last_delta_abs_p5: float | None = None
+        self.last_p3_score_max: float | None = None
+        self.last_p4_score_max: float | None = None
+        self.last_p5_score_max: float | None = None
+        self.last_p3_score_min_selected: float | None = None
+        self.last_p4_score_min_selected: float | None = None
+        self.last_p5_score_min_selected: float | None = None
+        self.last_p3_score_std: float | None = None
+        self.last_p4_score_std: float | None = None
+        self.last_p5_score_std: float | None = None
+        self.last_attn_entropy: float | None = None
 
         d = self.shared_dim
 
@@ -194,14 +216,23 @@ class CrossScaleSGA(nn.Module):
             p4_tok = p4_proj.view(B, d, -1).transpose(1, 2)
             p5_tok = p5_proj.view(B, d, -1).transpose(1, 2)
 
-            # Top-k by L2 saliency
-            p3_scores = _nan_guard(p3_tok.norm(dim=-1))
-            p4_scores = _nan_guard(p4_tok.norm(dim=-1))
-            p5_scores = _nan_guard(p5_tok.norm(dim=-1))
+            # Top-k by L2 saliency. Do not use _nan_guard here: clamping all
+            # high-energy scores to 20 destroys rank ordering and makes top-k
+            # effectively arbitrary on activated feature maps.
+            with torch.no_grad():
+                p3_scores = _score_guard(p3_tok.float().norm(dim=-1))
+                p4_scores = _score_guard(p4_tok.float().norm(dim=-1))
+                p5_scores = _score_guard(p5_tok.float().norm(dim=-1))
 
-            k3 = max(1, min(int(self.ratio_p3 * p3_tok.shape[1]), p3_tok.shape[1]))
-            k4 = max(1, min(int(self.ratio_p4 * p4_tok.shape[1]), p4_tok.shape[1]))
-            k5 = max(1, min(int(self.ratio_p5 * p5_tok.shape[1]), p5_tok.shape[1]))
+            k3_raw = max(1, min(int(self.ratio_p3 * p3_tok.shape[1]), p3_tok.shape[1]))
+            k4_raw = max(1, min(int(self.ratio_p4 * p4_tok.shape[1]), p4_tok.shape[1]))
+            k5_raw = max(1, min(int(self.ratio_p5 * p5_tok.shape[1]), p5_tok.shape[1]))
+            k3 = min(k3_raw, self.max_k3) if self.max_k3 > 0 else k3_raw
+            k4 = min(k4_raw, self.max_k4) if self.max_k4 > 0 else k4_raw
+            k5 = min(k5_raw, self.max_k5) if self.max_k5 > 0 else k5_raw
+            k3 = max(1, k3)
+            k4 = max(1, k4)
+            k5 = max(1, k5)
 
             _, p3_idx = torch.topk(p3_scores, k3, dim=-1)
             _, p4_idx = torch.topk(p4_scores, k4, dim=-1)
@@ -261,6 +292,9 @@ class CrossScaleSGA(nn.Module):
             p3_delta = self._scatter(p3_att, p3_idx, B, d, H3, W3)
             p4_delta = self._scatter(p4_att, p4_idx, B, d, H4, W4)
             p5_delta = self._scatter(p5_att, p5_idx, B, d, H5, W5)
+            p3_mask = self._scatter_mask(p3_idx, B, H3, W3)
+            p4_mask = self._scatter_mask(p4_idx, B, H4, W4)
+            p5_mask = self._scatter_mask(p5_idx, B, H5, W5)
 
             # tanh clamp before out_proj
             p3_delta = 6.0 * torch.tanh(p3_delta / 6.0)
@@ -273,9 +307,11 @@ class CrossScaleSGA(nn.Module):
             p5_delta = F.conv2d(p5_delta, self.out_proj_p5.weight.float())
 
             # delta norm
-            p3_delta = self._gn_fp32(p3_delta, self.delta_norm_p3)
-            p4_delta = self._gn_fp32(p4_delta, self.delta_norm_p4)
-            p5_delta = self._gn_fp32(p5_delta, self.delta_norm_p5)
+            # GroupNorm can turn zero canvas locations non-zero; mask again so
+            # the sparse branch remains sparse by contract.
+            p3_delta = self._gn_fp32(p3_delta, self.delta_norm_p3) * p3_mask
+            p4_delta = self._gn_fp32(p4_delta, self.delta_norm_p4) * p4_mask
+            p5_delta = self._gn_fp32(p5_delta, self.delta_norm_p5) * p5_mask
 
             # LayerScale residual: out = input + ls * delta
             # ls_p* shape (C, 1, 1) broadcasts over (B, C, H, W)
@@ -300,6 +336,17 @@ class CrossScaleSGA(nn.Module):
                     _total = float(_a.sum().clamp(min=1e-8))
                     self.last_attn_within_frac = float(_within / _total)
                     self.last_attn_cross_frac = float(1.0 - self.last_attn_within_frac)
+                    _attn_prob = attn.detach().float().clamp_min(1e-12)
+                    self.last_attn_entropy = float((-_attn_prob * _attn_prob.log()).sum(dim=-1).mean().item())
+                    self.last_p3_score_max = float(p3_scores.detach().amax().item())
+                    self.last_p4_score_max = float(p4_scores.detach().amax().item())
+                    self.last_p5_score_max = float(p5_scores.detach().amax().item())
+                    self.last_p3_score_min_selected = float(torch.gather(p3_scores, 1, p3_idx).amin().item())
+                    self.last_p4_score_min_selected = float(torch.gather(p4_scores, 1, p4_idx).amin().item())
+                    self.last_p5_score_min_selected = float(torch.gather(p5_scores, 1, p5_idx).amin().item())
+                    self.last_p3_score_std = float(p3_scores.detach().std(unbiased=False).item())
+                    self.last_p4_score_std = float(p4_scores.detach().std(unbiased=False).item())
+                    self.last_p5_score_std = float(p5_scores.detach().std(unbiased=False).item())
                 self.last_delta_abs_p3 = float(p3_delta.detach().abs().mean().item())
                 self.last_delta_abs_p4 = float(p4_delta.detach().abs().mean().item())
                 self.last_delta_abs_p5 = float(p5_delta.detach().abs().mean().item())
@@ -336,6 +383,14 @@ class CrossScaleSGA(nn.Module):
         return canvas.view(B, d, H, W)
 
     @staticmethod
+    def _scatter_mask(indices: torch.Tensor, B: int, H: int, W: int) -> torch.Tensor:
+        """Scatter selected indices into a (B, 1, H, W) FP32 binary mask."""
+        N = H * W
+        mask = torch.zeros(B, 1, N, device=indices.device, dtype=torch.float32)
+        mask.scatter_(2, indices.unsqueeze(1), 1.0)
+        return mask.view(B, 1, H, W)
+
+    @staticmethod
     def _gn_fp32(x: torch.Tensor, gn: nn.GroupNorm) -> torch.Tensor:
         """GroupNorm in FP32 regardless of weight storage dtype."""
         w = gn.weight.float() if gn.weight is not None else None
@@ -361,4 +416,14 @@ class CrossScaleSGA(nn.Module):
             "delta_abs_p3": self.last_delta_abs_p3,
             "delta_abs_p4": self.last_delta_abs_p4,
             "delta_abs_p5": self.last_delta_abs_p5,
+            "p3_score_max": self.last_p3_score_max,
+            "p4_score_max": self.last_p4_score_max,
+            "p5_score_max": self.last_p5_score_max,
+            "p3_score_min_selected": self.last_p3_score_min_selected,
+            "p4_score_min_selected": self.last_p4_score_min_selected,
+            "p5_score_min_selected": self.last_p5_score_min_selected,
+            "p3_score_std": self.last_p3_score_std,
+            "p4_score_std": self.last_p4_score_std,
+            "p5_score_std": self.last_p5_score_std,
+            "attn_entropy": self.last_attn_entropy,
         }

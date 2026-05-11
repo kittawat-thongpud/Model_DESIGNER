@@ -1346,6 +1346,16 @@ class CustomDetectionTrainer(DetectionTrainer):
             'delta_abs_p3',
             'delta_abs_p4',
             'delta_abs_p5',
+            'p3_score_max',
+            'p4_score_max',
+            'p5_score_max',
+            'p3_score_min_selected',
+            'p4_score_min_selected',
+            'p5_score_min_selected',
+            'p3_score_std',
+            'p4_score_std',
+            'p5_score_std',
+            'attn_entropy',
         )
         for i, blk in enumerate(cs2ga_blocks):
             tag = f'cs2ga/{i}'
