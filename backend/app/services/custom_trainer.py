@@ -428,7 +428,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         self._hsg_alpha_resume_epoch: int | None = None
         
         # HSG-DETR sparse metrics caches for extended_metrics.jsonl persistence
-        self._last_hsg_metrics: dict[str, float] | None = None
+        self._last_hsg_metrics: dict[str, Any] | None = None
         self._last_grad_norms: dict[str, float] = {}
 
         def _on_train_batch_end_cb(trainer):
@@ -1209,7 +1209,7 @@ class CustomDetectionTrainer(DetectionTrainer):
         ]
         decoder_modules = [m for m in model.modules() if m.__class__.__name__ in {'RTDETRDecoderSGB', 'RTDETRDecoderV2'}]
 
-        metrics: dict[str, float] = {}
+        metrics: dict[str, Any] = {}
 
         # ── Selected-token SGB metrics ───────────────────────────────────
         # HSG-DETR YAML emits SGB blocks in P5 -> P4 -> P3 order. Tag by
@@ -1331,24 +1331,26 @@ class CustomDetectionTrainer(DetectionTrainer):
             m for m in model.modules()
             if m.__class__.__name__ == 'CrossScaleSGA'
         ]
+        cs2ga_metric_keys = (
+            'gate_p3',
+            'gate_p4',
+            'gate_p5',
+            'k3',
+            'k4',
+            'k5',
+            'attn_within_frac',
+            'attn_cross_frac',
+            'delta_abs_p3',
+            'delta_abs_p4',
+            'delta_abs_p5',
+        )
         for i, blk in enumerate(cs2ga_blocks):
             tag = f'cs2ga/{i}'
             state = blk.get_debug_state() if hasattr(blk, 'get_debug_state') else {}
-            if state.get('gate_p3') is not None:
-                metrics[f'{tag}/gate_p3'] = float(state['gate_p3'])
-                metrics[f'{tag}/gate_p4'] = float(state['gate_p4'])
-                metrics[f'{tag}/gate_p5'] = float(state['gate_p5'])
-            if state.get('k3') is not None:
-                metrics[f'{tag}/k3'] = float(state['k3'])
-                metrics[f'{tag}/k4'] = float(state['k4'])
-                metrics[f'{tag}/k5'] = float(state['k5'])
-            if state.get('attn_within_frac') is not None:
-                metrics[f'{tag}/attn_within_frac'] = float(state['attn_within_frac'])
-                metrics[f'{tag}/attn_cross_frac'] = float(state['attn_cross_frac'])
-            if state.get('delta_abs_p3') is not None:
-                metrics[f'{tag}/delta_abs_p3'] = float(state['delta_abs_p3'])
-                metrics[f'{tag}/delta_abs_p4'] = float(state['delta_abs_p4'])
-                metrics[f'{tag}/delta_abs_p5'] = float(state['delta_abs_p5'])
+            for key in cs2ga_metric_keys:
+                value = state.get(key)
+                if isinstance(value, (int, float)):
+                    metrics[f'{tag}/{key}'] = float(value)
 
         # ── Decoder metrics ──────────────────────────────────────────────
         for dec in decoder_modules:
@@ -1368,6 +1370,8 @@ class CustomDetectionTrainer(DetectionTrainer):
                 for k, v in dec.get_metrics().items():
                     if isinstance(v, (int, float)):
                         metrics[f'decoder/{k}'] = float(v)
+                    elif k == 'loc_quality_mode' and isinstance(v, str):
+                        metrics[f'decoder/{k}'] = v
             for k, v in getattr(dec, 'last_dam_metrics', {}).items():
                 if isinstance(v, (int, float)):
                     metrics[k] = float(v)
