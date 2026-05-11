@@ -1342,6 +1342,19 @@ async def export_weight(weight_id: str, body: ExportWeightRequest):
     if not meta:
         raise HTTPException(404, f"Weight '{weight_id}' not found")
 
+    source_type = str(meta.get("source_type") or "").lower()
+    model_id = str(meta.get("model_id") or "").lower()
+    if source_type in {"dino", "rtdetrv2"} or model_id in {"arch:dino", "arch:rtdetrv2"}:
+        raise HTTPException(
+            400,
+            (
+                f"{meta.get('model_name') or weight_id} is an upstream {source_type or model_id} checkpoint. "
+                "ONNX/TorchScript export via /api/weights/{id}/export currently supports Ultralytics-loadable "
+                "YOLO/RTDETR weights only. Use /api/packages/weights/{id}/export for portable Model Designer "
+                "packages, or add a dedicated exporter wrapper for this architecture."
+            ),
+        )
+
     pt_path = weight_storage.weight_pt_path(weight_id)
     if not pt_path.exists():
         raise HTTPException(404, f"Weight file missing: {weight_id}")

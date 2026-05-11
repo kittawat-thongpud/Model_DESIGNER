@@ -44,18 +44,18 @@ def _results_csv_path(job_id: str) -> Path:
 
 def save_job(record: dict) -> None:
     """Save or update a job record to disk.
-    
+
     Strips 'history' field to keep record.json lightweight.
     History is read from Ultralytics results.csv instead.
     """
     job_id = record["job_id"]
-    
+
     # Create a copy to modify
     data_to_save = record.copy()
-    
+
     # Remove history if present (we read from results.csv instead)
     data_to_save.pop("history", None)
-        
+
     _store.save(job_id, data_to_save)
 
 
@@ -69,18 +69,18 @@ def load_job(job_id: str) -> dict | None:
 def get_job_history(job_id: str) -> list[dict]:
     """
     Load job training history with comprehensive metrics.
-    
+
     Priority:
     1. extended_metrics.jsonl (if exists) - contains ALL custom metrics
     2. results.csv (Ultralytics standard) - fallback for basic metrics
     3. record.json (legacy) - final fallback
-    
+
     Returns:
         List of epoch metrics dicts with all available data
     """
     extended_metrics_path = _job_dir(job_id) / "extended_metrics.jsonl"
     results_path = _results_csv_path(job_id)
-    
+
     # Try extended_metrics.jsonl first (most comprehensive)
     if extended_metrics_path.exists():
         try:
@@ -98,7 +98,7 @@ def get_job_history(job_id: str) -> list[dict]:
                 epoch = data.get("epoch")
                 if epoch is not None:
                     deduped_rows[epoch] = data
-            
+
             history = []
             prev_ts: float | None = None
             def first_present(data: dict, *keys: str):
@@ -107,7 +107,7 @@ def get_job_history(job_id: str) -> list[dict]:
                         return data.get(key)
                 return None
 
-            for data in deduped_rows.values():
+            for _, data in sorted(deduped_rows.items(), key=lambda item: item[0]):
                 ts = data.get("timestamp")
                 # Compute per-epoch time from timestamp diff
                 if ts is not None and prev_ts is not None:
@@ -165,16 +165,23 @@ def get_job_history(job_id: str) -> list[dict]:
                     # Timing — per-epoch (not cumulative)
                     "epoch_time": epoch_time,
                     "val_time_s": data.get("val_time_s"),
-                    
+
                     # HSG-DETR sparse metrics (persisted from training)
                     "hsg_detr": data.get("hsg_detr"),
-                    
+
+                    # DINO-DETR detailed metrics (persisted from subprocess logs)
+                    "dino_detr": data.get("dino_detr"),
+
                     # Gradient norms (persisted from training)
                     "gradient_norms": data.get("gradient_norms"),
                 }
 
-                # Remove None values (but keep hsg_detr/gradient_norms dicts even if empty)
-                epoch_metrics = {k: v for k, v in epoch_metrics.items() if v is not None or k in ('hsg_detr', 'gradient_norms')}
+                # Remove None values (but keep nested debug dicts even if empty)
+                epoch_metrics = {
+                    k: v
+                    for k, v in epoch_metrics.items()
+                    if v is not None or k in ('hsg_detr', 'dino_detr', 'gradient_norms')
+                }
                 history.append(epoch_metrics)
 
             if history:
@@ -187,7 +194,7 @@ def get_job_history(job_id: str) -> list[dict]:
             except Exception:
                 pass
             # Fall through to results.csv
-    
+
     # Fallback to results.csv (Ultralytics standard)
     if results_path.exists():
         try:
@@ -205,7 +212,7 @@ def get_job_history(job_id: str) -> list[dict]:
                                 epoch_data[key] = float(value)
                             except ValueError:
                                 epoch_data[key] = value
-                    
+
                     if epoch_data:
                         # results.csv 'time' is cumulative seconds — store raw for now
                         history.append(epoch_data)
@@ -240,7 +247,7 @@ def get_job_history(job_id: str) -> list[dict]:
                 }
                 parsed.append({k: v for k, v in metrics.items() if v is not None})
             history = parsed
-            
+
             if history:
                 return history
         except Exception as e:
@@ -250,7 +257,7 @@ def get_job_history(job_id: str) -> list[dict]:
                         {"job_id": job_id, "error": str(e)})
             except Exception:
                 pass
-    
+
     # Final fallback to legacy history in record.json
     record = load_job(job_id)
     return record.get("history", []) if record else []

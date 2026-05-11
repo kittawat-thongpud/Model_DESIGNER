@@ -291,11 +291,27 @@ def _save_weight(job_id: str, out_dir: Path) -> str | None:
     )
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
+        key_count = None
+        try:
+            import torch
+
+            raw = torch.load(dest_dir / "weight.pt", map_location="cpu", weights_only=False)
+            if isinstance(raw, dict):
+                for key in ("model", "ema", "state_dict"):
+                    state = raw.get(key)
+                    if isinstance(state, dict):
+                        key_count = len(state)
+                        break
+                if key_count is None:
+                    key_count = sum(1 for value in raw.values() if torch.is_tensor(value))
+        except Exception:
+            key_count = None
         meta.update(
             {
                 "arch_plugin": cfg.get("model_arch"),
                 "model_arch": cfg.get("model_arch"),
                 "source_type": "rtdetrv2",
+                "key_count": key_count,
                 "train_args": {
                     "model_arch": cfg.get("model_arch"),
                     "data": cfg.get("data"),
