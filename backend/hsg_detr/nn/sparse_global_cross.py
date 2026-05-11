@@ -41,6 +41,9 @@ def _nan_guard(x: torch.Tensor, limit: float = 20.0) -> torch.Tensor:
     return torch.nan_to_num(x, nan=0.0, posinf=limit, neginf=-limit).clamp(-limit, limit)
 
 
+_FP16_SAFE = 60000.0
+
+
 class CrossScaleSGA(nn.Module):
     """
     Cross-Scale Sparse Global Attention.
@@ -68,6 +71,8 @@ class CrossScaleSGA(nn.Module):
         ratio_p4: float = 0.10,
         ratio_p5: float = 0.25,
         debug: bool = False,
+        scale_embed_alpha: float = 0.0,
+        attn_scale_mult: float = 0.1,
     ) -> None:
         super().__init__()
         if isinstance(c1, int):
@@ -82,6 +87,8 @@ class CrossScaleSGA(nn.Module):
         self.ratio_p4 = float(ratio_p4)
         self.ratio_p5 = float(ratio_p5)
         self.debug_enabled: bool = bool(debug)
+        self.scale_embed_alpha = float(scale_embed_alpha)
+        self.attn_scale_mult = float(attn_scale_mult)
 
         # Debug state — updated each forward pass when debug_enabled=True
         self.last_gate_p3: float | None = None
@@ -105,6 +112,7 @@ class CrossScaleSGA(nn.Module):
 
         # Scale identity embeddings (0=P3, 1=P4, 2=P5)
         self.scale_embed = nn.Embedding(3, d)
+        nn.init.zeros_(self.scale_embed.weight)
 
         # Attention norm (applied inside FP32 island)
         self.norm = nn.LayerNorm(d)
@@ -129,7 +137,7 @@ class CrossScaleSGA(nn.Module):
         self.gate_p4 = nn.Parameter(torch.zeros(1))
         self.gate_p5 = nn.Parameter(torch.zeros(1))
 
-        self._attn_scale = float(d ** -0.5)
+        self._attn_scale = float(d ** -0.5) * max(1e-3, self.attn_scale_mult)
 
     # ------------------------------------------------------------------ #
 
@@ -194,11 +202,14 @@ class CrossScaleSGA(nn.Module):
             p4_sel = torch.gather(p4_tok, 1, p4_idx.unsqueeze(-1).expand(-1, -1, d))
             p5_sel = torch.gather(p5_tok, 1, p5_idx.unsqueeze(-1).expand(-1, -1, d))
 
-            # Add scale embeddings (FP32)
+            # Optional scale embeddings (FP32). Keep them disabled by default:
+            # random scale identity vectors dominate Q/K similarity and make
+            # attention collapse into within-scale blocks at initialization.
             dev = P3.device
-            e3 = self.scale_embed(torch.tensor(0, device=dev)).float().view(1, 1, -1)
-            e4 = self.scale_embed(torch.tensor(1, device=dev)).float().view(1, 1, -1)
-            e5 = self.scale_embed(torch.tensor(2, device=dev)).float().view(1, 1, -1)
+            embed_alpha = float(max(0.0, min(self.scale_embed_alpha, 1.0)))
+            e3 = embed_alpha * self.scale_embed(torch.tensor(0, device=dev)).float().view(1, 1, -1)
+            e4 = embed_alpha * self.scale_embed(torch.tensor(1, device=dev)).float().view(1, 1, -1)
+            e5 = embed_alpha * self.scale_embed(torch.tensor(2, device=dev)).float().view(1, 1, -1)
 
             p3_sel = _nan_guard(p3_sel + e3)
             p4_sel = _nan_guard(p4_sel + e4)
@@ -207,10 +218,16 @@ class CrossScaleSGA(nn.Module):
             # Concatenate cross-scale tokens (B, K, d)
             all_tok = torch.cat([p3_sel, p4_sel, p5_sel], dim=1)
 
+            # Normalize selected token vectors before joint attention. Without
+            # this, scale-specific activation magnitude can dominate the dot
+            # products and collapse CS²GA into three near-independent within-
+            # scale attention blocks.
+            all_tok_attn = F.normalize(all_tok, dim=-1, eps=1e-6)
+
             # LayerNorm (FP32)
             norm_w = self.norm.weight.float()
             norm_b = self.norm.bias.float()
-            q = F.layer_norm(all_tok, self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
+            q = F.layer_norm(all_tok_attn, self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
             q = _nan_guard(q)
             k_t = q
             v   = all_tok   # V uses un-normed tokens (standard: norm Q/K, not V)
@@ -282,6 +299,13 @@ class CrossScaleSGA(nn.Module):
             p3_out = p3_f + g3 * p3_delta
             p4_out = p4_f + g4 * p4_delta
             p5_out = p5_f + g5 * p5_delta
+
+            # The residual path is computed in FP32, then returned to the
+            # incoming AMP dtype. Clamp before FP16 cast so rare large
+            # activations cannot become +/-inf and poison backward.
+            p3_out = torch.nan_to_num(p3_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
+            p4_out = torch.nan_to_num(p4_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
+            p5_out = torch.nan_to_num(p5_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
 
         # Cast back to original input dtype (FP16 under AMP)
         return [
