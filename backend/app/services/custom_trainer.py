@@ -646,8 +646,8 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         Param groups:
           - base model:             lr=lr0,        wd=decay
-          - SGB sparse projections: lr=lr0 x 2.0,  wd=decay
-          - SGB gamma:              lr=lr0 x 5.0,  wd=0
+          - SGB/CS²GA projections:  lr=lr0 x 2.0,  wd=decay
+          - SGB gamma / LayerScale: lr=lr0 x 5.0,  wd=0
           - norm / bias:            lr=lr0,        wd=0
           - decoder:                lr=lr0 x 1.5,  wd=decay
         """
@@ -673,6 +673,24 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "v_proj",
                         "out_proj",
                         "se_fc",
+                    )):
+                        sgb_roles[id(param)] = "sgb_sparse"
+                    else:
+                        sgb_roles[id(param)] = "norm_bias"
+            elif cls_name == "CrossScaleSGA":
+                for local_name, param in module.named_parameters(recurse=True):
+                    if not param.requires_grad:
+                        continue
+                    if local_name.startswith(("ls_p3", "ls_p4", "ls_p5")):
+                        sgb_roles[id(param)] = "sgb_gamma"
+                    elif local_name.startswith((
+                        "proj_p3",
+                        "proj_p4",
+                        "proj_p5",
+                        "out_proj_p3",
+                        "out_proj_p4",
+                        "out_proj_p5",
+                        "scale_embed",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     else:
@@ -1647,7 +1665,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         sgb_roles[id(param)] = "sgb"
             elif cls_name == "CrossScaleSGA":
                 for local_name, param in module.named_parameters(recurse=True):
-                    if local_name.startswith("gate_"):
+                    if local_name.startswith(("ls_p3", "ls_p4", "ls_p5")):
                         sgb_roles[id(param)] = "sgb_gamma"
                     elif local_name.startswith((
                         "proj_",
