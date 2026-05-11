@@ -4,7 +4,14 @@ Cross-Scale Sparse Global Attention (CS²GA) for HSG-DETR.
 Replaces per-scale SparseGlobalTokenBlock with a single module that receives
 P3/P4/P5 simultaneously, projects to shared dim, selects top-k tokens per scale,
 adds learned scale embeddings, runs cross-scale self-attention, and scatters back
-with gated residuals.
+with LayerScale residuals.
+
+Residual design — LayerScale (DeiT/CaiT pattern):
+    out = input + layer_scale * delta
+    layer_scale: per-channel Parameter(C, 1, 1), init=1e-4
+    Starts near-identity, grows freely with no sigmoid saturation.
+    Fixes the chicken-and-egg collapse observed with sigmoid gates where
+    gate → 0 because delta is noisy early → gradient stops → delta never learns.
 
 AMP-safe: all numerically sensitive operations run inside _fp32_context
 (autocast disabled), matching the pattern in sparse_global_token.py.
@@ -21,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Helpers (shared with sparse_global_token.py pattern) ─────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_gn(channels: int) -> nn.GroupNorm:
     groups = min(32, int(channels))
@@ -51,7 +58,7 @@ class CrossScaleSGA(nn.Module):
     Receives P3/P4/P5 feature maps simultaneously, projects to a shared
     dimension, selects top-k salient tokens per scale, adds learned scale
     embeddings, runs joint cross-scale self-attention, then scatters back
-    with gated residuals.
+    with LayerScale residuals.
 
     Args:
         c1: list of input channels [c_p3, c_p4, c_p5] (injected by parse_model).
@@ -60,6 +67,8 @@ class CrossScaleSGA(nn.Module):
         ratio_p3: Top-k ratio for P3 tokens.
         ratio_p4: Top-k ratio for P4 tokens.
         ratio_p5: Top-k ratio for P5 tokens.
+        ls_init: LayerScale init value. Default 1e-4 (DeiT standard).
+        debug: Enable debug state recording each forward pass.
     """
 
     def __init__(
@@ -70,6 +79,7 @@ class CrossScaleSGA(nn.Module):
         ratio_p3: float = 0.05,
         ratio_p4: float = 0.10,
         ratio_p5: float = 0.25,
+        ls_init: float = 1e-4,
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
         attn_scale_mult: float = 0.1,
@@ -86,20 +96,21 @@ class CrossScaleSGA(nn.Module):
         self.ratio_p3 = float(ratio_p3)
         self.ratio_p4 = float(ratio_p4)
         self.ratio_p5 = float(ratio_p5)
+        self.ls_init = float(ls_init)
         self.debug_enabled: bool = bool(debug)
         self.scale_embed_alpha = float(scale_embed_alpha)
         self.attn_scale_mult = float(attn_scale_mult)
 
         # Debug state — updated each forward pass when debug_enabled=True
-        self.last_gate_p3: float | None = None
-        self.last_gate_p4: float | None = None
-        self.last_gate_p5: float | None = None
+        self.last_ls_p3: float | None = None    # mean |LayerScale| for P3
+        self.last_ls_p4: float | None = None
+        self.last_ls_p5: float | None = None
         self.last_k3: int | None = None
         self.last_k4: int | None = None
         self.last_k5: int | None = None
-        self.last_attn_within_frac: float | None = None   # mass on within-scale blocks
-        self.last_attn_cross_frac: float | None = None    # mass on cross-scale blocks
-        self.last_delta_abs_p3: float | None = None       # mean |delta| before gate
+        self.last_attn_within_frac: float | None = None
+        self.last_attn_cross_frac: float | None = None
+        self.last_delta_abs_p3: float | None = None
         self.last_delta_abs_p4: float | None = None
         self.last_delta_abs_p5: float | None = None
 
@@ -114,7 +125,7 @@ class CrossScaleSGA(nn.Module):
         self.scale_embed = nn.Embedding(3, d)
         nn.init.zeros_(self.scale_embed.weight)
 
-        # Attention norm (applied inside FP32 island)
+        # Attention norm
         self.norm = nn.LayerNorm(d)
 
         # Project back to original channels
@@ -132,10 +143,12 @@ class CrossScaleSGA(nn.Module):
         self.delta_norm_p4 = _make_gn(self.c1[1])
         self.delta_norm_p5 = _make_gn(self.c1[2])
 
-        # Gated residual — sigmoid(0) = 0.5 at init
-        self.gate_p3 = nn.Parameter(torch.zeros(1))
-        self.gate_p4 = nn.Parameter(torch.zeros(1))
-        self.gate_p5 = nn.Parameter(torch.zeros(1))
+        # LayerScale — per-channel (C, 1, 1), init=ls_init ≈ 1e-4
+        # Grows freely without sigmoid saturation. Gradient flows proportionally
+        # to ls value itself — small but non-zero from epoch 1.
+        self.ls_p3 = nn.Parameter(torch.full((self.c1[0], 1, 1), ls_init))
+        self.ls_p4 = nn.Parameter(torch.full((self.c1[1], 1, 1), ls_init))
+        self.ls_p5 = nn.Parameter(torch.full((self.c1[2], 1, 1), ls_init))
 
         self._attn_scale = float(d ** -0.5) * max(1e-3, self.attn_scale_mult)
 
@@ -152,30 +165,27 @@ class CrossScaleSGA(nn.Module):
             raise ValueError(f"CrossScaleSGA expects list[3], got {type(x)}")
 
         P3, P4, P5 = x
-        input_dtype = P3.dtype   # FP16 under AMP, FP32 otherwise
+        input_dtype = P3.dtype
 
-        # ── All numerically sensitive work inside FP32 context ────────────
         with _fp32_context(P3.device):
 
-            # Cast to FP32 for safe computation
             p3_f = P3.float()
             p4_f = P4.float()
             p5_f = P5.float()
 
-            # Pre-norm (cast weight to FP32 for GN)
+            # Pre-norm
             p3_n = self.pre_norm_p3(p3_f.to(dtype=self.pre_norm_p3.weight.dtype)).float()
             p4_n = self.pre_norm_p4(p4_f.to(dtype=self.pre_norm_p4.weight.dtype)).float()
             p5_n = self.pre_norm_p5(p5_f.to(dtype=self.pre_norm_p5.weight.dtype)).float()
 
-            # 1×1 projection to shared_dim (FP32 weights)
-            p3_proj = F.conv2d(p3_n, self.proj_p3.weight.float())   # (B, d, H3, W3)
+            # 1×1 projection to shared_dim
+            p3_proj = F.conv2d(p3_n, self.proj_p3.weight.float())
             p4_proj = F.conv2d(p4_n, self.proj_p4.weight.float())
             p5_proj = F.conv2d(p5_n, self.proj_p5.weight.float())
 
             _, _, H3, W3 = p3_proj.shape
             _, _, H4, W4 = p4_proj.shape
             _, _, H5, W5 = p5_proj.shape
-
             B = p3_proj.shape[0]
             d = self.shared_dim
 
@@ -184,7 +194,7 @@ class CrossScaleSGA(nn.Module):
             p4_tok = p4_proj.view(B, d, -1).transpose(1, 2)
             p5_tok = p5_proj.view(B, d, -1).transpose(1, 2)
 
-            # Top-k by L2 saliency (FP32, guard NaN/Inf)
+            # Top-k by L2 saliency
             p3_scores = _nan_guard(p3_tok.norm(dim=-1))
             p4_scores = _nan_guard(p4_tok.norm(dim=-1))
             p5_scores = _nan_guard(p5_tok.norm(dim=-1))
@@ -215,7 +225,7 @@ class CrossScaleSGA(nn.Module):
             p4_sel = _nan_guard(p4_sel + e4)
             p5_sel = _nan_guard(p5_sel + e5)
 
-            # Concatenate cross-scale tokens (B, K, d)
+            # Concat cross-scale tokens (B, K, d)
             all_tok = torch.cat([p3_sel, p4_sel, p5_sel], dim=1)
 
             # Normalize selected token vectors before joint attention. Without
@@ -224,22 +234,22 @@ class CrossScaleSGA(nn.Module):
             # scale attention blocks.
             all_tok_attn = F.normalize(all_tok, dim=-1, eps=1e-6)
 
-            # LayerNorm (FP32)
+            # LayerNorm → Q/K; V uses un-normed tokens
             norm_w = self.norm.weight.float()
             norm_b = self.norm.bias.float()
             q = F.layer_norm(all_tok_attn, self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
             q = _nan_guard(q)
             k_t = q
-            v   = all_tok   # V uses un-normed tokens (standard: norm Q/K, not V)
+            v = all_tok
 
-            # Scaled dot-product attention (FP32)
+            # Scaled dot-product attention
             attn = torch.bmm(q, k_t.transpose(1, 2)) * self._attn_scale
             attn = attn.clamp(-80.0, 80.0)
             attn = attn - attn.max(dim=-1, keepdim=True).values
             attn = torch.softmax(attn, dim=-1)
             attn = torch.nan_to_num(attn, nan=0.0)
 
-            attended = torch.bmm(attn, v)   # (B, K, d)
+            attended = torch.bmm(attn, v)
             attended = _nan_guard(attended)
 
             # Split back by scale
@@ -247,62 +257,58 @@ class CrossScaleSGA(nn.Module):
             p4_att = attended[:, k3:k3 + k4, :]
             p5_att = attended[:, k3 + k4:, :]
 
-            # Scatter attended tokens back to full spatial grids (FP32)
+            # Scatter back to spatial grids
             p3_delta = self._scatter(p3_att, p3_idx, B, d, H3, W3)
             p4_delta = self._scatter(p4_att, p4_idx, B, d, H4, W4)
             p5_delta = self._scatter(p5_att, p5_idx, B, d, H5, W5)
 
-            # tanh clamp — prevents delta overflow before out_proj
-            # (matches sparse_global_token.py pattern)
+            # tanh clamp before out_proj
             p3_delta = 6.0 * torch.tanh(p3_delta / 6.0)
             p4_delta = 6.0 * torch.tanh(p4_delta / 6.0)
             p5_delta = 6.0 * torch.tanh(p5_delta / 6.0)
 
-            # out_proj in FP32 (explicit weight cast)
+            # out_proj
             p3_delta = F.conv2d(p3_delta, self.out_proj_p3.weight.float())
             p4_delta = F.conv2d(p4_delta, self.out_proj_p4.weight.float())
             p5_delta = F.conv2d(p5_delta, self.out_proj_p5.weight.float())
 
-            # delta norm in FP32
+            # delta norm
             p3_delta = self._gn_fp32(p3_delta, self.delta_norm_p3)
             p4_delta = self._gn_fp32(p4_delta, self.delta_norm_p4)
             p5_delta = self._gn_fp32(p5_delta, self.delta_norm_p5)
 
-            # Gated residual on ORIGINAL inputs (cast delta → input_dtype)
-            g3 = torch.sigmoid(self.gate_p3.float())
-            g4 = torch.sigmoid(self.gate_p4.float())
-            g5 = torch.sigmoid(self.gate_p5.float())
+            # LayerScale residual: out = input + ls * delta
+            # ls_p* shape (C, 1, 1) broadcasts over (B, C, H, W)
+            ls3 = self.ls_p3.float()
+            ls4 = self.ls_p4.float()
+            ls5 = self.ls_p5.float()
 
             if self.debug_enabled:
-                self.last_gate_p3 = float(g3.item())
-                self.last_gate_p4 = float(g4.item())
-                self.last_gate_p5 = float(g5.item())
+                self.last_ls_p3 = float(ls3.abs().mean().item())
+                self.last_ls_p4 = float(ls4.abs().mean().item())
+                self.last_ls_p5 = float(ls5.abs().mean().item())
                 self.last_k3 = int(k3)
                 self.last_k4 = int(k4)
                 self.last_k5 = int(k5)
-                # Attention distribution: mean over batch of within-scale vs cross-scale mass
                 with torch.no_grad():
-                    _a = attn.detach().mean(0)  # (K, K) mean over batch
+                    _a = attn.detach().mean(0)
                     _within = (
                         _a[:k3, :k3].sum()
-                        + _a[k3:k3+k4, k3:k3+k4].sum()
-                        + _a[k3+k4:, k3+k4:].sum()
+                        + _a[k3:k3 + k4, k3:k3 + k4].sum()
+                        + _a[k3 + k4:, k3 + k4:].sum()
                     )
                     _total = float(_a.sum().clamp(min=1e-8))
                     self.last_attn_within_frac = float(_within / _total)
                     self.last_attn_cross_frac = float(1.0 - self.last_attn_within_frac)
-                # Delta magnitude (mean absolute value before gate scaling)
                 self.last_delta_abs_p3 = float(p3_delta.detach().abs().mean().item())
                 self.last_delta_abs_p4 = float(p4_delta.detach().abs().mean().item())
                 self.last_delta_abs_p5 = float(p5_delta.detach().abs().mean().item())
 
-            p3_out = p3_f + g3 * p3_delta
-            p4_out = p4_f + g4 * p4_delta
-            p5_out = p5_f + g5 * p5_delta
+            p3_out = p3_f + ls3 * p3_delta
+            p4_out = p4_f + ls4 * p4_delta
+            p5_out = p5_f + ls5 * p5_delta
 
-            # The residual path is computed in FP32, then returned to the
-            # incoming AMP dtype. Clamp before FP16 cast so rare large
-            # activations cannot become +/-inf and poison backward.
+            # Clamp before FP16 cast to prevent overflow
             p3_out = torch.nan_to_num(p3_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
             p4_out = torch.nan_to_num(p4_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
             p5_out = torch.nan_to_num(p5_out, nan=0.0, posinf=_FP16_SAFE, neginf=-_FP16_SAFE).clamp(-_FP16_SAFE, _FP16_SAFE)
@@ -318,14 +324,14 @@ class CrossScaleSGA(nn.Module):
 
     @staticmethod
     def _scatter(
-        attended: torch.Tensor,  # (B, k, d) — FP32
-        indices: torch.Tensor,   # (B, k)
+        attended: torch.Tensor,
+        indices: torch.Tensor,
         B: int, d: int, H: int, W: int,
     ) -> torch.Tensor:
         """Scatter attended tokens back to (B, d, H, W) canvas."""
         N = H * W
         canvas = torch.zeros(B, d, N, device=attended.device, dtype=torch.float32)
-        idx_exp = indices.unsqueeze(1).expand(-1, d, -1)          # (B, d, k)
+        idx_exp = indices.unsqueeze(1).expand(-1, d, -1)
         canvas.scatter_(2, idx_exp, attended.transpose(1, 2))
         return canvas.view(B, d, H, W)
 
@@ -339,15 +345,14 @@ class CrossScaleSGA(nn.Module):
     # ------------------------------------------------------------------ #
 
     def set_debug(self, enabled: bool = True) -> None:
-        """Enable or disable debug state recording."""
         self.debug_enabled = enabled
 
     def get_debug_state(self) -> dict:
         """Return last recorded debug values (None if debug_enabled=False or no forward yet)."""
         return {
-            "gate_p3": self.last_gate_p3,
-            "gate_p4": self.last_gate_p4,
-            "gate_p5": self.last_gate_p5,
+            "ls_p3": self.last_ls_p3,
+            "ls_p4": self.last_ls_p4,
+            "ls_p5": self.last_ls_p5,
             "k3": self.last_k3,
             "k4": self.last_k4,
             "k5": self.last_k5,

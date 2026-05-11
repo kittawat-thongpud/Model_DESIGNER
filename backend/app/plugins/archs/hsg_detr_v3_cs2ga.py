@@ -84,6 +84,10 @@ class HSGDetRV3CS2GAPlugin(ModelArchPlugin):
             "ratio_p4": 0.10,
             "ratio_p5": 0.25,
             "enable_metrics": True,
+            # AMP disabled: GradScaler starts at 65536 → overflows backbone
+            # in early batches before scale backs down. Safe to re-enable once
+            # training is stable (monitor grad/has_nan + amp_scale).
+            "amp": False,
         }
 
 

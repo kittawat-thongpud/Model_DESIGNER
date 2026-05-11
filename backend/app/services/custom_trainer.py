@@ -869,7 +869,8 @@ class CustomDetectionTrainer(DetectionTrainer):
             return
         try:
             model = unwrap_model(self.model)
-            has_hsg_decoder = any(m.__class__.__name__ in {"RTDETRDecoderSGB", "RTDETRDecoderV2"} for m in model.modules())
+            _hsg_classes = {"RTDETRDecoderSGB", "RTDETRDecoderV2", "CrossScaleSGA"}
+            has_hsg_decoder = any(m.__class__.__name__ in _hsg_classes for m in model.modules())
             if not has_hsg_decoder:
                 return
             self.scaler = self._new_grad_scaler(
@@ -1334,9 +1335,9 @@ class CustomDetectionTrainer(DetectionTrainer):
             if m.__class__.__name__ == 'CrossScaleSGA'
         ]
         cs2ga_metric_keys = (
-            'gate_p3',
-            'gate_p4',
-            'gate_p5',
+            'ls_p3',
+            'ls_p4',
+            'ls_p5',
             'k3',
             'k4',
             'k5',
