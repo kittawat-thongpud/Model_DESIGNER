@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -394,6 +395,56 @@ def _write_patched_yaml(cfg: dict, imgsz_hw: list[int], out_dir: Path) -> Path:
     return patched_path
 
 
+def _patch_runtime_config(
+    config_path: Path,
+    out_dir: Path,
+    *,
+    optimizer_name: str,
+    lr0: float,
+    lrf: float,
+    weight_decay: float,
+    warmup_duration: int,
+    cos_lr: bool,
+    epochs: int,
+) -> Path:
+    """Write a fully-resolved RT-DETRv2 YAML with app runtime train settings.
+
+    RT-DETRv2's YAML merge is recursive, so CLI updates like
+    ``lr_scheduler.type=CosineAnnealingLR`` leave stale MultiStepLR keys
+    (``gamma``, ``milestones``) in place.  Rewriting the resolved config avoids
+    invalid mixed scheduler dictionaries.
+    """
+    cfg = _load_yaml_with_includes(config_path)
+    optimizer = dict(cfg.get("optimizer") or {})
+    optimizer.update({
+        "type": optimizer_name,
+        "lr": float(lr0),
+        "weight_decay": float(weight_decay),
+    })
+    cfg["optimizer"] = optimizer
+    if cos_lr:
+        cfg["lr_scheduler"] = {
+            "type": "CosineAnnealingLR",
+            "T_max": max(1, int(epochs)),
+            "eta_min": float(lr0) * float(lrf),
+        }
+    else:
+        cfg["lr_scheduler"] = {
+            "type": "MultiStepLR",
+            "milestones": [max(1, int(int(epochs) * 0.8))],
+            "gamma": float(lrf),
+        }
+    cfg["lr_warmup_scheduler"] = {
+        "type": "LinearWarmup",
+        "warmup_duration": int(max(0, warmup_duration)),
+    }
+    patched_path = out_dir / "config_runtime.yml"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(patched_path, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+    return patched_path
+
+
 def _append_output_log(job_id: str, line: str, state: dict[str, Any]) -> None:
     """Parse RT-DETRv2 subprocess stdout and update job state.
 
@@ -606,6 +657,11 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     export_dir = job_dir / "rtdetrv2_dataset"
     image_root, train_json, val_json, nc = _prepare_coco_dataset(job_id, data_yaml_path, export_dir)
+    train_image_count = 0
+    try:
+        train_image_count = len((json.loads(train_json.read_text(encoding="utf-8")) or {}).get("images") or [])
+    except Exception:
+        train_image_count = 0
 
     out_dir = job_dir / "runs" / "rtdetrv2"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -664,6 +720,15 @@ def run_worker(payload: dict[str, Any]) -> None:
         _log(f"GPU memory check skipped: {e}")
 
     epochs = int(config["epochs"] if config.get("epochs") is not None else 100)
+    patience = int(config.get("patience", 0) or 0)
+    lr0 = float(config.get("lr0", 0.0001) if config.get("lr0") is not None else 0.0001)
+    lrf = float(config.get("lrf", 0.01) if config.get("lrf") is not None else 0.01)
+    weight_decay = float(config.get("weight_decay", 0.0001) if config.get("weight_decay") is not None else 0.0001)
+    warmup_epochs = float(config.get("warmup_epochs", 0.0) if config.get("warmup_epochs") is not None else 0.0)
+    cos_lr = bool(config.get("cos_lr", False))
+    optimizer_name = str(config.get("optimizer", "AdamW") or "AdamW")
+    if optimizer_name.lower() == "auto":
+        optimizer_name = "AdamW"
     use_amp = bool(config.get("amp", True))
     use_pretrained = bool(config.get("use_yolo_pretrained", True))
     resume = str(config.get("resume") or "").strip()
@@ -710,6 +775,19 @@ def run_worker(payload: dict[str, Any]) -> None:
     # are never written — only last.pth (overwritten each epoch) and best.pth
     # (written when mAP improves) are kept.  This avoids disk bloat and I/O stalls.
     checkpoint_freq = epochs + 1
+    steps_per_epoch = max(1, math.ceil(max(train_image_count, 1) / max(batch, 1)))
+    warmup_duration = max(0, int(round(warmup_epochs * steps_per_epoch)))
+    upstream_config = _patch_runtime_config(
+        upstream_config,
+        out_dir,
+        optimizer_name=optimizer_name,
+        lr0=lr0,
+        lrf=lrf,
+        weight_decay=weight_decay,
+        warmup_duration=warmup_duration,
+        cos_lr=cos_lr,
+        epochs=epochs,
+    )
 
     updates = [
         f"num_classes={nc}",
@@ -827,6 +905,12 @@ def run_worker(payload: dict[str, Any]) -> None:
         "val_loss": None,
         "mAP50": None,
         "mAP50_95": None,
+        "best_mAP50": None,
+        "best_mAP50_95": None,
+        "best_epoch": None,
+        "epochs_since_improve": 0,
+        "patience": patience,
+        "stop_requested": False,
         "_log_txt_offset": _initial_log_offset,  # byte offset into log.txt
         "_seen_epochs": _seen_epochs,
         # Extra state for frontend progress widget
@@ -877,6 +961,21 @@ def run_worker(payload: dict[str, Any]) -> None:
                 map50 = float(test_coco[1])
                 parse_state["mAP50_95"] = map50_95
                 parse_state["mAP50"] = map50
+                previous_best = parse_state.get("best_mAP50_95")
+                improved = previous_best is None or map50_95 > float(previous_best)
+                if improved:
+                    parse_state["best_mAP50_95"] = map50_95
+                    parse_state["best_mAP50"] = map50
+                    parse_state["best_epoch"] = epoch_1
+                    parse_state["epochs_since_improve"] = 0
+                else:
+                    parse_state["epochs_since_improve"] = int(parse_state.get("epochs_since_improve", 0)) + 1
+                if (
+                    patience > 0
+                    and not improved
+                    and int(parse_state.get("epochs_since_improve", 0)) >= patience
+                ):
+                    parse_state["stop_requested"] = True
 
             # ── Build extended_metrics.jsonl entry ──────────────────────
             # Field names MUST match what job_storage.get_job_history() reads:
@@ -969,16 +1068,37 @@ def run_worker(payload: dict[str, Any]) -> None:
                 "epoch": epoch_1,
                 "message": f"Epoch {epoch_1}/{epochs}",
             }
-            if parse_state.get("mAP50_95") is not None:
-                updates["best_mAP50_95"] = parse_state["mAP50_95"]
-            if parse_state.get("mAP50") is not None:
-                updates["best_mAP50"] = parse_state["mAP50"]
+            if parse_state.get("best_mAP50_95") is not None:
+                updates["best_mAP50_95"] = parse_state["best_mAP50_95"]
+                updates["best_fitness"] = parse_state["best_mAP50_95"]
+            if parse_state.get("best_mAP50") is not None:
+                updates["best_mAP50"] = parse_state["best_mAP50"]
+            if parse_state.get("stop_requested"):
+                updates["message"] = (
+                    f"Early stopping requested at epoch {epoch_1}/{epochs}: "
+                    f"no mAP50-95 improvement for {patience} epochs"
+                )
             _set_job(job_id, **updates)
 
     for line in proc.stdout or []:
         _append_output_log(job_id, line, parse_state)
         # Periodically check log.txt for detailed metrics
         _poll_log_txt()
+        if parse_state.get("stop_requested") and proc.poll() is None:
+            job_storage.append_job_log(
+                job_id,
+                "INFO",
+                (
+                    f"Stopping RT-DETRv2 early: no mAP50-95 improvement for "
+                    f"{patience} epochs after best epoch {parse_state.get('best_epoch')}"
+                ),
+            )
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            break
 
     # Final poll after process ends
     _poll_log_txt()
@@ -986,7 +1106,7 @@ def run_worker(payload: dict[str, Any]) -> None:
     returncode = proc.wait()
     elapsed = time.time() - started
 
-    if returncode != 0:
+    if returncode != 0 and not parse_state.get("stop_requested"):
         _set_job(
             job_id,
             status="failed",
@@ -997,8 +1117,13 @@ def run_worker(payload: dict[str, Any]) -> None:
 
     weight_id = _save_weight(job_id, out_dir)
     final_msg = f"Training complete ({elapsed:.0f}s)"
-    if parse_state.get("mAP50_95") is not None:
-        final_msg += f" — mAP50-95: {parse_state['mAP50_95']:.4f}"
+    if parse_state.get("stop_requested"):
+        final_msg = (
+            f"Early stopped ({elapsed:.0f}s) — no mAP50-95 improvement for "
+            f"{patience} epochs"
+        )
+    if parse_state.get("best_mAP50_95") is not None:
+        final_msg += f" — best mAP50-95: {parse_state['best_mAP50_95']:.4f}"
 
     _set_job(
         job_id,
@@ -1006,8 +1131,9 @@ def run_worker(payload: dict[str, Any]) -> None:
         message=final_msg,
         weight_id=weight_id,
         completed_at=datetime.utcnow().isoformat() + "Z",
-        best_mAP50_95=parse_state.get("mAP50_95"),
-        best_mAP50=parse_state.get("mAP50"),
+        best_fitness=parse_state.get("best_mAP50_95"),
+        best_mAP50_95=parse_state.get("best_mAP50_95"),
+        best_mAP50=parse_state.get("best_mAP50"),
     )
     job_storage.append_job_log(
         job_id,
