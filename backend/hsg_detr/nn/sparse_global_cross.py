@@ -89,9 +89,9 @@ class CrossScaleSGA(nn.Module):
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
         attn_scale_mult: float = 0.1,
-        max_k3: int = 384,
-        max_k4: int = 192,
-        max_k5: int = 128,
+        max_k3: int = 0,
+        max_k4: int = 0,
+        max_k5: int = 0,
     ) -> None:
         super().__init__()
         if isinstance(c1, int):
