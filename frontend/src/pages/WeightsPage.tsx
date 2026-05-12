@@ -897,7 +897,9 @@ export default function WeightsPage({ onOpenWeight }: Props) {
         <ExportWeightPanel
           weightId={exportTarget.weight_id}
           weight={exportTarget}
+          jobId={exportTarget.job_id ?? undefined}
           onClose={() => setExportTarget(null)}
+          onWeightCreated={() => setExportTarget(null)}
         />
       )}
     </div>

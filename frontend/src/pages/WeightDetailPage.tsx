@@ -730,7 +730,9 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
         <ExportWeightPanel
           weightId={weight.weight_id}
           weight={weight}
+          jobId={weight.job_id ?? undefined}
           onClose={() => setShowExportPanel(false)}
+          onWeightCreated={(newId) => { setShowExportPanel(false); }}
         />
       )}
 
