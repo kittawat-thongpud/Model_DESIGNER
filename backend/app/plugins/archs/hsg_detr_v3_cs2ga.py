@@ -1,7 +1,7 @@
 """
 HSG-DETR V3-CS²GA architecture plugin.
 
-Registers N-scale variant with CrossScaleSGA cross-scale sparse attention.
+Registers N/S/M/L variants with CrossScaleSGA cross-scale sparse attention.
 Uses standard YOLO Detect head for baseline comparison.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ _CONFIGS_DIR = Path(__file__).resolve().parents[3] / "hsg_detr" / "configs"
 
 
 class HSGDetRV3CS2GAPlugin(ModelArchPlugin):
-    """HSG-DETR V3-CS²GA N-scale variant."""
+    """HSG-DETR V3-CS²GA scale variant."""
 
     def __init__(self, scale: str):
         self._scale = scale.lower()
@@ -43,7 +43,13 @@ class HSGDetRV3CS2GAPlugin(ModelArchPlugin):
 
     @property
     def scale_label(self) -> str:
-        return f"N-scale — CS²GA cross-scale attention"
+        labels = {
+            "n": "Nano — CS²GA cross-scale attention",
+            "s": "Small — CS²GA cross-scale attention",
+            "m": "Medium — CS²GA cross-scale attention",
+            "l": "Large — CS²GA cross-scale attention",
+        }
+        return labels.get(self._scale, f"{self._scale.upper()} — CS²GA cross-scale attention")
 
     @property
     def task_type(self) -> str:
@@ -91,5 +97,5 @@ class HSGDetRV3CS2GAPlugin(ModelArchPlugin):
         }
 
 
-for _scale in ("n",):
+for _scale in ("n", "s", "m", "l"):
     register_arch(HSGDetRV3CS2GAPlugin(_scale))

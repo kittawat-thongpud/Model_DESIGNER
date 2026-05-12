@@ -154,8 +154,21 @@ const HSG_DETR_V3_FALLBACK: ArchFamily = {
   ],
 };
 
+const HSG_DETR_V3_CS2GA_FALLBACK: ArchFamily = {
+  family: 'hsg_detr_v3_cs2ga',
+  display_name: 'HSG-DETR V3-CS²GA',
+  task_type: 'detect',
+  description: 'HSG-DETR V3-CS²GA uses one cross-scale sparse attention block over P3/P4/P5 with a YOLO Detect head.',
+  supported_scales: [
+    { scale: 'n', label: 'Nano — CS²GA cross-scale attention', plugin_name: 'hsg_detr_v3_cs2ga_n' },
+    { scale: 's', label: 'Small — CS²GA cross-scale attention', plugin_name: 'hsg_detr_v3_cs2ga_s' },
+    { scale: 'm', label: 'Medium — CS²GA cross-scale attention', plugin_name: 'hsg_detr_v3_cs2ga_m' },
+    { scale: 'l', label: 'Large — CS²GA cross-scale attention', plugin_name: 'hsg_detr_v3_cs2ga_l' },
+  ],
+};
+
 function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
-  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK, HSG_DETR_V3_FALLBACK];
+  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK, HSG_DETR_V3_FALLBACK, HSG_DETR_V3_CS2GA_FALLBACK];
   return fallbacks.reduce(
     (items, fallback) => items.some(f => f.family === fallback.family) ? items : [...items, fallback],
     families,
