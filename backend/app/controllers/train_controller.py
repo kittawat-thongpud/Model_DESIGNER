@@ -415,7 +415,8 @@ def _job_arch_family(job: dict | None) -> str:
     return ""
 
 
-def _checkpoint_path_for_job(job_id: str, checkpoint_name: str) -> Path:
+def _checkpoint_path_for_job(job_id: str, checkpoint_name: str) -> "Path":
+    from pathlib import Path
     from urllib.parse import unquote
     from ..config import JOBS_DIR
 
