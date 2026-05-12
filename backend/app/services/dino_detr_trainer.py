@@ -241,7 +241,21 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
         nc = int(data_cfg.get("nc") or 1)
         return [{"id": i, "name": f"class_{i}", "supercategory": "object"} for i in range(nc)]
 
-    def create_coco_annotation(image_files: list[Path], output_path: Path, split_name: str):
+    def _build_flat_symlink_dir(link_dir: Path, image_files: list[Path]) -> None:
+        """Create a flat directory of symlinks so DINO-DETR can find images by basename."""
+        link_dir.mkdir(parents=True, exist_ok=True)
+        for img in image_files:
+            if not img.exists():
+                continue
+            dst = link_dir / img.name
+            if dst.exists() or dst.is_symlink():
+                continue
+            try:
+                dst.symlink_to(img.resolve())
+            except Exception:
+                pass
+
+    def create_coco_annotation(image_files: list[Path], output_path: Path, split_name: str, images_root: Path | None = None):
         """Create COCO annotation file from YOLO labels."""
         coco_output = {
             "images": [],
@@ -268,10 +282,19 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
             except Exception:
                 img_width, img_height = 640, 480  # Default dimensions
 
+            # file_name: relative from images_root if provided, else basename only
+            if images_root is not None:
+                try:
+                    file_name = str(image_path.resolve().relative_to(images_root.resolve()))
+                except ValueError:
+                    file_name = image_path.name
+            else:
+                file_name = image_path.name
+
             # Add image to COCO
             coco_output["images"].append({
                 "id": image_id,
-                "file_name": image_path.name,
+                "file_name": file_name,
                 "width": img_width,
                 "height": img_height,
             })
@@ -351,29 +374,53 @@ def _convert_yolo_to_coco(job_id: str, dataset_dir: Path) -> Path:
         val_images = train_images
         val_files = train_files
 
-    create_coco_annotation(train_files, train_ann, "train")
-    create_coco_annotation(val_files, val_ann, "val")
+    # Determine images_root: the common ancestor directory for each split's images.
+    # For nested datasets (e.g. images/frontFar/.../xxx.jpg), images_root = dataset_dir/images
+    # so file_name in COCO = "frontFar/.../xxx.jpg" and train2017 symlinks to images_root.
+    def _find_images_root(split_path: Path, files: list[Path]) -> Path:
+        """Return the deepest common ancestor that is a real directory."""
+        if split_path.is_dir():
+            return split_path
+        # split_path is a .txt file listing absolute paths
+        # Use the dataset images dir if it exists, else common parent of files
+        img_dir = dataset_dir / "images"
+        if img_dir.is_dir() and files:
+            try:
+                files[0].resolve().relative_to(img_dir.resolve())
+                return img_dir
+            except ValueError:
+                pass
+        if files:
+            return files[0].parent
+        return dataset_dir
+
+    train_root = _find_images_root(train_images, train_files)
+    val_root = _find_images_root(val_images, val_files)
+
+    create_coco_annotation(train_files, train_ann, "train", images_root=train_root)
+    create_coco_annotation(val_files, val_ann, "val", images_root=val_root)
 
     # Create symlinks for COCO directory structure (train2017, val2017)
-    # DINO-DETR expects images in train2017/ and val2017/ directories
+    # Point to the images_root so relative file_name paths resolve correctly.
     train2017_link = dataset_dir / "train2017"
     val2017_link = dataset_dir / "val2017"
 
-    def _ensure_split_link(link: Path, target: Path) -> None:
-        if link.exists() or link.is_symlink():
-            if link.is_symlink() and link.resolve() != target.resolve():
-                link.unlink()
-            else:
+    def _ensure_dir_link(link: Path, target: Path) -> None:
+        if link.is_symlink():
+            if link.resolve() == target.resolve():
                 return
+            link.unlink()
+        elif link.exists():
+            return  # real dir already there, don't touch
         link.symlink_to(target)
 
-    if train_images.is_dir():
-        _ensure_split_link(train2017_link, train_images)
-        _log(job_id, "INFO", f"Created symlink: {train2017_link} -> {train_images}")
+    if train_root.is_dir():
+        _ensure_dir_link(train2017_link, train_root)
+        _log(job_id, "INFO", f"Symlink: {train2017_link} -> {train_root}")
 
-    if val_images.is_dir():
-        _ensure_split_link(val2017_link, val_images)
-        _log(job_id, "INFO", f"Created symlink: {val2017_link} -> {val_images}")
+    if val_root.is_dir():
+        _ensure_dir_link(val2017_link, val_root)
+        _log(job_id, "INFO", f"Symlink: {val2017_link} -> {val_root}")
 
     return annotations_dir
 
