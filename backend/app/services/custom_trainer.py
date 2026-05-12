@@ -1596,12 +1596,19 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         if self._nonfinite_grad_steps <= self._max_nonfinite_grad_skips:
             if self.job_id:
+                scale_msg = ""
+                if amp_scale_before is not None or amp_scale_after_update is not None:
+                    scale_msg = (
+                        f" | amp_scale {amp_scale_before if amp_scale_before is not None else '?'}"
+                        f" → {amp_scale_after_update if amp_scale_after_update is not None else '?'}"
+                    )
                 job_storage.append_job_log(
                     self.job_id,
                     "WARNING",
                     "Skipped optimizer step due to non-finite gradients "
                     f"({self._nonfinite_grad_steps}/{self._max_nonfinite_grad_skips}); "
-                    "AMP remains enabled and GradScaler was backed off",
+                    "AMP remains enabled and GradScaler was backed off"
+                    f"{scale_msg}",
                 )
             return
 
