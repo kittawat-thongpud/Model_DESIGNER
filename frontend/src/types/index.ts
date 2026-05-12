@@ -423,6 +423,10 @@ export interface WeightRecord {
   training_runs?: TrainingRun[];
   total_time?: number | null;
   device?: string | null;
+  source_type?: string;
+  source_plugin?: string;
+  arch_plugin?: string;
+  model_arch?: string;
   created_at: string;
 }
 

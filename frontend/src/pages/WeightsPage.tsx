@@ -12,6 +12,18 @@ import ImportPackageModal from '../components/ImportPackageModal';
 
 interface Props { onOpenWeight?: (weightId: string) => void; }
 
+const rawCheckpointLabel = (w: WeightRecord) => {
+  const source = String(w.source_type || w.source_plugin || '').toLowerCase();
+  return source === 'rtdetrv2' || source === 'dino' ? 'Export .pth' : 'Export .pt';
+};
+
+const rawCheckpointSub = (w: WeightRecord) => {
+  const source = String(w.source_type || w.source_plugin || '').toLowerCase();
+  if (source === 'rtdetrv2') return 'RT-DETRv2 checkpoint';
+  if (source === 'dino') return 'DINO checkpoint';
+  return 'Weight file only';
+};
+
 export default function WeightsPage({ onOpenWeight }: Props) {
   const weights = useWeightsStore((s) => s.weights);
   const loading = useWeightsStore((s) => s.loading);
@@ -312,8 +324,8 @@ export default function WeightsPage({ onOpenWeight }: Props) {
                               >
                                 <Download size={13} className="text-emerald-400 shrink-0" />
                                 <div className="text-left">
-                                  <div className="text-xs font-medium">Export .pt</div>
-                                  <div className="text-[10px] text-slate-500">Weight file only</div>
+                                  <div className="text-xs font-medium">{rawCheckpointLabel(w)}</div>
+                                  <div className="text-[10px] text-slate-500">{rawCheckpointSub(w)}</div>
                                 </div>
                               </button>
                               <div className="border-t border-slate-700/50" />
@@ -884,6 +896,7 @@ export default function WeightsPage({ onOpenWeight }: Props) {
       {exportTarget && (
         <ExportWeightPanel
           weightId={exportTarget.weight_id}
+          weight={exportTarget}
           onClose={() => setExportTarget(null)}
         />
       )}

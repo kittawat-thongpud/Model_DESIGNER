@@ -360,19 +360,39 @@ async def get_class_sample(job_id: str, class_name: str, filename: str):
 
 @router.get("/{job_id}/checkpoints", summary="List available checkpoints for a job")
 async def list_checkpoints(job_id: str):
-    """List best.pt and last.pt checkpoints available for export or profile creation."""
+    """List checkpoints available for export or profile creation."""
     from pathlib import Path
     from ..config import JOBS_DIR
 
+    job = job_storage.load_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job not found: {job_id}")
+
     job_dir = JOBS_DIR / job_id
-    weights_dir = job_dir / "runs" / "train" / "weights"
+    family = _job_arch_family(job)
 
     checkpoints = []
-    for name in ("best.pt", "last.pt"):
-        p = weights_dir / name
+    if family == "rtdetrv2":
+        run_dir = job_dir / "runs" / "rtdetrv2"
+        candidates = [run_dir / "best.pth", run_dir / "last.pth", run_dir / "checkpoint.pth"]
+    elif family == "dino":
+        candidates = []
+        for run_name in ("dino_detr", "dino"):
+            run_dir = job_dir / "runs" / run_name
+            candidates.extend([run_dir / "best.pth", run_dir / "last.pth", run_dir / "checkpoint.pth"])
+            candidates.extend(sorted(run_dir.glob("checkpoint*.pth"), key=lambda p: p.stat().st_mtime, reverse=True) if run_dir.exists() else [])
+    else:
+        weights_dir = job_dir / "runs" / "train" / "weights"
+        candidates = [weights_dir / "best.pt", weights_dir / "last.pt"]
+
+    seen = set()
+    for p in candidates:
         if p.exists():
+            if p.name in seen:
+                continue
+            seen.add(p.name)
             checkpoints.append({
-                "name": name,
+                "name": p.name,
                 "path": str(p),
                 "size_bytes": p.stat().st_size,
                 "modified_at": p.stat().st_mtime,
@@ -381,25 +401,57 @@ async def list_checkpoints(job_id: str):
     return {"checkpoints": checkpoints}
 
 
+def _job_arch_family(job: dict | None) -> str:
+    if not job:
+        return ""
+    model_id = str(job.get("model_id") or "").lower()
+    if model_id.startswith("arch:"):
+        model_id = model_id[len("arch:"):]
+    model_arch = str((job.get("config") or {}).get("model_arch") or "").lower()
+    if model_id == "rtdetrv2" or model_arch.startswith("rtdetrv2"):
+        return "rtdetrv2"
+    if model_id == "dino" or model_arch.startswith("dino"):
+        return "dino"
+    return ""
+
+
+def _checkpoint_path_for_job(job_id: str, checkpoint_name: str) -> Path:
+    from urllib.parse import unquote
+    from ..config import JOBS_DIR
+
+    job = job_storage.load_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job not found: {job_id}")
+    name = Path(unquote(checkpoint_name)).name
+    job_dir = JOBS_DIR / job_id
+    family = _job_arch_family(job)
+    if family == "rtdetrv2":
+        candidates = [job_dir / "runs" / "rtdetrv2" / name]
+    elif family == "dino":
+        candidates = [job_dir / "runs" / run_name / name for run_name in ("dino_detr", "dino")]
+    else:
+        candidates = [job_dir / "runs" / "train" / "weights" / name]
+    src = next((p for p in candidates if p.exists() and p.is_file()), None)
+    if src is None:
+        raise HTTPException(404, f"Checkpoint '{name}' not found for job {job_id}")
+    return src
+
+
 @router.post("/{job_id}/checkpoints/{checkpoint_name}/create-weight-profile",
              summary="Create a weight profile from a job checkpoint")
 async def create_weight_from_checkpoint(job_id: str, checkpoint_name: str):
-    """Save best.pt or last.pt from a job as a named weight profile in the weight library."""
+    """Save a job checkpoint as a named weight profile in the weight library."""
     import torch
-    from pathlib import Path
-    from ..config import JOBS_DIR
     from ..services import weight_storage
 
     job = job_storage.load_job(job_id)
     if not job:
         raise HTTPException(404, f"Job not found: {job_id}")
 
-    weights_dir = JOBS_DIR / job_id / "runs" / "train" / "weights"
-    src = weights_dir / checkpoint_name
-    if not src.exists():
-        raise HTTPException(404, f"Checkpoint '{checkpoint_name}' not found for job {job_id}")
+    src = _checkpoint_path_for_job(job_id, checkpoint_name)
+    family = _job_arch_family(job)
 
-    label = "best" if "best" in checkpoint_name else "last"
+    label = "best" if "best" in src.name else "last" if "last" in src.name else src.stem
     profile_name = f"{job.get('model_name', job_id)} ({label})"
 
     weight_id = weight_storage.save_weight_meta(
@@ -422,17 +474,36 @@ async def create_weight_from_checkpoint(job_id: str, checkpoint_name: str):
     meta = weight_storage.load_weight_meta(weight_id)
     if meta:
         try:
-            import ultralytics.nn.tasks as _ult_tasks
-            _sg = [_ult_tasks.DetectionModel, _ult_tasks.SegmentationModel,
-                   _ult_tasks.PoseModel, _ult_tasks.ClassificationModel,
-                   _ult_tasks.OBBModel, _ult_tasks.WorldModel]
-            with torch.serialization.safe_globals(_sg):
-                sd = torch.load(str(dest), map_location="cpu", weights_only=True)
-            meta["key_count"] = len(sd)
-            meta["param_count"] = sum(v.numel() for v in sd.values() if hasattr(v, "numel"))
+            raw = torch.load(str(dest), map_location="cpu", weights_only=False)
+            sd = None
+            if isinstance(raw, dict):
+                for key in ("ema", "model", "state_dict", "model_state_dict"):
+                    value = raw.get(key)
+                    if isinstance(value, dict):
+                        sd = value
+                        break
+                if sd is None and any(torch.is_tensor(v) for v in raw.values()):
+                    sd = raw
+            if isinstance(sd, dict):
+                tensors = [v for v in sd.values() if hasattr(v, "numel")]
+                meta["key_count"] = len(sd)
+                meta["param_count"] = sum(v.numel() for v in tensors)
         except Exception:
             pass
         meta["file_size_bytes"] = dest.stat().st_size
+        if family in {"rtdetrv2", "dino"}:
+            cfg = job.get("config", {}) or {}
+            meta.update({
+                "source_type": family,
+                "arch_plugin": cfg.get("model_arch"),
+                "model_arch": cfg.get("model_arch"),
+                "train_args": {
+                    "model_arch": cfg.get("model_arch"),
+                    "model_scale": job.get("model_scale"),
+                    "checkpoint": src.name,
+                    "job_id": job_id,
+                },
+            })
         weight_storage._store.save(weight_id, meta)
 
     return {

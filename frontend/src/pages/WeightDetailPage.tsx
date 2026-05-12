@@ -27,6 +27,18 @@ interface Props {
   onEditWeight?: (weightId: string) => void;
 }
 
+const rawCheckpointExt = (weight: WeightRecord) => {
+  const source = String(weight.source_type || weight.source_plugin || '').toLowerCase();
+  return source === 'rtdetrv2' || source === 'dino' ? '.pth' : '.pt';
+};
+
+const rawCheckpointSub = (weight: WeightRecord) => {
+  const source = String(weight.source_type || weight.source_plugin || '').toLowerCase();
+  if (source === 'rtdetrv2') return 'RT-DETRv2 checkpoint';
+  if (source === 'dino') return 'DINO checkpoint';
+  return 'Weight file only';
+};
+
 /* ────────────────────────────── sub-components ────────────────────── */
 
 function StatCard({ label, value, sub, trend, trendUp, color = 'text-white' }: {
@@ -152,7 +164,7 @@ export default function WeightDetailPage({ weightId, onBack, onOpenJob, onOpenWe
 
   const handleExport = () => {
     if (!weight) return;
-    const filename = `${weight.model_name}_${weight.weight_id.slice(0, 8)}.pt`.replace(/\s+/g, '_');
+    const filename = `${weight.model_name}_${weight.weight_id.slice(0, 8)}${rawCheckpointExt(weight)}`.replace(/\s+/g, '_');
     api.downloadWeight(weight.weight_id, filename);
   };
 
@@ -328,8 +340,8 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
                   >
                     <Download size={15} className="text-emerald-400" />
                     <div className="text-left">
-                      <div className="font-medium">Export .pt</div>
-                      <div className="text-xs text-slate-500">Weight file only</div>
+                      <div className="font-medium">Export {rawCheckpointExt(weight)}</div>
+                      <div className="text-xs text-slate-500">{rawCheckpointSub(weight)}</div>
                     </div>
                   </button>
                   <div className="border-t border-slate-700/50" />
@@ -717,6 +729,7 @@ print(f"Predicted: {predicted_class}, Confidence: {confidence:.2%}")`;
       {showExportPanel && (
         <ExportWeightPanel
           weightId={weight.weight_id}
+          weight={weight}
           onClose={() => setShowExportPanel(false)}
         />
       )}

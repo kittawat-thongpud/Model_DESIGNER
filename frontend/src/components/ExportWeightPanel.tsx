@@ -8,6 +8,7 @@ import {
 
 interface Props {
   weightId?: string;
+  weight?: { source_type?: string; source_plugin?: string; model_name?: string };
   jobId?: string;
   onClose: () => void;
   onWeightCreated?: (weightId: string) => void;
@@ -23,7 +24,17 @@ const EXPORT_FORMATS = [
 
 type Tab = 'download' | 'profile' | 'export';
 
-export default function ExportWeightPanel({ weightId, jobId, onClose, onWeightCreated }: Props) {
+const rawCheckpointExt = (weight?: { source_type?: string; source_plugin?: string }) => {
+  const source = String(weight?.source_type || weight?.source_plugin || '').toLowerCase();
+  return source === 'rtdetrv2' || source === 'dino' ? '.pth' : '.pt';
+};
+
+const isUpstreamCheckpoint = (weight?: { source_type?: string; source_plugin?: string }) => {
+  const source = String(weight?.source_type || weight?.source_plugin || '').toLowerCase();
+  return source === 'rtdetrv2' || source === 'dino';
+};
+
+export default function ExportWeightPanel({ weightId, weight, jobId, onClose, onWeightCreated }: Props) {
   const [tab, setTab] = useState<Tab>('download');
   const [checkpoints, setCheckpoints] = useState<JobCheckpoint[]>([]);
   const [selectedCheckpoint, setSelectedCheckpoint] = useState<string>('best.pt');
@@ -86,9 +97,9 @@ export default function ExportWeightPanel({ weightId, jobId, onClose, onWeightCr
   };
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
-    { id: 'download', label: 'Download .pt', icon: <Download size={14} /> },
+    { id: 'download', label: `Download ${rawCheckpointExt(weight)}`, icon: <Download size={14} /> },
     ...(jobId ? [{ id: 'profile' as Tab, label: 'Save to Library', icon: <Package size={14} /> }] : []),
-    ...(resolvedWeightId ? [{ id: 'export' as Tab, label: 'Export Format', icon: <FileCode2 size={14} /> }] : []),
+    ...(resolvedWeightId && !isUpstreamCheckpoint(weight) ? [{ id: 'export' as Tab, label: 'Export Format', icon: <FileCode2 size={14} /> }] : []),
   ];
 
   return (
@@ -148,13 +159,15 @@ export default function ExportWeightPanel({ weightId, jobId, onClose, onWeightCr
                   </div>
                 </div>
               )}
-              <p className="text-xs text-slate-500">Download the raw PyTorch weight file (.pt) for use in other tools.</p>
+              <p className="text-xs text-slate-500">
+                Download the raw PyTorch checkpoint ({rawCheckpointExt(weight)}). Upstream RT-DETRv2/DINO checkpoints are exported raw; ONNX/TorchScript export needs a dedicated wrapper.
+              </p>
               <button
                 onClick={handleDownloadPt}
                 disabled={!resolvedWeightId}
                 className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
               >
-                <Download size={14} /> Download .pt
+                <Download size={14} /> Download {rawCheckpointExt(weight)}
               </button>
             </div>
           )}

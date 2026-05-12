@@ -367,7 +367,6 @@ def _import_job(
     names = set(zf.namelist())
 
     if record_arc not in names:
-        result.errors.append(f"job {old_jid}: record.json missing in package")
         return
 
     record: dict = json.loads(zf.read(record_arc))

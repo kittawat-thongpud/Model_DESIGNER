@@ -580,14 +580,23 @@ async def get_weight_info(weight_id: str):
 
 @router.get("/{weight_id}/download", summary="Download weight .pt file")
 async def download_weight(weight_id: str):
-    """Stream the weight.pt file as a file download."""
+    """Stream the raw checkpoint file as a download.
+
+    Internally Model Designer stores every weight as ``weight.pt`` for a stable
+    path, but upstream wrappers such as RT-DETRv2/DINO are real PyTorch
+    ``.pth`` checkpoints.  Use the source metadata for the user-facing
+    extension so export/download does not pretend those files are Ultralytics
+    ``.pt`` weights.
+    """
     from fastapi.responses import FileResponse
     pt_path = weight_storage.weight_pt_path(weight_id)
     if not pt_path.exists():
         raise HTTPException(status_code=404, detail=f"Weight file not found: {weight_id}")
     meta = weight_storage.load_weight_meta(weight_id)
     model_name = (meta or {}).get("model_name", "weight")
-    filename = f"{model_name}_{weight_id[:8]}.pt".replace(" ", "_")
+    source_type = str((meta or {}).get("source_type") or "").lower()
+    ext = ".pth" if source_type in {"rtdetrv2", "dino"} else ".pt"
+    filename = f"{model_name}_{weight_id[:8]}{ext}".replace(" ", "_")
     return FileResponse(
         path=str(pt_path),
         media_type="application/octet-stream",
