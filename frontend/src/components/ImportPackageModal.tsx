@@ -38,10 +38,29 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [uploadId, setUploadId] = useState<string | null>(null);
+  const [urlProgress, setUrlProgress] = useState<{ progress: number; message: string; bytes?: string } | null>(null);
   // Local/URL source inputs
   const [localPath, setLocalPath] = useState('');
   const [sourceUrl, setSourceUrl] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+
+  const waitForUrlTask = async (taskId: string) => {
+    for (;;) {
+      const state = await api.getPackageUrlTask(taskId);
+      const downloaded = state.bytes_downloaded ?? 0;
+      const total = state.bytes_total ?? 0;
+      setUrlProgress({
+        progress: Math.max(0, Math.min(100, Math.round(state.progress ?? 0))),
+        message: state.message || state.status,
+        bytes: downloaded > 0
+          ? `${(downloaded / (1024 * 1024)).toFixed(1)} MB${total > 0 ? ` / ${(total / (1024 * 1024)).toFixed(1)} MB` : ''}`
+          : undefined,
+      });
+      if (state.status === 'completed') return state.result;
+      if (state.status === 'failed') throw new Error(state.error || state.message || 'URL package task failed');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  };
 
   const handleFile = async (f: File) => {
     if (!f.name.endsWith('.mdpkg') && !f.name.endsWith('.zip')) {
@@ -111,8 +130,10 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
     if (!sourceUrl.trim()) return;
     setPeeking(true);
     setError(null);
+    setUrlProgress({ progress: 0, message: 'Starting URL download...' });
     try {
-      const info = await api.peekPackageFromUrl(sourceUrl.trim()) as any;
+      const started = await api.startPackageUrlTask('peek', sourceUrl.trim());
+      const info = await waitForUrlTask(started.task_id) as any;
       setWeights(info.weights);
       setJobCount(info.jobs?.length || 0);
       const m: Record<string, string> = {};
@@ -124,6 +145,7 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
       setError(msg);
     } finally {
       setPeeking(false);
+      setUrlProgress(null);
     }
   };
 
@@ -143,7 +165,9 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
       if (sourceTab === 'local') {
         res = await api.importPackageFromLocal(localPath.trim(), renameMap, includeJobs);
       } else if (sourceTab === 'url') {
-        res = await api.importPackageFromUrl(sourceUrl.trim(), renameMap, includeJobs);
+        setUrlProgress({ progress: 0, message: 'Starting URL import...' });
+        const started = await api.startPackageUrlTask('import', sourceUrl.trim(), renameMap, includeJobs);
+        res = await waitForUrlTask(started.task_id);
       } else {
         // upload tab
         if (!file) return;
@@ -158,6 +182,7 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
       setError(msg);
     } finally {
       setLoading(false);
+      setUrlProgress(null);
     }
   };
 
@@ -291,6 +316,18 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
                   >
                     {peeking ? <Loader2 size={14} className="animate-spin" /> : <Globe size={14} />} Download & Preview
                   </button>
+                  {urlProgress && (
+                    <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3 space-y-2">
+                      <div className="flex justify-between gap-3 text-xs">
+                        <span className="text-slate-300">{urlProgress.message}</span>
+                        <span className="font-mono text-indigo-300">{urlProgress.progress}%</span>
+                      </div>
+                      <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                        <div className="h-full bg-indigo-500 transition-all duration-300 rounded-full" style={{ width: `${urlProgress.progress}%` }} />
+                      </div>
+                      {urlProgress.bytes && <div className="text-[10px] text-slate-500 font-mono">{urlProgress.bytes}</div>}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -343,6 +380,19 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
               </div>
 
               <p className="text-[10px] text-slate-600">Leave blank or unchanged to keep the original name.</p>
+
+              {sourceTab === 'url' && urlProgress && (
+                <div className="bg-slate-800/60 border border-slate-700 rounded-lg p-3 space-y-2">
+                  <div className="flex justify-between gap-3 text-xs">
+                    <span className="text-slate-300">{urlProgress.message}</span>
+                    <span className="font-mono text-indigo-300">{urlProgress.progress}%</span>
+                  </div>
+                  <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-indigo-500 transition-all duration-300 rounded-full" style={{ width: `${urlProgress.progress}%` }} />
+                  </div>
+                  {urlProgress.bytes && <div className="text-[10px] text-slate-500 font-mono">{urlProgress.bytes}</div>}
+                </div>
+              )}
             </div>
           )}
 
@@ -417,7 +467,7 @@ export default function ImportPackageModal({ onClose, onDone }: Props) {
                 <button onClick={handleImport} disabled={loading}
                   className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2 cursor-pointer">
                   {loading ? <Loader2 size={14} className="animate-spin" /> : <Package size={14} />}
-                  {loading ? 'Importing…' : 'Import'}
+                  {loading && sourceTab === 'url' && urlProgress ? `${urlProgress.progress}%` : loading ? 'Importing…' : 'Import'}
                 </button>
               )}
             </>

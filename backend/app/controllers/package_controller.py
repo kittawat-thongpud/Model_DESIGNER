@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response
@@ -33,6 +35,8 @@ _PACKAGE_DEFAULTS = get_package_config().get("defaults", {})
 
 # In-memory registry of active chunked uploads: upload_id → temp dir path
 _active_uploads: dict[str, Path] = {}
+_url_tasks: dict[str, dict] = {}
+_url_tasks_lock = threading.Lock()
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
@@ -213,6 +217,14 @@ class UrlPackagePeekRequest(BaseModel):
     timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
 
 
+class UrlPackageTaskRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) URL to download .mdpkg from")
+    rename_map: dict[str, str] = Field(default_factory=dict, description="JSON object {old_weight_id: new_display_name}")
+    include_jobs: bool = Field(default=False, description="Also import job records")
+    timeout: int = Field(300, ge=10, le=3600, description="Download timeout in seconds")
+    action: Literal["peek", "import"] = "peek"
+
+
 def _convert_google_drive_url(url: str) -> str:
     """Convert Google Drive share/download URLs to direct download URLs."""
     import re
@@ -235,6 +247,156 @@ def _convert_google_drive_url(url: str) -> str:
         return url
 
     return url
+
+
+def _set_url_task(task_id: str, **updates) -> None:
+    with _url_tasks_lock:
+        state = _url_tasks.setdefault(task_id, {})
+        state["task_id"] = task_id
+        state.update(updates)
+        state["updated_at"] = time.time()
+
+
+def _get_url_task(task_id: str) -> dict:
+    with _url_tasks_lock:
+        state = _url_tasks.get(task_id)
+        if not state:
+            raise HTTPException(status_code=404, detail=f"Package URL task not found: {task_id}")
+        public = {k: v for k, v in state.items() if k not in {"file_path"}}
+    return public
+
+
+def _download_package_url_to_file(task_id: str, url: str, timeout: int) -> Path:
+    """Download URL to a temp file while updating task progress.
+
+    This intentionally runs outside the request lifecycle. A reverse-proxy 524
+    can no longer kill the server route or hide progress from the UI.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+
+    def _stream_to_file(download_url: str, suffix: str = ".mdpkg") -> tuple[Path, bytes]:
+        resp = session.get(download_url, stream=True, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length") or 0)
+        content_type = resp.headers.get("content-type", "")
+        fd, tmp_name = tempfile.mkstemp(prefix=f"mdpkg_url_{task_id}_", suffix=suffix)
+        tmp_path = Path(tmp_name)
+        first = bytearray()
+        downloaded = 0
+        _set_url_task(
+            task_id,
+            status="downloading",
+            message="Downloading package...",
+            bytes_total=total,
+            bytes_downloaded=0,
+            content_type=content_type,
+            progress=5,
+        )
+        with open(fd, "wb") as out:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                if len(first) < 8192:
+                    first.extend(chunk[: 8192 - len(first)])
+                out.write(chunk)
+                downloaded += len(chunk)
+                progress = 5 + int((downloaded / total) * 70) if total > 0 else min(70, 5 + downloaded // (1024 * 1024))
+                _set_url_task(
+                    task_id,
+                    bytes_downloaded=downloaded,
+                    bytes_total=total,
+                    progress=min(progress, 75),
+                    message=f"Downloaded {downloaded / (1024 * 1024):.1f} MB"
+                    + (f" / {total / (1024 * 1024):.1f} MB" if total else ""),
+                )
+        return tmp_path, bytes(first)
+
+    tmp_path, head = _stream_to_file(url)
+
+    # Google Drive can return a small HTML confirmation page first.
+    if b"google.com" in head[:5000] and (
+        b"virus" in head[:5000].lower()
+        or b"confirm" in head[:5000].lower()
+        or b"download_warning" in head[:5000]
+    ):
+        import re
+
+        preview = tmp_path.read_bytes()[:20000].decode("utf-8", errors="ignore")
+        confirm_match = re.search(r"confirm=([a-zA-Z0-9_-]+)", preview)
+        if confirm_match:
+            tmp_path.unlink(missing_ok=True)
+            confirm_url = f"{url}&confirm={confirm_match.group(1)}"
+            _set_url_task(task_id, message="Google Drive confirmation accepted; retrying download...", progress=3)
+            tmp_path, head = _stream_to_file(confirm_url)
+
+    if head.startswith(b"<!DOCTYPE") or head.startswith(b"<html") or b"<!DOCTYPE html" in head[:1000]:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("URL returned HTML page instead of a package file. The file may require authentication or confirmation.")
+
+    _set_url_task(task_id, file_path=str(tmp_path), progress=78, message="Download complete; reading package...")
+    return tmp_path
+
+
+def _run_url_package_task(task_id: str, body: UrlPackageTaskRequest) -> None:
+    url = _convert_google_drive_url(body.url)
+    tmp_path: Path | None = None
+    try:
+        _set_url_task(
+            task_id,
+            status="queued",
+            action=body.action,
+            source_url=body.url[:160],
+            progress=0,
+            message="Queued",
+            bytes_downloaded=0,
+            bytes_total=0,
+            started_at=time.time(),
+        )
+        tmp_path = _download_package_url_to_file(task_id, url, body.timeout)
+        data = tmp_path.read_bytes()
+        _set_url_task(task_id, progress=82, message="Parsing package...")
+
+        if body.action == "peek":
+            result = package_service.peek_package(data)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            _set_url_task(task_id, status="completed", progress=100, message="Preview ready", result=result)
+            return
+
+        _set_url_task(task_id, progress=88, message="Importing package...")
+        result = package_service.import_package(data, rename_map=body.rename_map, include_jobs=body.include_jobs)
+        if result.errors and not result.weights_imported and not result.jobs_imported:
+            raise RuntimeError(str(result.errors))
+        result_dict = result.to_dict()
+        logger.log("system", "INFO", "Package imported from URL task", {**result_dict, "task_id": task_id, "source_url": url[:100] + "..."})
+        _set_url_task(task_id, status="completed", progress=100, message="Import complete", result=result_dict)
+    except Exception as e:
+        logger.log("system", "ERROR", "Package URL task failed", {"task_id": task_id, "error": str(e)})
+        _set_url_task(task_id, status="failed", progress=100, message=str(e), error=str(e))
+    finally:
+        if tmp_path:
+            tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/url-task", summary="Start async package URL peek/import")
+async def start_package_url_task(body: UrlPackageTaskRequest):
+    """Start URL package download in the background and return immediately."""
+    task_id = uuid.uuid4().hex[:12]
+    _set_url_task(task_id, status="queued", action=body.action, progress=0, message="Queued")
+    thread = threading.Thread(target=_run_url_package_task, args=(task_id, body), daemon=True)
+    thread.start()
+    return {"task_id": task_id, "status": "queued", "progress": 0, "message": "Queued"}
+
+
+@router.get("/url-task/{task_id}", summary="Get package URL task progress")
+async def get_package_url_task(task_id: str):
+    return _get_url_task(task_id)
 
 
 @router.post("/peek/url", summary="Preview package from download URL")

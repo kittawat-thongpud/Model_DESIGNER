@@ -509,6 +509,47 @@ export const api = {
     }
     return res.json();
   },
+  startPackageUrlTask: async (
+    action: 'peek' | 'import',
+    url: string,
+    renameMap: Record<string, string> = {},
+    includeJobs = false,
+    timeout = 300,
+  ): Promise<{ task_id: string; status: string; progress: number; message: string }> => {
+    const res = await fetch('/api/packages/url-task', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, url, rename_map: renameMap, include_jobs: includeJobs, timeout }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  getPackageUrlTask: async (
+    taskId: string,
+  ): Promise<{
+    task_id?: string;
+    action?: 'peek' | 'import';
+    status: 'queued' | 'downloading' | 'completed' | 'failed' | string;
+    progress: number;
+    message: string;
+    bytes_downloaded?: number;
+    bytes_total?: number;
+    error?: string;
+    result?: any;
+  }> => {
+    const res = await fetch(`/api/packages/url-task/${encodeURIComponent(taskId)}?_t=${Date.now()}`, {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' },
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
   importPackage: async (
     file: File,
     renameMap: Record<string, string> = {},
