@@ -836,6 +836,10 @@ def run_worker(payload: dict[str, Any]) -> None:
                 val_map = accumulated_eval_metrics.get("map")
                 val_map75 = accumulated_eval_metrics.get("map75")
 
+                # gpu_mem_gb: convert max_mem_mb (MB) reported by DINO-DETR to GB
+                _max_mem_mb = train_snapshot.get("max_mem_mb") or metrics.get("max_mem_mb")
+                _gpu_mem_gb = round(float(_max_mem_mb) / 1024.0, 2) if _max_mem_mb else None
+
                 progress_data = {
                     "type": "progress",
                     "phase": "validation" if phase == "val" else "train",
@@ -843,10 +847,11 @@ def run_worker(payload: dict[str, Any]) -> None:
                     "batch": f"{iteration}/{total_iterations}" if iteration and total_iterations else "0/0",
                     "percent": pct,
                     "losses": {
-                        "total": train_snapshot.get("train_loss"),
-                        "ce": train_snapshot.get("loss_ce"),
-                        "bbox": train_snapshot.get("loss_bbox"),
-                        "giou": train_snapshot.get("loss_giou"),
+                        # Use box/cls/dfl keys so frontend losses widget renders them
+                        "box": train_snapshot.get("loss_bbox_avg", train_snapshot.get("loss_bbox")),
+                        "cls": train_snapshot.get("loss_ce_avg", train_snapshot.get("loss_ce")),
+                        "dfl": train_snapshot.get("loss_giou_avg", train_snapshot.get("loss_giou")),
+                        "total": train_snapshot.get("train_loss") or train_snapshot.get("loss_avg"),
                         "class_error": train_snapshot.get("class_error"),
                     },
                     "val_map50": val_map50,
@@ -855,7 +860,7 @@ def run_worker(payload: dict[str, Any]) -> None:
                     "device": "cuda" if torch.cuda.is_available() else "cpu",
                     "ram_gb": system_res["ram_used_gb"],
                     "ram_total_gb": system_res["ram_total_gb"],
-                    "gpu_mem_gb": None,
+                    "gpu_mem_gb": _gpu_mem_gb,
                     "total_elapsed_s": total_elapsed_s,
                     "epoch_elapsed_s": None,
                     "avg_epoch_s": total_elapsed_s / epoch if epoch > 0 else None,

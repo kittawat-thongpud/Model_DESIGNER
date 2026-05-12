@@ -506,20 +506,28 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
                   </div>
                 </div>
 
-                {/* Losses row — always shown */}
+                {/* Losses row — dynamic keys: box/cls/dfl (YOLO) or bbox/ce/giou (DINO) */}
                 <div className="flex items-center gap-5">
-                  {(['box', 'cls', 'dfl'] as const).map((k, i) => {
+                  {(() => {
                     const colors = ['text-amber-400', 'text-purple-400', 'text-rose-400'];
-                    const v = tp?.losses?.[k];
-                    return (
-                      <span key={k} className="text-xs">
-                        <span className="text-slate-500 uppercase">{k} </span>
-                        <span className={`font-mono ${v != null ? colors[i] : 'text-slate-600'}`}>
-                          {v != null ? v.toFixed(3) : '—'}
+                    const losses = (tp?.losses ?? {}) as Record<string, number | null | undefined>;
+                    // Prefer YOLO keys; fall back to DINO keys when box is absent
+                    const slots: Array<{ key: string; label: string }> =
+                      losses['box'] != null
+                        ? [{ key: 'box', label: 'BOX' }, { key: 'cls', label: 'CLS' }, { key: 'dfl', label: 'DFL' }]
+                        : [{ key: 'box', label: 'BBOX' }, { key: 'cls', label: 'CE' }, { key: 'dfl', label: 'GIoU' }];
+                    return slots.map(({ key, label }, i) => {
+                      const v = losses[key];
+                      return (
+                        <span key={key} className="text-xs">
+                          <span className="text-slate-500">{label} </span>
+                          <span className={`font-mono ${v != null ? colors[i] : 'text-slate-600'}`}>
+                            {v != null ? (v as number).toFixed(3) : '—'}
+                          </span>
                         </span>
-                      </span>
-                    );
-                  })}
+                      );
+                    });
+                  })()}
                 </div>
 
                 {/* Info grid — always shown, null = — */}
