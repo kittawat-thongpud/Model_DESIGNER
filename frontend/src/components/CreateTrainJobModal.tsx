@@ -167,8 +167,18 @@ const HSG_DETR_V3_CS2GA_FALLBACK: ArchFamily = {
   ],
 };
 
+const YOLO26_CS2GA_FALLBACK: ArchFamily = {
+  family: 'yolo26_cs2ga',
+  display_name: 'YOLO26 + CS²GA',
+  task_type: 'detect',
+  description: 'YOLO26 backbone/neck (pretrained) with CS²GA cross-scale sparse attention inserted as a plug-in feature enhancer after the FPN/PAN outputs. CS²GA is the only new component — all other weights transfer from yolo26n.pt.',
+  supported_scales: [
+    { scale: 'n', label: 'Nano (~3.2 M, ~8.9 GFLOPs) — YOLO26-N + CS²GA', plugin_name: 'yolo26_cs2ga_n' },
+  ],
+};
+
 function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
-  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK, HSG_DETR_V3_FALLBACK, HSG_DETR_V3_CS2GA_FALLBACK];
+  const fallbacks = [HSG_DETR_V2_FALLBACK, HSG_DETR_V2C_FALLBACK, HSG_DETR_V3_FALLBACK, HSG_DETR_V3_CS2GA_FALLBACK, YOLO26_CS2GA_FALLBACK];
   return fallbacks.reduce(
     (items, fallback) => items.some(f => f.family === fallback.family) ? items : [...items, fallback],
     families,

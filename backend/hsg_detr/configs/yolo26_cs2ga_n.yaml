@@ -1,0 +1,68 @@
+# =============================================================================
+# YOLO26 + CS²GA — Cross-Scale Feature Enhancer
+# =============================================================================
+# Concept: use proven YOLO26 backbone/neck as the base, then insert a single
+# CrossScaleSGA block after the final P3/P4/P5 PAN outputs as a plug-in
+# feature enhancer. CS²GA is the only new component — everything else
+# transfers from yolo26n.pt pretrained weights.
+#
+# Experimental goal:
+#   Baseline : YOLO26-N  (plain, layers 0–22 → Detect layer 23)
+#   Ours     : YOLO26-N + CS²GA  (same 0–22, add CS²GA layer 23, Detect layer 24)
+#   Attribution: any mAP delta comes exclusively from CS²GA
+#
+# Architecture:
+#   Backbone (0–10): Conv/C3k2/SPPF/C2PSA — identical to yolo26n
+#   Neck    (11–22): C3k2 FPN/PAN         — identical to yolo26n
+#   CS²GA   (23)  : cross-scale attention on P3(64)/P4(128)/P5(256) — NEW
+#   Detect  (24)  : YOLO26 E2E head       — init from yolo26n layer-23 weights
+#
+# Warm-start: layers 0–22 + Detect copied from yolo26n.pt (100% backbone/neck)
+#             CS²GA layer-23 init fresh with LayerScale=1e-4
+#
+# N-scale channels (width=0.25): P3=64, P4=128, P5=256
+# Token budget @ 640×640: P3 5%→320, P4 10%→160, P5 25%→100 = 580 total
+# =============================================================================
+nc: 80
+end2end: True
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]              # 0  P1/2
+  - [-1, 1, Conv, [128, 3, 2]]             # 1  P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]      # 2
+  - [-1, 1, Conv, [256, 3, 2]]             # 3  P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]      # 4
+  - [-1, 1, Conv, [512, 3, 2]]             # 5  P4/16
+  - [-1, 2, C3k2, [512, True]]             # 6
+  - [-1, 1, Conv, [1024, 3, 2]]            # 7  P5/32
+  - [-1, 2, C3k2, [1024, True]]            # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]]      # 9
+  - [-1, 2, C2PSA, [1024]]                 # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 11
+  - [[-1, 6], 1, Concat, [1]]                    # 12  cat P4
+  - [-1, 2, C3k2, [512, True]]                   # 13  P4-fused
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 14
+  - [[-1, 4], 1, Concat, [1]]                    # 15  cat P3
+  - [-1, 2, C3k2, [256, True]]                   # 16  P3 ← 64ch @ N
+
+  - [-1, 1, Conv, [256, 3, 2]]                   # 17
+  - [[-1, 13], 1, Concat, [1]]                   # 18  cat P4-fused
+  - [-1, 2, C3k2, [512, True]]                   # 19  P4 ← 128ch @ N
+
+  - [-1, 1, Conv, [512, 3, 2]]                   # 20
+  - [[-1, 10], 1, Concat, [1]]                   # 21  cat P5
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]       # 22  P5 ← 256ch @ N
+
+  # CS²GA: cross-scale attention on P3/P4/P5 simultaneously
+  # c1=[64,128,256], shared_dim=256, ratios=5%/10%/25%, LayerScale init=1e-4
+  - [[16, 19, 22], 1, CrossScaleSGA, [256, 0.05, 0.10, 0.25]]  # 23
+
+  # YOLO26 E2E detect head (accepts list[Tensor] from CS²GA)
+  - [-1, 1, Detect, [nc]]                        # 24
