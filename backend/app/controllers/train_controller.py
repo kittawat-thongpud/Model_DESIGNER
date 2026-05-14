@@ -75,6 +75,10 @@ async def start_training(req: TrainRequest):
 
     if not req.model_id.startswith("arch:"):
         config = req.config.to_train_kwargs()
+        # Re-inject yolo_model for official YOLO models (was set earlier but overwritten by to_train_kwargs)
+        if req.model_id.startswith("yolo:"):
+            yolo_model = req.model_id.split(":")[1]
+            config["yolo_model"] = yolo_model
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []
