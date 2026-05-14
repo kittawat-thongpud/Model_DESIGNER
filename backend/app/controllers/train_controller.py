@@ -32,7 +32,9 @@ async def start_training(req: TrainRequest):
         yaml_path = ""  # Not used for official YOLO models
         # Inject yolo_model into config for ultra_trainer
         config = req.config.to_train_kwargs()
-        config["yolo_model"] = yolo_model
+        # Only set yolo_model if not already set by frontend
+        if "yolo_model" not in config:
+            config["yolo_model"] = yolo_model
     elif req.model_id.startswith("arch:"):
         # Arch plugin model — resolve family + scale to specific plugin
         # model_id = "arch:mamba_yolo", model_scale = "t"  → plugin "mamba_yolo_t"
