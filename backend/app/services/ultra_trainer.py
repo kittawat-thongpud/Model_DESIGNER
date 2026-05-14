@@ -1426,75 +1426,76 @@ def _training_worker(
         # If config contains 'model_arch', look up the arch plugin and:
         #   1. Register any custom nn.Modules (e.g. SparseGlobalBlock → ultralytics)
         #   2. Override yaml_path with the plugin's built-in YAML definition
+        # Skip for official YOLO models (yolo_model is set)
         arch_plugin = None
-        model_arch_key = config.pop("model_arch", None)
-        if model_arch_key:
-            from ..plugins.loader import get_arch_plugin, find_arch_for_yaml
-            arch_plugin = get_arch_plugin(model_arch_key)
-            if arch_plugin is None:
-                raise ValueError(
-                    f"Unknown model_arch '{model_arch_key}'. "
-                    f"Make sure the arch plugin is registered via discover_plugins()."
-                )
-            job_storage.append_job_log(job_id, "INFO",
-                f"Using arch plugin: {arch_plugin.display_name}")
-            arch_plugin.register_modules()
-            base_yaml_path = arch_plugin.yaml_path()
-            # If the plugin has a scale key, inject it into a job-local YAML copy
-            # so Ultralytics picks the correct depth/width from the scales: block.
-            arch_scale = arch_plugin.scale
-            import yaml as _yaml
-            yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
+        if "yolo_model" not in config:
+            model_arch_key = config.pop("model_arch", None)
+            if model_arch_key:
+                from ..plugins.loader import get_arch_plugin, find_arch_for_yaml
+                arch_plugin = get_arch_plugin(model_arch_key)
+                if arch_plugin is None:
+                    raise ValueError(
+                        f"Unknown model_arch '{model_arch_key}'. "
+                        f"Make sure the arch plugin is registered via discover_plugins()."
+                    )
+                job_storage.append_job_log(job_id, "INFO",
+                    f"Using arch plugin: {arch_plugin.display_name}")
+                arch_plugin.register_modules()
+                base_yaml_path = arch_plugin.yaml_path()
+                # If the plugin has a scale key, inject it into a job-local YAML copy
+                # so Ultralytics picks the correct depth/width from the scales: block.
+                arch_scale = arch_plugin.scale
+                import yaml as _yaml
+                yaml_dict = _yaml.safe_load(base_yaml_path.read_text(encoding="utf-8"))
+                
+                # Use yaml_scale if available (e.g. HSG-DETR V2c variants always use "n")
+                if hasattr(arch_plugin, 'yaml_scale'):
+                    arch_scale = arch_plugin.yaml_scale
+
+                # Handle scale injection
+                if arch_scale:
+                    _scale_key = str(arch_scale).upper()
+                    yaml_dict["scale"] = _scale_key
+                    _scales = yaml_dict.get("scales")
+                    if isinstance(_scales, dict):
+                        _scale_vals = _scales.get(_scale_key)
+                        if _scale_vals is None:
+                            _scale_vals = _scales.get(str(arch_scale).lower())
+                        if _scale_vals is not None and len(_scale_vals) >= 3:
+                            yaml_dict["depth_multiple"] = _scale_vals[0]
+                            yaml_dict["width_multiple"] = _scale_vals[1]
+                            yaml_dict["max_channels"] = _scale_vals[2]
+                            yaml_dict.pop("scales", None)
             
-            # Use yaml_scale if available (e.g. HSG-DETR V2c variants always use "n")
-            if hasattr(arch_plugin, 'yaml_scale'):
-                arch_scale = arch_plugin.yaml_scale
+                # Get default config options from plugin if available (all arch plugins)
+                plugin_defaults = {}
+                if hasattr(arch_plugin, 'get_config_options'):
+                    plugin_defaults = arch_plugin.get_config_options()
 
-            # Handle scale injection
-            if arch_scale:
-                _scale_key = str(arch_scale).upper()
-                yaml_dict["scale"] = _scale_key
-                _scales = yaml_dict.get("scales")
-                if isinstance(_scales, dict):
-                    _scale_vals = _scales.get(_scale_key)
-                    if _scale_vals is None:
-                        _scale_vals = _scales.get(str(arch_scale).lower())
-                    if _scale_vals is not None and len(_scale_vals) >= 3:
-                        yaml_dict["depth_multiple"] = _scale_vals[0]
-                        yaml_dict["width_multiple"] = _scale_vals[1]
-                        yaml_dict["max_channels"] = _scale_vals[2]
-                        yaml_dict.pop("scales", None)
-            
-            # Get default config options from plugin if available (all arch plugins)
-            # Skip for official YOLO models (yolo_model is set)
-            plugin_defaults = {}
-            if "yolo_model" not in config and hasattr(arch_plugin, 'get_config_options'):
-                plugin_defaults = arch_plugin.get_config_options()
+                # Extract enable_deep_metrics from plugin defaults for all custom arch plugins
+                if "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
+                    config["enable_deep_metrics"] = plugin_defaults["enable_deep_metrics"]
 
-            # Extract enable_deep_metrics from plugin defaults for all custom arch plugins
-            if "yolo_model" not in config and "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
-                config["enable_deep_metrics"] = plugin_defaults["enable_deep_metrics"]
+                # Extract nan_retries from plugin defaults (for AMP-sensitive architectures)
+                if "nan_retries" not in config and "nan_retries" in plugin_defaults:
+                    config["nan_retries"] = plugin_defaults["nan_retries"]
 
-            # Extract nan_retries from plugin defaults (for AMP-sensitive architectures)
-            if "yolo_model" not in config and "nan_retries" not in config and "nan_retries" in plugin_defaults:
-                config["nan_retries"] = plugin_defaults["nan_retries"]
-
-            # Handle HSG-DETR V2c/V3 specific parameters
-            if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
-                # Extract HSG-DETR decoder config options (plugin_defaults already loaded above)
-                loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
-                alpha_u = config.get("alpha_u", plugin_defaults.get("alpha_u", 0.3))
-                beta_s = config.get("beta_s", plugin_defaults.get("beta_s", 0.0))
-                soft_hard = config.get("soft_hard", plugin_defaults.get("soft_hard", None))
-                top_m_ratio = config.get("top_m_ratio", plugin_defaults.get("top_m_ratio", None))
-                max_top_k = config.get("max_top_k", plugin_defaults.get("max_top_k", None))
-                max_top_m = config.get("max_top_m", plugin_defaults.get("max_top_m", None))
-                tau = config.get("tau", plugin_defaults.get("tau", None))
-                lambda_soft = config.get("lambda_soft", plugin_defaults.get("lambda_soft", None))
-                eta = config.get("eta", plugin_defaults.get("eta", None))
-                for _metric_key in ("enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "enable_deep_metrics"):
-                    if _metric_key not in config and _metric_key in plugin_defaults:
-                        config[_metric_key] = plugin_defaults[_metric_key]
+                # Handle HSG-DETR V2c/V3 specific parameters
+                if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
+                    # Extract HSG-DETR decoder config options (plugin_defaults already loaded above)
+                    loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
+                    alpha_u = config.get("alpha_u", plugin_defaults.get("alpha_u", 0.3))
+                    beta_s = config.get("beta_s", plugin_defaults.get("beta_s", 0.0))
+                    soft_hard = config.get("soft_hard", plugin_defaults.get("soft_hard", None))
+                    top_m_ratio = config.get("top_m_ratio", plugin_defaults.get("top_m_ratio", None))
+                    max_top_k = config.get("max_top_k", plugin_defaults.get("max_top_k", None))
+                    max_top_m = config.get("max_top_m", plugin_defaults.get("max_top_m", None))
+                    tau = config.get("tau", plugin_defaults.get("tau", None))
+                    lambda_soft = config.get("lambda_soft", plugin_defaults.get("lambda_soft", None))
+                    eta = config.get("eta", plugin_defaults.get("eta", None))
+                    for _metric_key in ("enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "enable_deep_metrics"):
+                        if _metric_key not in config and _metric_key in plugin_defaults:
+                            config[_metric_key] = plugin_defaults[_metric_key]
                 
                 if "head" in yaml_dict:
                     for i, layer in enumerate(yaml_dict["head"]):
