@@ -1465,14 +1465,18 @@ def _training_worker(
                         yaml_dict["max_channels"] = _scale_vals[2]
                         yaml_dict.pop("scales", None)
             
+            # Get default config options from plugin if available (all arch plugins)
+            plugin_defaults = {}
+            if hasattr(arch_plugin, 'get_config_options'):
+                plugin_defaults = arch_plugin.get_config_options()
+
+            # Extract enable_deep_metrics from plugin defaults for all custom arch plugins
+            if "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
+                config["enable_deep_metrics"] = plugin_defaults["enable_deep_metrics"]
+
             # Handle HSG-DETR V2c/V3 specific parameters
             if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
-                # Get default config options from plugin if available
-                plugin_defaults = {}
-                if hasattr(arch_plugin, 'get_config_options'):
-                    plugin_defaults = arch_plugin.get_config_options()
-                
-                # Extract HSG-DETR decoder config options (plugin defaults override schema defaults)
+                # Extract HSG-DETR decoder config options (plugin_defaults already loaded above)
                 loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
                 alpha_u = config.get("alpha_u", plugin_defaults.get("alpha_u", 0.3))
                 beta_s = config.get("beta_s", plugin_defaults.get("beta_s", 0.0))
@@ -1483,7 +1487,7 @@ def _training_worker(
                 tau = config.get("tau", plugin_defaults.get("tau", None))
                 lambda_soft = config.get("lambda_soft", plugin_defaults.get("lambda_soft", None))
                 eta = config.get("eta", plugin_defaults.get("eta", None))
-                for _metric_key in ("enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics"):
+                for _metric_key in ("enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "enable_deep_metrics"):
                     if _metric_key not in config and _metric_key in plugin_defaults:
                         config[_metric_key] = plugin_defaults[_metric_key]
                 
@@ -1963,6 +1967,7 @@ def _training_worker(
             'enable_query_metrics': config.pop('enable_query_metrics', True),
             'enable_gt_metrics': config.pop('enable_gt_metrics', False),
             'enable_dam_metrics': config.pop('enable_dam_metrics', False),
+            'enable_deep_metrics': config.pop('enable_deep_metrics', False),
         }
 
         # ── Pop Model Designer fields that are NOT valid Ultralytics kwargs ───
@@ -2382,6 +2387,10 @@ def _training_worker(
                 f"Epoch {epoch}/{trainer.epochs} completed in {epoch_time:.1f}s | "
                 f"Total: {total_elapsed/60:.1f}m | ETA: {eta_seconds/60:.1f}m")
 
+            # Log deep metrics if enabled
+            if _enable_deep_metrics:
+                _log_epoch_deep_metrics(epoch)
+
         def on_fit_epoch_end(trainer):
             """Called after validation at end of each epoch."""
             # DDP: only rank -1 (single GPU) or rank 0 writes to job storage
@@ -2530,12 +2539,184 @@ def _training_worker(
                     f"Backbone warm-start failed ({ws_err}) — continuing without warm-start"
                 )
 
+        # ── Deep metrics collection ───────────────────────────────────────────
+        _enable_deep_metrics = custom_params.get('enable_deep_metrics', False)
+        _deep_metrics_cache = {}  # Cache for batch-level metrics
+
+        def _collect_deep_metrics(trainer):
+            """Collect deep metrics from custom modules (CS²GA, SGB, etc.)."""
+            if not _enable_deep_metrics:
+                return {}
+
+            try:
+                model = trainer.model
+                if hasattr(model, 'module'):
+                    model = model.module  # DDP unwrap
+                if hasattr(model, 'model'):
+                    model = model.model  # YOLO wrapper unwrap
+
+                metrics = {}
+
+                # ── CS²GA CrossScaleSGA metrics ─────────────────────────────
+                cs2ga_blocks = [
+                    m for m in model.modules()
+                    if m.__class__.__name__ == 'CrossScaleSGA'
+                ]
+                cs2ga_metric_keys = (
+                    'ls_p3', 'ls_p4', 'ls_p5',
+                    'k3', 'k4', 'k5',
+                    'attn_within_frac', 'attn_cross_frac',
+                    'delta_abs_p3', 'delta_abs_p4', 'delta_abs_p5',
+                    'p3_score_max', 'p4_score_max', 'p5_score_max',
+                    'p3_score_min_selected', 'p4_score_min_selected', 'p5_score_min_selected',
+                    'p3_score_std', 'p4_score_std', 'p5_score_std',
+                    'attn_entropy',
+                )
+                for i, blk in enumerate(cs2ga_blocks):
+                    tag = f'cs2ga/{i}'
+                    state = blk.get_debug_state() if hasattr(blk, 'get_debug_state') else {}
+                    for key in cs2ga_metric_keys:
+                        value = state.get(key)
+                        if isinstance(value, (int, float)):
+                            metrics[f'{tag}/{key}'] = float(value)
+
+                # ── SGTokenBlock/SGTokenBlockV2 metrics ─────────────────────
+                sgb_blocks = [
+                    m for m in model.modules()
+                    if m.__class__.__name__ in {'SGTokenBlock', 'SGTokenBlockV2'}
+                ]
+                for i, blk in enumerate(sgb_blocks):
+                    tag = f'sgb/{i}'
+                    # Basic SGB metrics
+                    N = getattr(blk, 'last_N', None)
+                    k = getattr(blk, 'last_k', None)
+                    ratio = getattr(blk, 'ratio', None)
+                    if N is not None:
+                        metrics[f'{tag}/N'] = float(N)
+                    if k is not None:
+                        metrics[f'{tag}/k'] = float(k)
+                    if ratio is not None:
+                        metrics[f'{tag}/ratio'] = float(ratio)
+                    if N is not None and k is not None and N > 0:
+                        metrics[f'{tag}/k_over_N'] = float(k) / float(N)
+
+                    # V2-specific metrics
+                    if blk.__class__.__name__ == 'SGTokenBlockV2':
+                        last_gate = getattr(blk, 'last_gate', None)
+                        if last_gate is not None:
+                            metrics[f'{tag}/gamma_abs_mean'] = float(last_gate)
+                        last_score_std = getattr(blk, 'last_score_std', None)
+                        if last_score_std is not None:
+                            metrics[f'{tag}/score_std'] = float(last_score_std)
+                        for attr, suffix in (
+                            ('last_k_eff', 'K_eff'),
+                            ('last_top_m', 'top_m'),
+                            ('last_tau', 'tau'),
+                            ('last_lambda_soft', 'lambda_soft'),
+                            ('last_soft_nonhard_mass', 'soft_nonhard_mass'),
+                            ('last_topm_extra_mass', 'topm_extra_mass'),
+                            ('last_hard_delta_norm', 'hard_delta_norm'),
+                            ('last_nonhard_delta_norm', 'nonhard_delta_norm'),
+                        ):
+                            value = getattr(blk, attr, None)
+                            if value is not None:
+                                metrics[f'{tag}/{suffix}'] = float(value)
+
+                # ── Gradient metrics ────────────────────────────────────────
+                has_nan = False
+                has_inf = False
+                grad_norms = {}
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        if torch.isnan(p.grad).any():
+                            has_nan = True
+                        if torch.isinf(p.grad).any():
+                            has_inf = True
+                        # Group by layer type
+                        if 'cs2ga' in n.lower() or 'crossscalesga' in n.lower():
+                            grad_norms['cs2ga'] = grad_norms.get('cs2ga', 0) + float(p.grad.norm().item())
+                        elif 'sgb' in n.lower() or 'sgtoken' in n.lower():
+                            grad_norms['sgb'] = grad_norms.get('sgb', 0) + float(p.grad.norm().item())
+                        elif 'backbone' in n.lower() or 'stem' in n.lower():
+                            grad_norms['backbone'] = grad_norms.get('backbone', 0) + float(p.grad.norm().item())
+                        elif 'head' in n.lower() or 'detect' in n.lower():
+                            grad_norms['head'] = grad_norms.get('head', 0) + float(p.grad.norm().item())
+                        else:
+                            grad_norms['other'] = grad_norms.get('other', 0) + float(p.grad.norm().item())
+
+                metrics['grad/has_nan'] = float(has_nan)
+                metrics['grad/has_inf'] = float(has_inf)
+                for k, v in grad_norms.items():
+                    metrics[f'grad/{k}_norm'] = v
+
+                return metrics
+            except Exception as e:
+                # Silently fail to avoid disrupting training
+                return {'_error': str(e)}
+
+        def on_train_batch_end(trainer):
+            """Called after each training batch - cache metrics for epoch summary."""
+            if not _enable_deep_metrics:
+                return
+
+            # DDP: only rank -1 or rank 0
+            import os as _os
+            if int(_os.environ.get('LOCAL_RANK', -1)) > 0:
+                return
+
+            # Collect metrics and cache for averaging
+            batch_metrics = _collect_deep_metrics(trainer)
+            if batch_metrics:
+                for k, v in batch_metrics.items():
+                    if isinstance(v, (int, float)):
+                        if k not in _deep_metrics_cache:
+                            _deep_metrics_cache[k] = []
+                        _deep_metrics_cache[k].append(float(v))
+
+        def _log_epoch_deep_metrics(epoch):
+            """Log averaged deep metrics for the epoch."""
+            if not _deep_metrics_cache:
+                return
+
+            # Average collected metrics
+            metrics = {}
+            for k, values in _deep_metrics_cache.items():
+                if values:
+                    metrics[k] = float(sum(values) / len(values))
+
+            # Clear cache for next epoch
+            _deep_metrics_cache.clear()
+
+            if metrics:
+                # Log to job storage
+                job_storage.append_job_log(
+                    job_id, 'METRICS',
+                    f'Deep metrics epoch {epoch}',
+                    {'type': 'deep_metrics', 'epoch': epoch, **metrics}
+                )
+
+                # Write to extended_metrics.jsonl
+                try:
+                    import jsonlines
+                    extended_path = Path(job_dir) / 'extended_metrics.jsonl'
+                    with jsonlines.open(extended_path, mode='a') as writer:
+                        record = {
+                            'epoch': epoch,
+                            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                            **metrics
+                        }
+                        writer.write(record)
+                except Exception:
+                    pass  # Fail silently
+
         def _register_callbacks(_model):
             # Register callbacks
             _model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
             _model.add_callback("on_train_start", on_train_start)
             _model.add_callback("on_train_epoch_end", on_train_epoch_end)
             _model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+            if _enable_deep_metrics:
+                _model.add_callback("on_train_batch_end", on_train_batch_end)
 
         _register_callbacks(model)
 

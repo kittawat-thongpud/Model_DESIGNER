@@ -103,6 +103,7 @@ class YOLO26CS2GAPlugin(ModelArchPlugin):
         return {
             "amp": False,  # GradScaler 65536 still overflows backbone early batches
             "enable_metrics": True,
+            "enable_deep_metrics": True,  # Enable CS²GA debug metrics collection
             # YOLO26-N official optimizer settings
             "optimizer": "MuSGD",
             "lr0": 0.0054,
