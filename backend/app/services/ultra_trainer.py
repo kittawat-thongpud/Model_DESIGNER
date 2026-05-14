@@ -1830,6 +1830,11 @@ def _training_worker(
         yolo_model = config.pop("yolo_model", "")  # official YOLO model (yolov8n, yolov8s, etc.)
         use_yolo_pretrained = config.pop("use_yolo_pretrained", True)
         
+        # Filter out arch-plugin-specific parameters for official YOLO models
+        if yolo_model:
+            for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
+                config.pop(key, None)
+        
         # Convert boolean fields to actual boolean (handle string 'True'/'False' from config)
         if isinstance(use_yolo_pretrained, str):
             use_yolo_pretrained = use_yolo_pretrained.lower() in ('true', '1', 'yes')
