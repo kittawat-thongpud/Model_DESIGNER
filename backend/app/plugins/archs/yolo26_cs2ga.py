@@ -98,11 +98,36 @@ class YOLO26CS2GAPlugin(ModelArchPlugin):
         return None
 
     def get_config_options(self) -> dict[str, object]:
+        # YOLO26 official training recipe for N-scale (from Ultralytics docs)
+        # https://docs.ultralytics.com/guides/yolo26-training-recipe
         return {
-            # AMP off: GradScaler 65536 still overflows backbone early batches.
-            # Re-enable once grad/has_nan = 0 for 10+ consecutive epochs.
-            "amp": False,
+            "amp": False,  # GradScaler 65536 still overflows backbone early batches
             "enable_metrics": True,
+            # YOLO26-N official optimizer settings
+            "optimizer": "MuSGD",
+            "lr0": 0.0054,
+            "lrf": 0.0495,
+            "momentum": 0.947,
+            "weight_decay": 0.00064,
+            "warmup_epochs": 0.98,
+            # YOLO26-N loss weights
+            "box": 5.63,
+            "cls": 0.56,
+            "dfl": 9.04,
+            # YOLO26-N augmentation
+            "mosaic": 0.909,
+            "mixup": 0.012,
+            "copy_paste": 0.075,
+            "scale": 0.562,
+            "fliplr": 0.606,
+            "degrees": 1.11,
+            "shear": 1.46,
+            "translate": 0.071,
+            "hsv_h": 0.014,
+            "hsv_s": 0.645,
+            "hsv_v": 0.566,
+            "bgr": 0.106,
+            "close_mosaic": 10,
         }
 
     # ------------------------------------------------------------------ #
