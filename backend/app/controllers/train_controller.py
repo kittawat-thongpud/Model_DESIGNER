@@ -79,6 +79,9 @@ async def start_training(req: TrainRequest):
         if req.model_id.startswith("yolo:"):
             yolo_model = req.model_id.split(":")[1]
             config["yolo_model"] = yolo_model
+            # Remove arch-plugin-specific parameters that are not valid for official YOLO
+            for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
+                config.pop(key, None)
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []
