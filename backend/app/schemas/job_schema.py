@@ -71,7 +71,7 @@ class TrainConfig(BaseModel):
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer: Literal[
-        "auto", "SGD", "Adam", "AdamW", "NAdam", "RAdam", "RMSProp"
+        "auto", "SGD", "Adam", "AdamW", "NAdam", "RAdam", "RMSProp", "MuSGD"
     ] = str(_training_default("optimizer", "auto"))
     lr0: float = float(_training_default("lr0", 0.01))                  # initial learning rate
     lrf: float = float(_training_default("lrf", 0.01))                  # final LR factor (final_lr = lr0 * lrf)
