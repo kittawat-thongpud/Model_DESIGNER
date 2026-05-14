@@ -782,7 +782,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                         </div>
 
                         {/* Training Mode for Official YOLO / upstream arch plugins */}
-                        {(selectedModelId?.startsWith('yolo:') || selectedArchFamily?.family === 'rtdetrv2' || selectedArchFamily?.family === 'dino') && (
+                        {(selectedModelId?.startsWith('yolo:') || selectedArchFamily?.family === 'rtdetrv2' || selectedArchFamily?.family === 'dino' || selectedArchFamily?.family === 'yolo26_cs2ga') && (
                           <div className="col-span-2">
                             <label className="block text-xs font-medium text-amber-400 mb-1.5">Training Mode</label>
                             <div className="flex gap-3">
@@ -804,6 +804,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                                       ? 'Use official DINO pretrained backbone — faster representation tuning'
                                       : selectedArchFamily?.family === 'rtdetrv2'
                                       ? 'Use official RT-DETRv2 COCO checkpoint — faster convergence'
+                                      : selectedArchFamily?.family === 'yolo26_cs2ga'
+                                      ? 'Load yolo26n.pt pretrained weights for backbone/neck — CS²GA trains from scratch'
                                       : 'Use COCO pretrained weights — faster convergence, better accuracy'}
                                   </div>
                                 </div>

@@ -2433,6 +2433,7 @@ def _training_worker(
         _yolov8_backbone_ref = config.pop("yolov8_backbone", None)
         _model_scale_ref = model_scale
         _resume_requested_ref = bool(resume_path)
+        _use_yolo_pretrained_ref = use_yolo_pretrained
 
         def on_pretrain_routine_end(trainer):
             trainer_resume = bool(getattr(getattr(trainer, "args", None), "resume", False))
@@ -2445,7 +2446,44 @@ def _training_worker(
                 return
             if _arch_plugin_ref is None or _pretrained_loaded_ref:
                 return
-            # Warm-start is opt-in ONLY: require explicit yolov8_backbone selection.
+
+            # YOLO26-CS²GA: use use_yolo_pretrained flag directly
+            plugin_family = getattr(_arch_plugin_ref, "family", "").lower()
+            if plugin_family == "yolo26_cs2ga":
+                if not _use_yolo_pretrained_ref:
+                    job_storage.append_job_log(job_id, "INFO",
+                        "YOLO26-CS²GA warm-start: use_yolo_pretrained=False — training from scratch")
+                    return
+                # Warm-start for YOLO26-CS²GA
+                ws_scale = _model_scale_ref
+                try:
+                    ws_log = lambda msg: job_storage.append_job_log(job_id, "INFO", msg)
+                    class _ModelShim:
+                        def __init__(self, nn_module):
+                            self.model = nn_module
+                    ws_result = _arch_plugin_ref.warm_start(
+                        _ModelShim(trainer.model), log_fn=ws_log, model_scale=ws_scale
+                    )
+                    if ws_result.get("transferred", 0) > 0:
+                        job_storage.append_job_log(
+                            job_id, "INFO",
+                            f"✓ YOLO26-CS²GA warm-start complete: "
+                            f"{ws_result['transferred']} tensors transferred, "
+                            f"{ws_result['skipped']} skipped"
+                        )
+                    else:
+                        job_storage.append_job_log(
+                            job_id, "INFO",
+                            "YOLO26-CS²GA warm-start: no tensors transferred"
+                        )
+                except Exception as ws_err:
+                    job_storage.append_job_log(
+                        job_id, "WARNING",
+                        f"YOLO26-CS²GA warm-start failed ({ws_err}) — continuing without warm-start"
+                    )
+                return
+
+            # HSG-DETR: Warm-start is opt-in ONLY: require explicit yolov8_backbone selection.
             if not _yolov8_backbone_ref:
                 job_storage.append_job_log(job_id, "INFO",
                     "Backbone warm-start: no YOLOv8 backbone selected — skipping")
