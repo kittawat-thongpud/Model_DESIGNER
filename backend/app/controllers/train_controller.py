@@ -22,9 +22,13 @@ async def start_training(req: TrainRequest):
     # Check if official YOLO model
     if req.model_id.startswith("yolo:"):
         # Official YOLO model - no database lookup needed
-        model_name = req.model_id.split(":")[1].upper()  # e.g., "yolo:yolov8" -> "YOLOV8"
+        yolo_model = req.model_id.split(":")[1]  # e.g., "yolo:yolov8n" -> "yolov8n"
+        model_name = yolo_model.upper()  # e.g., "YOLOV8N"
         task = str(_MODEL_DEFAULTS.get("task", "detect"))
         yaml_path = ""  # Not used for official YOLO models
+        # Inject yolo_model into config for ultra_trainer
+        config = req.config.to_train_kwargs()
+        config["yolo_model"] = yolo_model
     elif req.model_id.startswith("arch:"):
         # Arch plugin model — resolve family + scale to specific plugin
         # model_id = "arch:mamba_yolo", model_scale = "t"  → plugin "mamba_yolo_t"

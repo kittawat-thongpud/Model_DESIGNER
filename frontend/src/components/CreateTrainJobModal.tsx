@@ -1214,7 +1214,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                               onChange={e => updateConfig('optimizer', e.target.value)}
                               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white focus:border-emerald-500 focus:outline-none"
                             >
-                              {['auto', 'SGD', 'Adam', 'AdamW', 'NAdam', 'RAdam', 'RMSProp'].map(opt => (
+                              {['auto', 'SGD', 'Adam', 'AdamW', 'NAdam', 'RAdam', 'RMSProp', 'MuSGD'].map(opt => (
                                 <option key={opt} value={opt}>{opt}</option>
                               ))}
                             </select>
