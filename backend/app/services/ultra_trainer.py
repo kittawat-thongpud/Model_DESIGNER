@@ -1474,6 +1474,10 @@ def _training_worker(
             if "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
                 config["enable_deep_metrics"] = plugin_defaults["enable_deep_metrics"]
 
+            # Extract nan_retries from plugin defaults (for AMP-sensitive architectures)
+            if "nan_retries" not in config and "nan_retries" in plugin_defaults:
+                config["nan_retries"] = plugin_defaults["nan_retries"]
+
             # Handle HSG-DETR V2c/V3 specific parameters
             if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
                 # Extract HSG-DETR decoder config options (plugin_defaults already loaded above)
@@ -2767,6 +2771,7 @@ def _training_worker(
         max_nan_retries = int(config.get("nan_retries", _TRAINING_NAN_RETRIES) or _TRAINING_NAN_RETRIES)
         nan_attempt = 0
         results = None
+        job_storage.append_job_log(job_id, "INFO", f"NaN retry configuration: max_nan_retries={max_nan_retries}")
 
         def _fresh_model_for_retry() -> "YOLO":
             # Recreate a fresh model instance using the same initialization mode.

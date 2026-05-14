@@ -1512,6 +1512,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                     # V2's Look-Forward-Twice decoder keeps gradients chained
                     # across refinement layers, so it needs a tighter clip.
                     clip_max_norm = 0.1
+                elif any(m.__class__.__name__ == "CrossScaleSGA" for m in model_unwrapped.modules()):
+                    # CS²GA has attention-based cross-scale interactions that can
+                    # produce large gradients early in training. Use conservative clip.
+                    clip_max_norm = 1.0
             except Exception:
                 pass
 
