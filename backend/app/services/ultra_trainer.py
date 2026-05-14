@@ -1481,6 +1481,16 @@ def _training_worker(
                     config["nan_retries"] = plugin_defaults["nan_retries"]
 
                 # Handle HSG-DETR V2c/V3 specific parameters
+                loc_quality_mode = None
+                alpha_u = None
+                beta_s = None
+                soft_hard = None
+                top_m_ratio = None
+                max_top_k = None
+                max_top_m = None
+                tau = None
+                lambda_soft = None
+                eta = None
                 if arch_plugin.family in {"hsg_detr_v2c", "hsg_detr_v3"}:
                     # Extract HSG-DETR decoder config options (plugin_defaults already loaded above)
                     loc_quality_mode = config.get("loc_quality_mode", plugin_defaults.get("loc_quality_mode", "area"))
@@ -1497,6 +1507,11 @@ def _training_worker(
                         if _metric_key not in config and _metric_key in plugin_defaults:
                             config[_metric_key] = plugin_defaults[_metric_key]
                 
+                job_storage.append_job_log(job_id, "INFO",
+                    f"HSG-DETR config: loc_quality_mode={loc_quality_mode}, alpha_u={alpha_u}, beta_s={beta_s}, "
+                    f"soft_hard={soft_hard}, top_m_ratio={top_m_ratio}, lambda_soft={lambda_soft}, eta={eta}, "
+                    f"dam_metrics={config.get('enable_dam_metrics', False)}")
+
                 if "head" in yaml_dict:
                     for i, layer in enumerate(yaml_dict["head"]):
                         if isinstance(layer, list) and len(layer) >= 4:
