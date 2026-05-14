@@ -23,7 +23,11 @@ async def start_training(req: TrainRequest):
     if req.model_id.startswith("yolo:"):
         # Official YOLO model - no database lookup needed
         yolo_model = req.model_id.split(":")[1]  # e.g., "yolo:yolov8n" -> "yolov8n"
-        model_name = yolo_model.upper()  # e.g., "YOLOV8N"
+        # Format model name with space before scale for YOLO26
+        if yolo_model.lower().startswith("yolo26") and len(yolo_model) > 5:
+            model_name = yolo_model[:-1].upper() + " " + yolo_model[-1].upper()  # e.g., "yolo26n" -> "YOLO26 N"
+        else:
+            model_name = yolo_model.upper()  # e.g., "yolov8n" -> "YOLOV8N"
         task = str(_MODEL_DEFAULTS.get("task", "detect"))
         yaml_path = ""  # Not used for official YOLO models
         # Inject yolo_model into config for ultra_trainer
