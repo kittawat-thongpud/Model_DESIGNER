@@ -1466,16 +1466,17 @@ def _training_worker(
                         yaml_dict.pop("scales", None)
             
             # Get default config options from plugin if available (all arch plugins)
+            # Skip for official YOLO models (yolo_model is set)
             plugin_defaults = {}
-            if hasattr(arch_plugin, 'get_config_options'):
+            if "yolo_model" not in config and hasattr(arch_plugin, 'get_config_options'):
                 plugin_defaults = arch_plugin.get_config_options()
 
             # Extract enable_deep_metrics from plugin defaults for all custom arch plugins
-            if "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
+            if "yolo_model" not in config and "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
                 config["enable_deep_metrics"] = plugin_defaults["enable_deep_metrics"]
 
             # Extract nan_retries from plugin defaults (for AMP-sensitive architectures)
-            if "nan_retries" not in config and "nan_retries" in plugin_defaults:
+            if "yolo_model" not in config and "nan_retries" not in config and "nan_retries" in plugin_defaults:
                 config["nan_retries"] = plugin_defaults["nan_retries"]
 
             # Handle HSG-DETR V2c/V3 specific parameters
