@@ -358,7 +358,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             'anneal_epochs', 'eta_start', 'eta_end', 'eta_warmup_epochs',
             'lambda_selector', 'T_teacher', 'T_student', 'selector_loss_start_epoch',
             'selector_loss_warmup_epochs',
-            'enable_query_metrics', 'enable_gt_metrics', 'enable_dam_metrics',
+            'enable_query_metrics', 'enable_gt_metrics', 'enable_dam_metrics', 'enable_deep_metrics',
             '_partition_configs', '_dataset_name',
         }
         
