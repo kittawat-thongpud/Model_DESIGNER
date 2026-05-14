@@ -1994,6 +1994,11 @@ def _training_worker(
 
         # Build train kwargs (only valid Ultralytics parameters)
         train_kwargs = {k: v for k, v in config.items() if v != ""}
+        
+        # Remove arch-plugin-specific parameters that Ultralytics doesn't recognize
+        for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
+            train_kwargs.pop(key, None)
+        
         train_kwargs["project"] = str(job_dir / "runs")
         _requested_cache = _normalize_requested_cache(train_kwargs.get("cache", None))
         if _requested_cache is None:
