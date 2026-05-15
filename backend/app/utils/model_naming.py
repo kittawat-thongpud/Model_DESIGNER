@@ -13,16 +13,21 @@ def format_official_yolo_model_name(yolo_model: str) -> str:
         yolo_model: Model identifier (e.g., "yolov8n", "yolov9s", "yolo26n")
         
     Returns:
-        Formatted model name following consistent pattern
+        Formatted model name following consistent pattern with space before scale
         
     Examples:
-        - "yolov8n" -> "YOLOV8N"
-        - "yolov9s" -> "YOLOV9S"
-        - "yolo26n" -> "YOLO26N"
-        - "yolo11x" -> "YOLO11X"
+        - "yolov8n" -> "YOLOV8 N"
+        - "yolov9s" -> "YOLOV9 S"
+        - "yolo26n" -> "YOLO26 N"
+        - "yolo11x" -> "YOLO11 X"
     """
-    # Use consistent naming: all uppercase, no spaces
-    return yolo_model.upper()
+    # Extract base name and scale letter
+    if len(yolo_model) > 0 and yolo_model[-1].isalpha():
+        base_name = yolo_model[:-1].upper()
+        scale = yolo_model[-1].upper()
+        return f"{base_name} {scale}"
+    else:
+        return yolo_model.upper()
 
 
 def format_arch_plugin_model_name(arch_plugin, scale: str) -> str:

@@ -13,15 +13,22 @@ export function formatOfficialYoloModelName(yoloModel: string): string {
    *   yoloModel: Model identifier (e.g., "yolov8n", "yolov9s", "yolo26n")
    * 
    * Returns:
-   *   Formatted model name following consistent pattern
+   *   Formatted model name following consistent pattern with space before scale
    * 
    * Examples:
-   *   - "yolov8n" -> "YOLOV8N"
-   *   - "yolov9s" -> "YOLOV9S"
-   *   - "yolo26n" -> "YOLO26N"
-   *   - "yolo11x" -> "YOLO11X"
+   *   - "yolov8n" -> "YOLOV8 N"
+   *   - "yolov9s" -> "YOLOV9 S"
+   *   - "yolo26n" -> "YOLO26 N"
+   *   - "yolo11x" -> "YOLO11 X"
    */
-  return yoloModel.toUpperCase();
+  // Extract base name and scale letter
+  if (yoloModel.length > 0 && /[a-zA-Z]/.test(yoloModel[yoloModel.length - 1])) {
+    const baseName = yoloModel.slice(0, -1).toUpperCase();
+    const scale = yoloModel[yoloModel.length - 1].toUpperCase();
+    return `${baseName} ${scale}`;
+  } else {
+    return yoloModel.toUpperCase();
+  }
 }
 
 export function formatArchPluginModelName(displayName: string, scale: string): string {
