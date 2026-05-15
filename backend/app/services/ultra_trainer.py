@@ -1353,10 +1353,54 @@ def _training_worker(
     job_id: str,
     yaml_path: str,
     task: str,
-    config: dict[str, Any],
-    partition_configs: list[dict[str, Any]] | None = None,
-    model_scale: str | None = None,
+    config: dict,
+    partition_configs: list[dict],
+    model_scale: float,
 ) -> None:
+    """Training worker with enhanced error handling and cleanup."""
+    import os
+    import signal
+    import threading
+    import time as _time
+    import traceback
+    
+    # Setup global exception handler to catch hanging imports
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        """Global exception handler that logs and forces exit on critical errors."""
+        if issubclass(exc_type, KeyboardInterrupt):
+            # Allow KeyboardInterrupt to propagate normally
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        # Log the exception
+        error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        job_storage.append_job_log(job_id, "ERROR", f"Uncaught exception: {error_msg}")
+        
+        # Force exit on critical errors to prevent hanging
+        critical_errors = (ImportError, ModuleNotFoundError, MemoryError)
+        if issubclass(exc_type, critical_errors):
+            job_storage.append_job_log(job_id, "ERROR", "Critical error detected, forcing process exit")
+            try:
+                os.kill(os.getpid(), signal.SIGKILL)
+            except:
+                os._exit(1)
+    
+    # Install global exception handler
+    sys.excepthook = handle_exception
+    
+    # Setup a hard timeout watchdog (30 minutes max for entire job)
+    def hard_timeout_watchdog():
+        """Hard timeout watchdog - kills process if it runs too long."""
+        _time.sleep(1800)  # 30 minutes
+        job_storage.append_job_log(job_id, "ERROR", "Hard timeout reached (30 min), forcing exit")
+        try:
+            os.kill(os.getpid(), signal.SIGKILL)
+        except:
+            os._exit(1)
+    
+    hard_timeout_thread = threading.Thread(target=hard_timeout_watchdog, daemon=True, name="hard_timeout_watchdog")
+    hard_timeout_thread.start()
+
     """Background thread that runs Ultralytics model.train().
     
     Args:

@@ -33,6 +33,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "worker_stop_timeout_s": 5.0,
         "training_setup_watchdog_timeout_s": 600,
         "training_setup_heartbeat_s": 30,
+        "training_watchdog_timeout_s": 7200,  # 2 hours for main training loop
     },
     "queue": {
         "sqlite_path": "task_queue.db",

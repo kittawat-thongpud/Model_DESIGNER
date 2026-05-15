@@ -594,7 +594,44 @@ class CustomDetectionTrainer(DetectionTrainer):
     
     def _do_train(self, world_size=1):
         """Override training loop to add custom logging and DDP cleanup."""
+        import os
+        import signal
+        import threading
+        import time as _time
+        
         self.log(f"Starting training for {self.epochs} epochs", "INFO")
+        
+        # Setup training watchdog to prevent hanging
+        done = threading.Event()
+        start_t = _time.time()
+        monitoring_config = get_monitoring_config()
+        # Use a longer timeout for training (default 2 hours)
+        timeout_s = int(monitoring_config.get("training_watchdog_timeout_s", 7200))
+        heartbeat_interval = 60  # Check every minute during training
+        
+        def _training_watchdog():
+            """Watchdog for main training loop."""
+            while True:
+                if done.wait(heartbeat_interval):
+                    break
+                elapsed = _time.time() - start_t
+                if elapsed >= timeout_s:
+                    try:
+                        self.log(
+                            f"Training watchdog triggered after {elapsed:.1f}s - forcing exit",
+                            "ERROR",
+                        )
+                        # Force exit to prevent hanging
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            os._exit(1)
+                        except:
+                            pass
+                    break
+        
+        watchdog_thread = threading.Thread(target=_training_watchdog, daemon=True, name="training_watchdog")
+        watchdog_thread.start()
         
         try:
             # BaseTrainer._do_train() takes no positional args in Ultralytics 8.4.x
@@ -607,6 +644,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             self._cleanup_ddp_processes()
             raise
         finally:
+            done.set()  # Stop the watchdog
             # Always cleanup DDP processes after training ends
             self._cleanup_ddp_processes()
     
@@ -807,17 +845,19 @@ class CustomDetectionTrainer(DetectionTrainer):
         heartbeat_interval = int(monitoring_config.get("training_setup_heartbeat_s", 30))
 
         def _watchdog():
-            """Emit heartbeat logs every 30s; dump stacks on timeout."""
+            """Emit heartbeat logs every 30s; dump stacks on timeout and force exit."""
+            import os
+            import signal
             while True:
                 triggered = not done.wait(heartbeat_interval)
                 if done.is_set():
                     break
                 elapsed = _time.time() - start_t
                 if elapsed >= timeout_s:
-                    # Timeout — dump stacks
+                    # Timeout — dump stacks and force exit
                     try:
                         self.log(
-                            f"Training setup watchdog triggered after {elapsed:.1f}s - dumping thread stacks",
+                            f"Training setup watchdog triggered after {elapsed:.1f}s - dumping thread stacks and forcing exit",
                             "WARNING",
                         )
                         frames = sys._current_frames()
@@ -830,8 +870,18 @@ class CustomDetectionTrainer(DetectionTrainer):
                                 self.log(f"Thread stack | name={th.name} ident={th.ident}\n{stack}", "WARNING")
                             except Exception:
                                 continue
+                        
+                        # Force exit to prevent hanging
+                        self.log(f"Training setup hung for {elapsed:.1f}s, forcing process exit", "ERROR")
+                        # Use SIGKILL to force immediate termination
+                        os.kill(os.getpid(), signal.SIGKILL)
                     except Exception as e:
                         self.log(f"Training setup watchdog failed: {e}", "WARNING")
+                        # Fallback to sys.exit if SIGKILL fails
+                        try:
+                            os._exit(1)
+                        except:
+                            pass
                     break
                 else:
                     # Heartbeat — user sees setup is still running
