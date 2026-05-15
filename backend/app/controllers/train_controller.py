@@ -27,11 +27,11 @@ async def start_training(req: TrainRequest):
     if req.model_id.startswith("yolo:"):
         # Official YOLO model - no database lookup needed
         yolo_model = req.model_id.split(":")[1]  # e.g., "yolo:yolov8n" -> "yolov8n"
-        # Format model name with space before scale for YOLO26
-        if yolo_model.lower().startswith("yolo26") and len(yolo_model) > 5:
-            model_name = yolo_model[:-1].upper() + " " + yolo_model[-1].upper()  # e.g., "yolo26n" -> "YOLO26 N"
-        else:
-            model_name = yolo_model.upper()  # e.g., "yolov8n" -> "YOLOV8N"
+        
+        # Use centralized model naming
+        from ..utils.model_naming import format_official_yolo_model_name
+        model_name = format_official_yolo_model_name(yolo_model)
+        
         task = str(_MODEL_DEFAULTS.get("task", "detect"))
         yaml_path = ""  # Not used for official YOLO models
         # Inject yolo_model into config for ultra_trainer
@@ -64,11 +64,9 @@ async def start_training(req: TrainRequest):
         if preflight_err:
             raise HTTPException(400, preflight_err)
         # Job name: "Mamba-YOLO T", "RT-DETR L", "HSG-DET M" etc.
-        _scale_upper = (arch_plugin.scale or "").upper()
-        model_name = (
-            f"{arch_plugin.family_display_name} {_scale_upper}"
-            if _scale_upper else arch_plugin.family_display_name
-        )
+        # Use centralized model naming for arch plugins
+        from ..utils.model_naming import format_arch_plugin_model_name
+        model_name = format_arch_plugin_model_name(arch_plugin, scale)
         task = arch_plugin.task_type
         yaml_path = ""  # arch plugin sets yaml_path in training worker
         # Inject model_arch key so the training worker picks up the plugin

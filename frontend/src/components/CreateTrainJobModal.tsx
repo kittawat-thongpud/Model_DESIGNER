@@ -393,6 +393,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       if (selectedModelId.startsWith('yolo:')) {
         const family = selectedModelId.split(':')[1];
         finalModelId = `yolo:${family}${modelScale}`;
+        console.log('DEBUG: Final model_id:', finalModelId, 'from selectedModelId:', selectedModelId, 'modelScale:', modelScale);
       }
       
       const res = await api.startTraining({
