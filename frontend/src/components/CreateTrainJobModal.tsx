@@ -388,8 +388,15 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         (finalConfig as any).yolov8_backbone = yolov8Backbone;
       }
       
+      // For official YOLO models, include scale in model_id
+      let finalModelId = selectedModelId;
+      if (selectedModelId.startsWith('yolo:')) {
+        const family = selectedModelId.split(':')[1];
+        finalModelId = `yolo:${family}${modelScale}`;
+      }
+      
       const res = await api.startTraining({
-        model_id: selectedModelId,
+        model_id: finalModelId,
         model_scale: modelScale,
         config: finalConfig,
         partitions: partitionConfigs,
