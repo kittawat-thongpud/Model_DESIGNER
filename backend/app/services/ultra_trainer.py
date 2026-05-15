@@ -1360,6 +1360,7 @@ def _training_worker(
     """Training worker with enhanced error handling and cleanup."""
     import os
     import signal
+    import sys
     import threading
     import time as _time
     import traceback
