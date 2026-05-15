@@ -31,9 +31,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "monitoring": {
         "worker_check_interval_s": 60,
         "worker_stop_timeout_s": 5.0,
-        "training_setup_watchdog_timeout_s": 1800,  # 30 minutes for setup
+        "training_setup_watchdog_timeout_s": 1800,  # 30 minutes for setup (only on hangs)
         "training_setup_heartbeat_s": 30,
-        "training_watchdog_timeout_s": 14400,  # 4 hours for main training loop
+        "training_watchdog_timeout_s": 21600,  # 6 hours without progress (intelligent watchdog)
     },
     "queue": {
         "sqlite_path": "task_queue.db",

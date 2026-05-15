@@ -1389,11 +1389,11 @@ def _training_worker(
     # Install global exception handler
     sys.excepthook = handle_exception
     
-    # Setup a hard timeout watchdog (4 hours max for entire job)
+    # Setup a hard timeout watchdog (24 hours max for entire job)
     def hard_timeout_watchdog():
         """Hard timeout watchdog - kills process if it runs too long."""
-        _time.sleep(14400)  # 4 hours
-        job_storage.append_job_log(job_id, "ERROR", "Hard timeout reached (4 hours), forcing exit")
+        _time.sleep(86400)  # 24 hours
+        job_storage.append_job_log(job_id, "ERROR", "Hard timeout reached (24 hours), forcing exit")
         try:
             os.kill(os.getpid(), signal.SIGKILL)
         except:

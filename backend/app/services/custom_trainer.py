@@ -610,25 +610,44 @@ class CustomDetectionTrainer(DetectionTrainer):
         heartbeat_interval = 60  # Check every minute during training
         
         def _training_watchdog():
-            """Watchdog for main training loop."""
+            """Watchdog for main training loop - only kills on actual hangs."""
+            last_progress_time = _time.time()
+            last_epoch = -1
+            
             while True:
                 if done.wait(heartbeat_interval):
                     break
                 elapsed = _time.time() - start_t
-                if elapsed >= timeout_s:
-                    try:
+                
+                # Check if training is making progress (epoch advancing or recent progress logs)
+                try:
+                    # Check current epoch from training state
+                    current_epoch = getattr(self, 'epoch', -1)
+                    if current_epoch > last_epoch:
+                        # Training is progressing, reset progress timer
+                        last_progress_time = _time.time()
+                        last_epoch = current_epoch
+                        self.log(f"Training progress detected - Epoch {current_epoch}", "DEBUG")
+                    
+                    # Only kill if no progress for very long time (6 hours)
+                    time_since_progress = _time.time() - last_progress_time
+                    if time_since_progress >= 21600:  # 6 hours without progress
                         self.log(
-                            f"Training watchdog triggered after {elapsed:.1f}s - forcing exit",
+                            f"No training progress for {time_since_progress/3600:.1f} hours - forcing exit",
                             "ERROR",
                         )
-                        # Force exit to prevent hanging
                         os.kill(os.getpid(), signal.SIGKILL)
-                    except Exception:
-                        try:
-                            os._exit(1)
-                        except:
-                            pass
-                    break
+                        break
+                    else:
+                        # Regular heartbeat
+                        self.log(
+                            f"Training heartbeat - Epoch {current_epoch}, {elapsed/3600:.1f}h elapsed, "
+                            f"last progress {time_since_progress/3600:.1f}h ago",
+                            "DEBUG",
+                        )
+                except Exception as e:
+                    self.log(f"Training watchdog check failed: {e}", "WARNING")
+                    # Continue monitoring even if check fails
         
         watchdog_thread = threading.Thread(target=_training_watchdog, daemon=True, name="training_watchdog")
         watchdog_thread.start()
