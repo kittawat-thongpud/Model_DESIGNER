@@ -19,6 +19,10 @@ _MODEL_DEFAULTS = get_model_config().get("defaults", {})
 @router.post("/start", summary="Start a training job")
 async def start_training(req: TrainRequest):
     """Start an Ultralytics training job."""
+    # Debug logging
+    import logging
+    logging.getLogger().info(f"DEBUG: Received model_id={req.model_id}, model_scale={req.model_scale}")
+    
     # Check if official YOLO model
     if req.model_id.startswith("yolo:"):
         # Official YOLO model - no database lookup needed
