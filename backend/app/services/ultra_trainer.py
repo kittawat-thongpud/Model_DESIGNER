@@ -778,6 +778,16 @@ def start_training(
     _data_arg = config.get("data", "")
     _dataset_name = _data_arg if (_data_arg and dataset_registry.is_image_dataset(_data_arg)) else ""
 
+    # Extract class_names from dataset registry for frontend display
+    if _dataset_name:
+        try:
+            from .dataset_registry import get_class_names
+            class_names = get_class_names(_dataset_name)
+            if class_names:
+                config["class_names"] = class_names
+        except Exception as e:
+            logger.log("training", "WARNING", f"Failed to extract class_names for {_dataset_name}: {e}")
+
     _reconcile_training_queue()
 
     # Extract model scale (use passed value, fallback to config, default 'n')

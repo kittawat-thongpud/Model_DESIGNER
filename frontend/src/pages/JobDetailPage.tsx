@@ -588,7 +588,10 @@ export default function JobDetailPage({ jobId, onBack }: Props) {
 
         {/* Per-Class Metrics */}
         {job.history && job.history.length > 0 && (job.history[job.history.length - 1] as any).ap_per_class && (
-          <PerClassMetrics history={job.history as any} />
+          <PerClassMetrics 
+            history={job.history as any} 
+            classNames={job.config?.class_names || job.class_names}
+          />
         )}
 
         {/* Configuration */}

@@ -118,6 +118,8 @@ export interface TrainConfig {
   data: string;
   imgsz: number | number[];
   batch: number;
+  dataset_name?: string;
+  class_names?: string[];
   workers: number;
   cache: 'auto' | 'ram' | 'disk' | 'none' | boolean;
   epochs: number;
@@ -222,7 +224,7 @@ export interface JobRecord {
   epoch: number;
   total_epochs: number;
   message: string;
-  config: Record<string, unknown>;
+  config: TrainConfig;
   partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean; dataset_name?: string; partition_name?: string}>;
   history: EpochMetrics[];
   weight_id: string | null;
