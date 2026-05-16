@@ -19,6 +19,39 @@ async def list_jobs(status: str | None = None, model_id: str | None = None):
     return job_storage.list_jobs(status=status, model_id=model_id)
 
 
+def _resolve_partition_datasets(partition_configs: list[dict], dataset_name: str) -> list[dict]:
+    """Enrich partition configs with dataset names from partition cache."""
+    if not partition_configs or not dataset_name:
+        return partition_configs
+    
+    try:
+        from pathlib import Path
+        from ..config import SPLITS_DIR
+        
+        partition_file = Path(SPLITS_DIR) / f"{dataset_name.lower()}_partitions.json"
+        if not partition_file.exists():
+            return partition_configs
+        
+        import json
+        cache = json.loads(partition_file.read_text())
+        cache_partitions = {p["id"]: p for p in cache.get("partitions", [])}
+        
+        enriched = []
+        for pc in partition_configs:
+            partition_id = pc.get("partition_id", "")
+            if partition_id in cache_partitions:
+                enriched.append({
+                    **pc,
+                    "dataset_name": dataset_name,
+                    "partition_name": cache_partitions[partition_id].get("name", partition_id)
+                })
+            else:
+                enriched.append({**pc, "dataset_name": dataset_name})
+        return enriched
+    except Exception:
+        return partition_configs
+
+
 @router.get("/{job_id}", summary="Get job details")
 async def get_job(job_id: str, include_history: bool = True):
     """Return full training job record, optionally with history."""
@@ -29,6 +62,12 @@ async def get_job(job_id: str, include_history: bool = True):
     # Load history separately if requested
     if include_history:
         record["history"] = job_storage.get_job_history(job_id)
+    
+    # Enrich partition_configs with dataset names
+    partition_configs = record.get("partition_configs")
+    dataset_name = record.get("dataset_name")
+    if partition_configs and dataset_name:
+        record["partition_configs"] = _resolve_partition_datasets(partition_configs, dataset_name)
     
     return record
 
