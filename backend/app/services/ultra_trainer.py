@@ -1598,24 +1598,27 @@ def _training_worker(
                     f"soft_hard={soft_hard}, top_m_ratio={top_m_ratio}, lambda_soft={lambda_soft}, eta={eta}, "
                     f"dam_metrics={config.get('enable_dam_metrics', False)}")
             
-            # Write patched YAML only if arch_plugin is valid
+            # Skip YAML patching if no arch plugin (use original YAML directly)
             if arch_plugin is None:
-                raise ValueError(
-                    f"Cannot write patched YAML: arch_plugin is None. "
-                    f"Make sure 'model_arch' is set in config for custom model architectures."
-                )
-            patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
-            patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
-            yaml_path = str(patched_yaml)
-            
-            if arch_scale:
                 job_storage.append_job_log(job_id, "INFO",
-                    f"Arch YAML: {base_yaml_path.name} (scale={_scale_key})")
+                    f"No arch plugin detected, using original YAML: {original_yaml_path}")
+                # Keep original yaml_path - no patching needed
             else:
-                job_storage.append_job_log(job_id, "INFO",
-                    f"Arch YAML: {base_yaml_path.name}")
-                job_storage.append_job_log(job_id, "INFO",
-                    f"Arch YAML: {yaml_path}")
+                # Write patched YAML for arch plugin
+                patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
+                patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                yaml_path = str(patched_yaml)
+            
+            # Log arch plugin details only if arch_plugin exists
+            if arch_plugin:
+                if arch_scale:
+                    job_storage.append_job_log(job_id, "INFO",
+                        f"Arch YAML: {base_yaml_path.name} (scale={_scale_key})")
+                else:
+                    job_storage.append_job_log(job_id, "INFO",
+                        f"Arch YAML: {base_yaml_path.name}")
+                    job_storage.append_job_log(job_id, "INFO",
+                        f"Arch YAML: {yaml_path}")
 
             # yolov8_backbone warm-start is opt-in — only when user explicitly selects it in UI
             # (no auto-inject from pretrain_key() anymore)
@@ -1623,11 +1626,12 @@ def _training_worker(
             # If the arch plugin has a pretrain_key (e.g. "rtdetr-l") and the user
             # wants pretrained weights, route through the yolo_model path so the
             # official .pt file is downloaded and loaded automatically.
-            _pk = arch_plugin.pretrain_key()
-            if _pk and config.get("use_yolo_pretrained", True) and not config.get("yolo_model"):
-                config["yolo_model"] = _pk
-                job_storage.append_job_log(job_id, "INFO",
-                    f"Injecting pretrained model key from arch plugin: {_pk}")
+            if arch_plugin:
+                _pk = arch_plugin.pretrain_key()
+                if _pk and config.get("use_yolo_pretrained", True) and not config.get("yolo_model"):
+                    config["yolo_model"] = _pk
+                    job_storage.append_job_log(job_id, "INFO",
+                        f"Injecting pretrained model key from arch plugin: {_pk}")
 
         # Auto-detect arch plugin from yaml path if not set via model_arch key
         if arch_plugin is None and original_yaml_path:
