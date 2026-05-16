@@ -136,27 +136,9 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
               <div className="mt-4 pt-2 border-t border-slate-800">
                 <span className="text-xs text-slate-500 block mb-1">Dataset</span>
                 <span className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 block border border-slate-800">
-                  {fmtDataset(getValue('data') as string, datasetName)}
+                  {config.dataset_name || datasetName || 'unknown'}
                 </span>
               </div>
-              {partitions && partitions.length > 0 && (
-                <div className="mt-4 pt-2 border-t border-slate-800">
-                  <span className="text-xs text-slate-500 block mb-2">Partitions ({partitions.length})</span>
-                  <div className="space-y-1">
-                    {partitions.map((p, idx) => (
-                      <div key={idx} className="bg-slate-900 px-2 py-1.5 rounded text-xs border border-slate-800">
-                        <div className="text-emerald-400 font-medium mb-0.5">
-                          {p.partition_name || p.partition_id}
-                          <span className="text-slate-500 ml-1">({p.dataset_name || datasetName || 'unknown'})</span>
-                        </div>
-                        <div className="text-slate-500 text-[10px]">
-                          {[p.train && 'train', p.val && 'val', p.test && 'test'].filter(Boolean).join(' + ')}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
            </ConfigColumn>
 
         </div>
