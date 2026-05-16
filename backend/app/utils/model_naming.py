@@ -46,7 +46,8 @@ def format_arch_plugin_model_name(arch_plugin, scale: str) -> str:
         - rtdetr + "l" -> "RT-DETR L"
         - yolo26_cs2ga + "n" -> "YOLO26 + CS²GA N"
     """
-    base_name = arch_plugin.display_name
+    # Use family_display_name (without scale) to avoid double scale
+    base_name = getattr(arch_plugin, 'family_display_name', arch_plugin.display_name)
     if scale:
         return f"{base_name} {scale.upper()}"
     return base_name
