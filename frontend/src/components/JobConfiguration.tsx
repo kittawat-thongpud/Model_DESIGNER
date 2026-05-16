@@ -14,7 +14,7 @@ import { fmtDataset } from '../utils/format';
 interface JobConfigurationProps {
   config: TrainConfig;
   datasetName?: string | null;
-  partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean}>;
+  partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean; dataset_name?: string; partition_name?: string}>;
   modelScale?: string;
 }
 
@@ -145,7 +145,10 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
                   <div className="space-y-1">
                     {partitions.map((p, idx) => (
                       <div key={idx} className="bg-slate-900 px-2 py-1.5 rounded text-xs border border-slate-800">
-                        <div className="text-emerald-400 font-medium mb-0.5">{p.partition_id}</div>
+                        <div className="text-emerald-400 font-medium mb-0.5">
+                          {p.partition_name || p.partition_id}
+                          <span className="text-slate-500 ml-1">({p.dataset_name || datasetName || 'unknown'})</span>
+                        </div>
                         <div className="text-slate-500 text-[10px]">
                           {[p.train && 'train', p.val && 'val', p.test && 'test'].filter(Boolean).join(' + ')}
                         </div>

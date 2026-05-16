@@ -223,7 +223,7 @@ export interface JobRecord {
   total_epochs: number;
   message: string;
   config: Record<string, unknown>;
-  partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean}>;
+  partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean; dataset_name?: string; partition_name?: string}>;
   history: EpochMetrics[];
   weight_id: string | null;
   // Ultralytics-native metrics
