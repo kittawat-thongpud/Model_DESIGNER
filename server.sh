@@ -501,3 +501,13 @@ PY
         ;;
 
 esac
+
+# Track exit code and pause if error (for VS Code terminal)
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ] && [ -t 0 ]; then
+    echo ""
+    echo "⚠️  Command failed with exit code: $EXIT_CODE"
+    echo "Press Enter to close..."
+    read -r
+fi
+exit $EXIT_CODE
