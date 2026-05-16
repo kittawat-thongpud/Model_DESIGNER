@@ -12,7 +12,9 @@
 #   service-install   — install as systemd service (auto-start on boot)
 #   service-uninstall — remove systemd service
 
-set -euo pipefail
+set -uo pipefail
+# Don't exit on error - continue even when commands fail
+set +e
 
 SESSION="model-designer"
 SERVICE_NAME="model-designer"
