@@ -1598,7 +1598,12 @@ def _training_worker(
                     f"soft_hard={soft_hard}, top_m_ratio={top_m_ratio}, lambda_soft={lambda_soft}, eta={eta}, "
                     f"dam_metrics={config.get('enable_dam_metrics', False)}")
             
-            # Write patched YAML
+            # Write patched YAML only if arch_plugin is valid
+            if arch_plugin is None:
+                raise ValueError(
+                    f"Cannot write patched YAML: arch_plugin is None. "
+                    f"Make sure 'model_arch' is set in config for custom model architectures."
+                )
             patched_yaml = job_dir / f"arch_{arch_plugin.name}.yaml"
             patched_yaml.write_text(_yaml.dump(yaml_dict, allow_unicode=True, sort_keys=False), encoding="utf-8")
             yaml_path = str(patched_yaml)
