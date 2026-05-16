@@ -84,16 +84,28 @@ async def start_training(req: TrainRequest):
 
         task = record.get("task", str(_MODEL_DEFAULTS.get("task", "detect")))
         model_name = record.get("name", "Untitled")
-
-    if not req.model_id.startswith("arch:"):
+        
+        # Initialize config for custom model
         config = req.config.to_train_kwargs()
-        # Re-inject yolo_model for official YOLO models (was set earlier but overwritten by to_train_kwargs)
-        if req.model_id.startswith("yolo:"):
-            yolo_model = req.model_id.split(":")[1]
-            config["yolo_model"] = yolo_model
-            # Remove arch-plugin-specific parameters that are not valid for official YOLO
-            for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
-                config.pop(key, None)
+        
+        # Try to auto-detect arch plugin from YAML path
+        from ..plugins.loader import find_arch_for_yaml
+        arch_plugin = find_arch_for_yaml(str(yaml_path))
+        if arch_plugin:
+            config["model_arch"] = arch_plugin.name
+            logger.log("training", "INFO", f"Auto-detected arch plugin for custom model: {arch_plugin.name}")
+
+    if not req.model_id.startswith("arch:") and not req.model_id.startswith("yolo:"):
+        # Custom models: config already set above, don't overwrite
+        pass
+    elif req.model_id.startswith("yolo:"):
+        # Official YOLO models: re-inject yolo_model (was set earlier but may be overwritten)
+        config = req.config.to_train_kwargs()
+        yolo_model = req.model_id.split(":")[1]
+        config["yolo_model"] = yolo_model
+        # Remove arch-plugin-specific parameters that are not valid for official YOLO
+        for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
+            config.pop(key, None)
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []
