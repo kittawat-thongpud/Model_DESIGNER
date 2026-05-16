@@ -16,6 +16,17 @@ set -uo pipefail
 # Don't exit on error - continue even when commands fail
 set +e
 
+# Enable verbose debug logging if DEBUG=1
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x  # Print every command before executing
+    _log() { echo "[DEBUG $(date '+%H:%M:%S')] $*"; }
+else
+    _log() { :; }  # No-op when not in debug mode
+fi
+
+_log "=== server.sh starting ==="
+_log "SCRIPT_DIR=$SCRIPT_DIR, APP_DIR=$APP_DIR"
+
 SESSION="model-designer"
 SERVICE_NAME="model-designer"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -57,6 +68,7 @@ _port_pids() {
 }
 
 kill_port() {
+    _log "kill_port() called"
     cleanup_training_workers
 
     local PIDS
@@ -76,6 +88,7 @@ kill_port() {
 }
 
 cleanup_training_workers() {
+    _log "cleanup_training_workers() called"
     local cleaned=0
     local pid_file pid job_id
     shopt -s nullglob
@@ -133,6 +146,7 @@ _service_clear_port() {
 }
 
 _build_frontend() {
+    _log "_build_frontend() called"
     if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
         echo "📦 Node.js/npm not found — installing via NodeSource (LTS)..."
         curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
@@ -148,7 +162,7 @@ _build_frontend() {
         if npm --prefix "${FRONTEND_DIR}" run build; then
             echo "✅ Frontend built successfully."
         else
-            echo "❌ Frontend build failed. Aborting."
+            echo "❌ Frontend build failed."
             return 1
         fi
     else
@@ -160,6 +174,7 @@ _build_frontend() {
 # ── tmux back-end ─────────────────────────────────────────────────────────────
 
 _tmux_start() {
+    _log "_tmux_start() called"
     kill_port
     if tmux has-session -t "${SESSION}" 2>/dev/null; then
         echo "⚠️  tmux session '${SESSION}' is already running."
@@ -191,6 +206,7 @@ _tmux_stop() {
 }
 
 _tmux_restart() {
+    _log "_tmux_restart() called"
     if tmux has-session -t "${SESSION}" 2>/dev/null; then
         echo "� Stopping tmux session '${SESSION}'..."
         tmux kill-session -t "${SESSION}"
@@ -210,6 +226,8 @@ _tmux_restart() {
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
+
+_log "Command received: ${1:-}"
 
 case "${1:-}" in
 
@@ -315,7 +333,14 @@ case "${1:-}" in
         echo "🔄 Pulling latest code..."
         git -C "${APP_DIR}" pull
 
-        _build_frontend || exit 1
+        _build_frontend
+        if [ $? -ne 0 ]; then
+            echo ""
+            echo "⚠️  Frontend build failed with exit code: $?"
+            echo "Press Enter to close..."
+            read -r
+            exit 1
+        fi
 
         echo "🔁 Restarting server..."
         if _service_installed; then
@@ -502,11 +527,15 @@ PY
 
 esac
 
-# Track exit code and pause if error (for VS Code terminal)
+# Track exit code and pause to prevent terminal from closing (for VS Code terminal)
 EXIT_CODE=$?
-if [ $EXIT_CODE -ne 0 ] && [ -t 0 ]; then
+if [ -t 0 ]; then
     echo ""
-    echo "⚠️  Command failed with exit code: $EXIT_CODE"
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "⚠️  Command failed with exit code: $EXIT_CODE"
+    else
+        echo "✅ Command completed successfully"
+    fi
     echo "Press Enter to close..."
     read -r
 fi
