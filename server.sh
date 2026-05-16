@@ -24,9 +24,6 @@ else
     _log() { :; }  # No-op when not in debug mode
 fi
 
-_log "=== server.sh starting ==="
-_log "SCRIPT_DIR=$SCRIPT_DIR, APP_DIR=$APP_DIR"
-
 SESSION="model-designer"
 SERVICE_NAME="model-designer"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -36,6 +33,9 @@ APP_DIR="${APP_DIR:-${SCRIPT_DIR}}"
 LOG_FILE="${APP_DIR}/server.log"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
 PORT=8000
+
+_log "=== server.sh starting ==="
+_log "SCRIPT_DIR=$SCRIPT_DIR, APP_DIR=$APP_DIR"
 
 export MCP_ALLOWED_HOSTS="${MCP_ALLOWED_HOSTS:-rase*,*.ts.net}"
 export MCP_ALLOWED_ORIGINS="${MCP_ALLOWED_ORIGINS:-http://rase*:*,https://rase*:*,http://*.ts.net:*,https://*.ts.net:*}"
