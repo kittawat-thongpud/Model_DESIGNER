@@ -72,6 +72,7 @@ async def start_training(req: TrainRequest):
         # Inject model_arch key so the training worker picks up the plugin
         config = req.config.to_train_kwargs()
         config["model_arch"] = arch_plugin.name
+        logger.log("training", "DEBUG", f"Set model_arch={arch_plugin.name} for arch plugin job")
     else:
         # Custom model - load from database
         record = model_storage.load_model(req.model_id)
@@ -106,6 +107,10 @@ async def start_training(req: TrainRequest):
         # Remove arch-plugin-specific parameters that are not valid for official YOLO
         for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
             config.pop(key, None)
+
+    # Verify model_arch is set for arch/custom models (not needed for official YOLO)
+    if not req.model_id.startswith("yolo:") and "model_arch" not in config:
+        logger.log("training", "WARNING", f"model_arch not set for {req.model_id}. This may cause training failures.")
 
     # Convert PartitionSplitConfig objects to dict format
     partition_configs = [p.dict() for p in req.partitions] if req.partitions else []
