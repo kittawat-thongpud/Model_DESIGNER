@@ -2066,6 +2066,7 @@ def _training_worker(
         _pin_memory = config.pop('pin_memory', False)
         _allow_cuda_cpu_fallback = bool(config.pop('allow_cuda_cpu_fallback', False))
         config.pop('dataset_name', None)       # internal tracking field — not a YOLO arg
+        config.pop('class_names', None)        # internal tracking field — not a YOLO arg
         config.pop('use_yolo_pretrained', None)  # handled above, not a YOLO arg
         config.pop('yolov8_backbone', None)      # handled above, not a YOLO arg
         config.pop('nan_retries', None)          # handled above, not a YOLO arg
@@ -2075,7 +2076,7 @@ def _training_worker(
         train_kwargs = {k: v for k, v in config.items() if v != ""}
         
         # Remove arch-plugin-specific parameters that Ultralytics doesn't recognize
-        for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch"]:
+        for key in ["enable_deep_metrics", "nan_retries", "enable_query_metrics", "enable_gt_metrics", "enable_dam_metrics", "model_arch", "class_names"]:
             train_kwargs.pop(key, None)
         
         train_kwargs["project"] = str(job_dir / "runs")

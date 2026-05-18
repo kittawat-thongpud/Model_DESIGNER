@@ -74,7 +74,7 @@ const SCHEMAS: MetricSchema[] = [
 ];
 
 const CS2GA_GROUPS: Array<{ title: string; match: RegExp; domain?: [number, number] }> = [
-  { title: 'CS2GA Gate / LayerScale', match: /(^|\/)(gate_|ls_)/, domain: [0, 1] },
+  { title: 'CS2GA Gate / LayerScale', match: /(^|\/)(gate_|ls_)/ },
   { title: 'CS2GA Attention Split', match: /attn_(within|cross)_frac$/, domain: [0, 1] },
   { title: 'CS2GA Delta Magnitude', match: /delta_abs_/ },
   { title: 'CS2GA Score Diagnostics', match: /score_(max|min_selected|std)$/ },

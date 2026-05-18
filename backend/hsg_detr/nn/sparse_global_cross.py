@@ -88,7 +88,7 @@ class CrossScaleSGA(nn.Module):
         ls_init: float = 1e-4,
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
-        attn_scale_mult: float = 0.1,
+        attn_scale_mult: float = 8.0,
         max_k3: int = 0,
         max_k4: int = 0,
         max_k5: int = 0,
@@ -266,10 +266,16 @@ class CrossScaleSGA(nn.Module):
             all_tok_attn = F.normalize(all_tok, dim=-1, eps=1e-6)
 
             # LayerNorm → Q/K; V uses un-normed tokens
+            # Cosine attention: normalize Q and K after LayerNorm so logit range
+            # stays bounded by _attn_scale regardless of how LayerNorm weights
+            # grow during training.  Without this, LayerNorm γ growth gradually
+            # sharpens attention → within-scale tokens (more similar to each
+            # other) accumulate weight → cross-scale mixing collapses.
             norm_w = self.norm.weight.float()
             norm_b = self.norm.bias.float()
             q = F.layer_norm(all_tok_attn, self.norm.normalized_shape, norm_w, norm_b, self.norm.eps)
             q = _nan_guard(q)
+            q = F.normalize(q, dim=-1, eps=1e-6)   # cosine Q/K — logits ∈ [±_attn_scale]
             k_t = q
             v = all_tok
 
