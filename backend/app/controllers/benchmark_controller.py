@@ -1283,6 +1283,7 @@ def _run_rtdetrv2_benchmark(
         f"train_dataloader.dataset.ann_file='{train_json}'",
         f"train_dataloader.total_batch_size={batch}",
         f"train_dataloader.num_workers={workers}",
+        f"eval_spatial_size={req.imgsz}",  # Match checkpoint resolution
     ]
 
     cmd = [
