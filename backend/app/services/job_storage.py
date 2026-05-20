@@ -147,7 +147,7 @@ def get_job_history(job_id: str) -> list[dict]:
                     "recall_per_class": data.get("recall_per_class"),
                     "f1_per_class": data.get("f1_per_class"),
 
-                    # Latency metrics
+                    # Latency metrics (ms)
                     "inference_latency_ms": data.get("inference_latency_ms"),
                     "preprocess_latency_ms": data.get("preprocess_latency_ms"),
                     "postprocess_latency_ms": data.get("postprocess_latency_ms"),
@@ -166,6 +166,9 @@ def get_job_history(job_id: str) -> list[dict]:
                     "epoch_time": epoch_time,
                     "val_time_s": data.get("val_time_s"),
 
+                    # Throughput
+                    "imgs_per_sec": data.get("imgs_per_sec"),
+
                     # HSG-DETR sparse metrics (persisted from training)
                     "hsg_detr": data.get("hsg_detr"),
 
@@ -182,6 +185,12 @@ def get_job_history(job_id: str) -> list[dict]:
                     for k, v in epoch_metrics.items()
                     if v is not None or k in ('hsg_detr', 'dino_detr', 'gradient_norms')
                 }
+                # Convenience alias: gpu_mem_gb expressed in MB for backward compat
+                if "gpu_mem_gb" in epoch_metrics:
+                    epoch_metrics.setdefault(
+                        "gpu_memory_mb",
+                        round(epoch_metrics["gpu_mem_gb"] * 1024, 1),
+                    )
                 history.append(epoch_metrics)
 
             if history:

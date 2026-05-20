@@ -185,17 +185,64 @@ export interface TrainConfig {
 
 export interface EpochMetrics {
   epoch: number;
-  box_loss: number;
-  cls_loss: number;
-  dfl_loss: number;
-  precision?: number | null;
-  recall?: number | null;
+
+  // ── Training losses ────────────────────────────────────────────────────
+  box_loss?: number | null;
+  cls_loss?: number | null;
+  dfl_loss?: number | null;
+
+  // ── Validation losses ──────────────────────────────────────────────────
+  val_box_loss?: number | null;
+  val_cls_loss?: number | null;
+  val_dfl_loss?: number | null;
+  val_giou_loss?: number | null;
+  val_l1_loss?: number | null;
+
+  // ── Validation accuracy metrics ────────────────────────────────────────
   mAP50?: number | null;
   mAP50_95?: number | null;
+  mAP75?: number | null;
+  precision?: number | null;
+  recall?: number | null;
   fitness?: number | null;
-  lr: number;
-  epoch_time: number;
+
+  // ── Learning rate & timing ─────────────────────────────────────────────
+  lr?: number | null;
+  epoch_time?: number | null;
+  val_time_s?: number | null;
+
+  // ── System resources ───────────────────────────────────────────────────
+  device?: string | null;
+  ram_gb?: number | null;
+  gpu_mem_gb?: number | null;
+  gpu_mem_reserved_gb?: number | null;
+  /** Convenience alias: gpu_mem_gb * 1024, added by job_storage for legacy consumers */
   gpu_memory_mb?: number | null;
+
+  // ── Inference latency (ms) ─────────────────────────────────────────────
+  inference_latency_ms?: number | null;
+  preprocess_latency_ms?: number | null;
+  postprocess_latency_ms?: number | null;
+  total_latency_ms?: number | null;
+
+  // ── Throughput ─────────────────────────────────────────────────────────
+  imgs_per_sec?: number | null;
+
+  // ── Per-class metrics (arrays, length = nc) ────────────────────────────
+  ap_per_class?: number[] | null;
+  ap50_per_class?: number[] | null;
+  precision_per_class?: number[] | null;
+  recall_per_class?: number[] | null;
+  f1_per_class?: number[] | null;
+
+  // ── HSG-DETR / DINO-DETR internals ────────────────────────────────────
+  hsg_detr?: Record<string, unknown> | null;
+  dino_detr?: Record<string, unknown> | null;
+  gradient_norms?: Record<string, number> | null;
+
+  // ── kNN accuracy (self-supervised jobs) ───────────────────────────────
+  knn_accuracy?: number | null;
+
   [key: string]: unknown;
 }
 

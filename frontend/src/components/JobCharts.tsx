@@ -13,6 +13,7 @@ import {
   BarChart,
   Bar,
   Brush,
+  ReferenceLine,
 } from 'recharts';
 import {
   TrendingUp,
@@ -21,6 +22,8 @@ import {
   Clock,
   Target,
   Crosshair,
+  Cpu,
+  Timer,
 } from 'lucide-react';
 import { EpochMetrics } from '../types';
 
@@ -222,9 +225,9 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
       
       {isDetection && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* mAP Chart */}
-          <ChartCard 
-            title="Mean Average Precision (mAP)" 
+          {/* mAP Chart — mAP50, mAP50-95, mAP75 (optional), fitness (optional) */}
+          <ChartCard
+            title="Mean Average Precision (mAP)"
             icon={<Target size={18} className="text-emerald-400" />}
             latestValue={latest.mAP50 ? `${(Number(latest.mAP50) * 100).toFixed(2)}%` : '-'}
             trend={getTrend('mAP50')}
@@ -238,16 +241,22 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
               <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => Number(v).toFixed(4)} />
+              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => `${(Number(v)*100).toFixed(0)}%`} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="circle" wrapperStyle={{fontSize: '12px'}} />
               <Area type="monotone" dataKey="mAP50" name="mAP@50" stroke="#10b981" strokeWidth={2} fillOpacity={1} fill="url(#colormAP)" />
               <Area type="monotone" dataKey="mAP50_95" name="mAP@50-95" stroke="#34d399" strokeWidth={2} fillOpacity={0} strokeDasharray="4 4" />
-              <Brush 
-                dataKey="epoch" 
-                height={20} 
-                stroke="#475569" 
-                fill="#0f1117" 
+              {history.some(h => h.mAP75 != null) && (
+                <Line type="monotone" dataKey="mAP75" name="mAP@75" stroke="#6ee7b7" strokeWidth={1.5} strokeDasharray="3 3" dot={false} />
+              )}
+              {history.some(h => h.fitness != null) && (
+                <Line type="monotone" dataKey="fitness" name="Fitness" stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="6 2" dot={false} strokeOpacity={0.7} />
+              )}
+              <Brush
+                dataKey="epoch"
+                height={20}
+                stroke="#475569"
+                fill="#0f1117"
                 tickFormatter={() => ''}
                 travellerWidth={10}
               />
@@ -255,8 +264,8 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
           </ChartCard>
 
           {/* Precision & Recall */}
-          <ChartCard 
-            title="Precision & Recall" 
+          <ChartCard
+            title="Precision & Recall"
             icon={<Crosshair size={18} className="text-indigo-400" />}
             latestValue={latest.precision ? Number(latest.precision).toFixed(4) : '-'}
             trend={getTrend('precision')}
@@ -264,7 +273,7 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
             <LineChart data={history} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
               <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => Number(v).toFixed(4)} />
+              <YAxis stroke="#475569" tick={{fontSize: 10}} domain={[0, 1]} tickFormatter={(v) => `${(Number(v)*100).toFixed(0)}%`} />
               <Tooltip content={<CustomTooltip />} />
               <Legend iconType="plainline" wrapperStyle={{fontSize: '12px'}} />
               <Line type="monotone" dataKey="precision" name="Precision" stroke="#6366f1" strokeWidth={2} dot={false} />
@@ -309,11 +318,11 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
       {/* SECTION 3: SYSTEM & LR */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
          <div className="md:col-span-2">
-            <ChartCard 
-              title="Learning Rate Schedule" 
-              icon={<Zap size={18} className="text-yellow-400" />} 
+            <ChartCard
+              title="Learning Rate Schedule"
+              icon={<Zap size={18} className="text-yellow-400" />}
               height={200}
-              latestValue={Number(latest.lr).toExponential(2)}
+              latestValue={latest.lr != null ? Number(latest.lr).toExponential(2) : '-'}
               trend="neutral"
             >
               <AreaChart data={history} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
@@ -328,11 +337,11 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
                 <YAxis stroke="#475569" tick={{fontSize: 10}} tickFormatter={(v) => v.toExponential(0)} scale="log" domain={['auto', 'auto']} />
                 <Tooltip content={<CustomTooltip />} />
                 <Area type="stepAfter" dataKey="lr" stroke="#eab308" strokeWidth={2} dot={false} fill="url(#colorLr)" />
-                <Brush 
-                  dataKey="epoch" 
-                  height={20} 
-                  stroke="#475569" 
-                  fill="#0f1117" 
+                <Brush
+                  dataKey="epoch"
+                  height={20}
+                  stroke="#475569"
+                  fill="#0f1117"
                   tickFormatter={() => ''}
                   travellerWidth={10}
                 />
@@ -340,23 +349,129 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
             </ChartCard>
          </div>
          <div>
-            <ChartCard 
-              title="Time per Epoch (s)" 
-              icon={<Clock size={18} className="text-slate-400" />} 
+            <ChartCard
+              title="Time per Epoch (s)"
+              icon={<Clock size={18} className="text-slate-400" />}
               height={200}
-              latestValue={Number(latest.epoch_time).toFixed(1)}
+              latestValue={latest.epoch_time != null ? Number(latest.epoch_time).toFixed(1) : '-'}
               trend="neutral"
             >
               <BarChart data={history} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
                 <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
-                <YAxis stroke="#475569" tick={{fontSize: 10}} domain={['auto', 'auto']} tickFormatter={(v) => Number(v).toFixed(4)} />
+                <YAxis stroke="#475569" tick={{fontSize: 10}} domain={['auto', 'auto']} tickFormatter={(v) => `${Number(v).toFixed(0)}s`} />
                 <Tooltip content={<CustomTooltip />} />
-                <Bar dataKey="epoch_time" fill="#475569" radius={[2, 2, 0, 0]} />
+                <Bar dataKey="epoch_time" name="Epoch time (s)" fill="#475569" radius={[2, 2, 0, 0]} />
               </BarChart>
             </ChartCard>
          </div>
       </div>
+
+      {/* SECTION 4: GPU / RAM RESOURCES (conditional — only when data exists) */}
+      {history.some(h => h.gpu_mem_gb != null) && (
+        <div>
+          <h3 className="text-white font-semibold flex items-center gap-2 mb-4">
+            <Cpu size={18} className="text-sky-400" /> System Resources
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* GPU Memory */}
+            <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition-colors">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-xs font-bold text-slate-400 uppercase">GPU Memory (GB)</span>
+                <span className="text-xs text-slate-500 font-mono">
+                  {latest.gpu_mem_gb != null ? `${Number(latest.gpu_mem_gb).toFixed(2)} / ${Number(latest.gpu_mem_reserved_gb ?? latest.gpu_mem_gb).toFixed(2)} GB` : '—'}
+                </span>
+              </div>
+              <div className="h-[120px] w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={history}>
+                    <defs>
+                      <linearGradient id="colorGpuAlloc" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.4}/>
+                        <stop offset="95%" stopColor="#38bdf8" stopOpacity={0}/>
+                      </linearGradient>
+                      <linearGradient id="colorGpuRsv" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#7dd3fc" stopOpacity={0.15}/>
+                        <stop offset="95%" stopColor="#7dd3fc" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                    <XAxis dataKey="epoch" hide />
+                    <YAxis stroke="#475569" tick={{fontSize: 9}} width={30} domain={[0, 'auto']} tickFormatter={(v) => `${Number(v).toFixed(1)}`} />
+                    <Tooltip content={<CustomTooltip />} />
+                    {history.some(h => h.gpu_mem_reserved_gb != null) && (
+                      <Area type="monotone" dataKey="gpu_mem_reserved_gb" name="Reserved (GB)" stroke="#7dd3fc" strokeWidth={1.5} strokeDasharray="4 4" fillOpacity={1} fill="url(#colorGpuRsv)" />
+                    )}
+                    <Area type="monotone" dataKey="gpu_mem_gb" name="Allocated (GB)" stroke="#38bdf8" strokeWidth={2} fillOpacity={1} fill="url(#colorGpuAlloc)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            {/* RAM */}
+            {history.some(h => h.ram_gb != null) && (
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition-colors">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-slate-400 uppercase">RAM Usage (GB)</span>
+                  <span className="text-xs text-slate-500 font-mono">
+                    {latest.ram_gb != null ? `${Number(latest.ram_gb).toFixed(2)} GB` : '—'}
+                  </span>
+                </div>
+                <div className="h-[120px] w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={history}>
+                      <defs>
+                        <linearGradient id="colorRam" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#a78bfa" stopOpacity={0.35}/>
+                          <stop offset="95%" stopColor="#a78bfa" stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                      <XAxis dataKey="epoch" hide />
+                      <YAxis stroke="#475569" tick={{fontSize: 9}} width={30} domain={[0, 'auto']} tickFormatter={(v) => `${Number(v).toFixed(1)}`} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Area type="monotone" dataKey="ram_gb" name="RAM (GB)" stroke="#a78bfa" strokeWidth={2} fillOpacity={1} fill="url(#colorRam)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* SECTION 5: INFERENCE LATENCY (conditional — only when data exists) */}
+      {history.some(h => h.inference_latency_ms != null) && (
+        <div>
+          <h3 className="text-white font-semibold flex items-center gap-2 mb-4">
+            <Timer size={18} className="text-orange-400" /> Inference Latency (ms)
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Latency stacked bar */}
+            <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 hover:border-slate-700 transition-colors col-span-full">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-xs font-bold text-slate-400 uppercase">Pipeline Breakdown (ms / image)</span>
+                <span className="text-xs text-slate-500 font-mono">
+                  Latest total: {latest.total_latency_ms != null ? `${Number(latest.total_latency_ms).toFixed(1)} ms` : '—'}
+                </span>
+              </div>
+              <div className="h-[140px] w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={history.filter(h => h.inference_latency_ms != null)} margin={{ top: 5, right: 10, left: 0, bottom: 0 }} stackOffset="none">
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                    <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 10}} minTickGap={20} />
+                    <YAxis stroke="#475569" tick={{fontSize: 9}} width={35} tickFormatter={(v) => `${Number(v).toFixed(0)}`} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Legend iconType="square" wrapperStyle={{fontSize: '11px'}} />
+                    <Bar dataKey="preprocess_latency_ms" name="Preprocess" stackId="lat" fill="#6366f1" />
+                    <Bar dataKey="inference_latency_ms" name="Inference" stackId="lat" fill="#f59e0b" />
+                    <Bar dataKey="postprocess_latency_ms" name="Postprocess" stackId="lat" fill="#ec4899" radius={[2,2,0,0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

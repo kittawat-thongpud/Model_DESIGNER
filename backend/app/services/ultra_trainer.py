@@ -455,6 +455,8 @@ def _training_process_supervisor(
     max_crash_retries = int(config.get("worker_crash_retries", _TRAINING_WORKER_CRASH_RETRIES) or 0)
     try:
         while True:
+            # Kill orphaned DataLoader workers and log available VRAM before each attempt
+            _gpu_pre_training_cleanup(job_id)
             proc = _start_training_subprocess(job_id, yaml_path, task, config, partition_configs, model_scale)
             with _lock:
                 info = _active_jobs.get(job_id)
@@ -1144,6 +1146,85 @@ def _kill_orphan_worker_tree(job_id: str) -> None:
             pass
 
 
+def _kill_orphaned_dataloader_workers() -> int:
+    """Kill orphaned PyTorch DataLoader / pt_data_worker processes re-parented under
+    the current process (uvicorn).  These processes survive when a training subprocess
+    is killed and keep the CUDA context alive, preventing new jobs from getting enough
+    VRAM.
+
+    Returns the number of processes killed.
+    """
+    killed = 0
+    try:
+        import psutil
+        current = psutil.Process(os.getpid())
+        children = current.children(recursive=True)
+        targets: list[psutil.Process] = []
+        for child in children:
+            try:
+                name = child.name()
+                cmdline = " ".join(child.cmdline())
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if "pt_data_worker" in name or "pt_data_worker" in cmdline:
+                targets.append(child)
+        for proc in targets:
+            try:
+                proc.kill()
+                killed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if targets:
+            psutil.wait_procs(targets, timeout=3)
+    except Exception as exc:
+        logger.log("training", "WARNING", f"_kill_orphaned_dataloader_workers: {exc}")
+    if killed:
+        logger.log("training", "INFO", f"Killed {killed} orphaned pt_data_worker process(es)")
+    return killed
+
+
+def _gpu_pre_training_cleanup(job_id: str) -> dict:
+    """Run GPU cleanup before starting a new training job.
+
+    Steps:
+    1. Kill orphaned DataLoader workers that are holding VRAM.
+    2. Query free VRAM via nvidia-smi (NO torch CUDA calls here — calling
+       torch.cuda.* in the supervisor/uvicorn process would permanently
+       initialize a CUDA context in uvicorn, leaking ~5–6 GiB of VRAM for
+       the entire server lifetime).
+    3. Log available VRAM so it appears in the job log.
+
+    Returns a dict with free_vram_mb and total_vram_mb (0 if unavailable).
+    """
+    killed = _kill_orphaned_dataloader_workers()
+    if killed:
+        import time as _t
+        _t.sleep(0.5)  # brief pause for OS to reclaim resources
+
+    vram_info = {"free_vram_mb": 0, "total_vram_mb": 0}
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["nvidia-smi",
+             "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            first_line = result.stdout.strip().splitlines()[0]
+            free_mib, total_mib = (int(x.strip()) for x in first_line.split(","))
+            vram_info["free_vram_mb"] = free_mib
+            vram_info["total_vram_mb"] = total_mib
+        job_storage.append_job_log(
+            job_id, "INFO",
+            f"GPU pre-training cleanup: killed {killed} orphaned worker(s), "
+            f"free VRAM {vram_info['free_vram_mb']} MiB / {vram_info['total_vram_mb']} MiB",
+        )
+    except Exception as exc:
+        job_storage.append_job_log(job_id, "WARNING", f"GPU pre-training cleanup warning: {exc}")
+    return vram_info
+
+
 def cleanup_zombie_workers() -> dict[str, str]:
     """Detect and clean up zombie worker threads and their DDP subprocesses.
     
@@ -1412,8 +1493,29 @@ def _training_worker(
     hard_timeout_thread = threading.Thread(target=hard_timeout_watchdog, daemon=True, name="hard_timeout_watchdog")
     hard_timeout_thread.start()
 
+    # ── GPU pre-training cleanup (subprocess side) ──────────────────────────
+    # Run inside the training subprocess too: kill any pt_data_worker orphans
+    # that may have been re-parented here, and release cached CUDA memory from
+    # any previous CUDA context that was inherited through the fork chain.
+    try:
+        import gc as _gc
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+        _gc.collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+            _free_b, _total_b = _torch.cuda.mem_get_info(0)
+            job_storage.append_job_log(
+                job_id, "INFO",
+                f"[subprocess] CUDA ready — free VRAM {_free_b // (1024*1024)} MiB "
+                f"/ {_total_b // (1024*1024)} MiB",
+            )
+    except Exception as _e:
+        job_storage.append_job_log(job_id, "WARNING", f"[subprocess] GPU warmup warning: {_e}")
+
     """Background thread that runs Ultralytics model.train().
-    
+
     Args:
         partition_configs: List of partition split configurations
                           [{'partition_id': 'p_xxx', 'train': True, 'val': False, 'test': True}, ...]

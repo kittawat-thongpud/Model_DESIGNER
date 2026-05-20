@@ -22,6 +22,7 @@ from .sparse_global_token_v2 import (
     RTDETRDecoderV2,
 )
 from .sparse_global_cross import CrossScaleSGA
+from .cross_scale_fpn import CrossScaleFPN
 
 # Also include hsg_det's SparseGlobalTokenBlock so that when hsg_detr
 # rebuilds parse_model via source-patch, SparseGlobalTokenBlock stays
@@ -48,6 +49,7 @@ _MODULES: dict[str, type] = {
     "SGTokenBlockV2": SGTokenBlockV2,
     "RTDETRDecoderV2": RTDETRDecoderV2,
     "CrossScaleSGA": CrossScaleSGA,
+    "CrossScaleFPN": CrossScaleFPN,
     **_HSG_DET_MODULES,
 }
 
@@ -95,7 +97,7 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
 
     # These modules must NOT be in base_modules — they need special
     # channel-injection paths handled by their own elif cases below.
-    _special_modules = {"RTDETRDecoderSGB", "RTDETRDecoderV2", "CrossScaleSGA"}
+    _special_modules = {"RTDETRDecoderSGB", "RTDETRDecoderV2", "CrossScaleSGA", "CrossScaleFPN"}
     base_names = [n for n in modules.keys() if n not in _special_modules]
 
     # ── 1. Insert into base_modules frozenset ────────────────────────────
@@ -123,12 +125,22 @@ def _patch_parse_model(modules: dict[str, type]) -> bool:
         "\n            args.insert(0, _cs_ch)"
         "\n            args.insert(1, _cs_ch)"
         "\n            c2 = _cs_ch"
+        # CrossScaleFPN special case:
+        # f = [large_layer, small_layer]
+        # c_kv = ch[f[0]] (large-stride, K/V source)
+        # c_q  = ch[f[1]] (small-stride, Q source → output channels)
+        "\n        elif m is CrossScaleFPN:"
+        "\n            _csfpn_c_kv = ch[f[0]]"
+        "\n            _csfpn_c_q  = ch[f[1]]"
+        "\n            args.insert(0, _csfpn_c_kv)"
+        "\n            args.insert(1, _csfpn_c_q)"
+        "\n            c2 = _csfpn_c_q"
     )
     if rtdetr_insert_line in src:
         src = src.replace(rtdetr_insert_line, rtdetr_insert_line + cs2ga_case, 1)
-        print("[HSG-DETR] Added CrossScaleSGA special case to parse_model")
+        print("[HSG-DETR] Added CrossScaleSGA + CrossScaleFPN special cases to parse_model")
     else:
-        print("[HSG-DETR] WARNING: RTDETRDecoder args.insert line NOT FOUND — CrossScaleSGA not patched!")
+        print("[HSG-DETR] WARNING: RTDETRDecoder args.insert line NOT FOUND — CrossScaleSGA/CrossScaleFPN not patched!")
 
     # ── 4. Patch Detect args to flatten list-channels from CrossScaleSGA ──
     # Main Detect group uses args.extend([reg_max, end2end, [ch[x]...]])

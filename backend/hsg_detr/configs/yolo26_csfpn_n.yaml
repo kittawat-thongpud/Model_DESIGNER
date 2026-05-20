@@ -1,0 +1,77 @@
+# =============================================================================
+# YOLO26 + CrossScaleFPN — Attention-as-Core-Aggregation
+# =============================================================================
+# Hypothesis: replacing FPN's fixed Upsample+Concat with cross-scale attention
+# forces the model to LEARN selective feature fusion (content-aware) rather
+# than blindly blending all features equally (FPN default).
+#
+# Key difference from yolo26_cs2ga:
+#   CS²GA   : sits AFTER FPN → additive decoration (LayerScale ≈ 0.07)
+#             93% of gradient bypasses attention → model learns to ignore it
+#   CSFPN   : REPLACES FPN top-down path → attention IS the fusion
+#             100% of gradient flows through attention → forced to learn
+#
+# Architecture:
+#   Backbone (0–10): Conv/C3k2/SPPF/C2PSA — identical to yolo26n
+#   Neck top-down (11–14):
+#       Layer 11: CrossScaleFPN(Q=P4, K/V=P5)  → P4 fused with P5 semantics
+#       Layer 12: C3k2 → P4_neck
+#       Layer 13: CrossScaleFPN(Q=P3, K/V=P4_neck) → P3 fused with P4 context
+#       Layer 14: C3k2 → P3_out
+#   Neck bottom-up (15–20): Conv/Concat/C3k2 — same PAN as yolo26n
+#   Detect (21): YOLO26 E2E head — NO CS²GA layer
+#
+# Warm-start: layers 0–10 + C3k2 neck + PAN + Detect copied from yolo26n.pt
+#             CrossScaleFPN layers 11,13 init fresh (zero out_proj = identity)
+#
+# N-scale channels (width=0.25): P3=64, P4=128, P5=256
+# Attention tokens:
+#   P4(40×40)←P5(20×20): Q=1600, K=400   → 640K per head   [very fast]
+#   P3(80×80)←P4(40×40): Q=6400, K=1600  → 10.2M per head  [fast]
+# =============================================================================
+nc: 80
+end2end: True
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]              # 0  P1/2
+  - [-1, 1, Conv, [128, 3, 2]]             # 1  P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]      # 2
+  - [-1, 1, Conv, [256, 3, 2]]             # 3  P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]      # 4  P3-skip (128ch @ N)
+  - [-1, 1, Conv, [512, 3, 2]]             # 5  P4/16
+  - [-1, 2, C3k2, [512, True]]             # 6  P4-skip (128ch @ N)
+  - [-1, 1, Conv, [1024, 3, 2]]            # 7  P5/32
+  - [-1, 2, C3k2, [1024, True]]            # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]]      # 9
+  - [-1, 2, C2PSA, [1024]]                 # 10 P5-out (256ch @ N)
+
+head:
+  # ── TOP-DOWN: CrossScaleFPN replaces Upsample+Concat ──────────────────
+  #
+  # P4 fusion: Q=P4(layer6, 128ch@40×40), K/V=P5(layer10, 256ch@20×20)
+  # CrossScaleFPN attends: each P4 position asks "which P5 position is most
+  # relevant?" — no upsampling, K/V stay at P5's 20×20 resolution.
+  - [[10, 6], 1, CrossScaleFPN, []]        # 11  P4+P5 fused (128ch @ 40×40)
+  - [-1, 2, C3k2, [512, True]]             # 12  P4_neck (128ch @ 40×40)
+
+  # P3 fusion: Q=P3(layer4, 128ch@80×80), K/V=P4_neck(layer12, 128ch@40×40)
+  # CrossScaleFPN attends: each P3 position asks "which P4_neck position is
+  # most relevant?" — P4_neck already carries P5 semantic info.
+  - [[-1, 4], 1, CrossScaleFPN, []]        # 13  P3+P4_neck fused (128ch @ 80×80)
+  - [-1, 2, C3k2, [256, True]]             # 14  P3_out (64ch @ 80×80)
+
+  # ── BOTTOM-UP PAN (unchanged logic from yolo26n, indices shifted) ──────
+  - [-1, 1, Conv, [256, 3, 2]]             # 15  downsample P3 (64ch @ 40×40)
+  - [[-1, 12], 1, Concat, [1]]             # 16  cat P4_neck → 192ch @ 40×40
+  - [-1, 2, C3k2, [512, True]]             # 17  P4_out (128ch @ 40×40)
+
+  - [-1, 1, Conv, [512, 3, 2]]             # 18  downsample P4 (128ch @ 20×20)
+  - [[-1, 10], 1, Concat, [1]]             # 19  cat P5 → 384ch @ 20×20
+  - [-1, 1, C3k2, [1024, True, 0.5, True]] # 20  P5_out (256ch @ 20×20)
+
+  # ── Detect: P3(14) + P4(17) + P5(20) — NO CS²GA needed ────────────────
+  - [[14, 17, 20], 1, Detect, [nc]]        # 21

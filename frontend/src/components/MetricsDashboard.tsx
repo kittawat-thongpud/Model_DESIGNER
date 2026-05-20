@@ -6,19 +6,24 @@ interface EpochMetrics {
   box_loss?: number;
   cls_loss?: number;
   dfl_loss?: number;
+  val_box_loss?: number;
+  val_cls_loss?: number;
+  val_dfl_loss?: number;
   precision?: number;
   recall?: number;
   mAP50?: number;
   mAP50_95?: number;
+  mAP75?: number;
   fitness?: number;
   lr?: number;
   epoch_time?: number;
+  /** GB allocated on GPU */
+  gpu_mem_gb?: number;
+  gpu_mem_reserved_gb?: number;
+  /** MB alias: gpu_mem_gb * 1024 — added by job_storage */
   gpu_memory_mb?: number;
-  map?: number;
-  map50?: number;
-  map75?: number;
-  mp?: number;
-  mr?: number;
+  ram_gb?: number;
+  total_latency_ms?: number;
 }
 
 interface MetricsDashboardProps {
@@ -99,7 +104,8 @@ export default function MetricsDashboard({ history, bestMetrics }: MetricsDashbo
       metrics: [
         { label: 'Learning Rate', key: 'lr' as keyof EpochMetrics, decimals: 6, best: undefined, isLoss: false },
         { label: 'Epoch Time (s)', key: 'epoch_time' as keyof EpochMetrics, decimals: 2, best: undefined, isLoss: false },
-        { label: 'GPU Memory (MB)', key: 'gpu_memory_mb' as keyof EpochMetrics, decimals: 0, best: undefined, isLoss: false },
+        { label: 'GPU Memory (GB)', key: 'gpu_mem_gb' as keyof EpochMetrics, decimals: 2, best: undefined, isLoss: false },
+        { label: 'Latency (ms)', key: 'total_latency_ms' as keyof EpochMetrics, decimals: 1, best: undefined, isLoss: false },
       ],
     },
   ];
@@ -186,10 +192,10 @@ export default function MetricsDashboard({ history, bestMetrics }: MetricsDashbo
                     {formatValue(epoch.recall)}
                   </td>
                   <td className="px-4 py-2 text-right font-mono text-gray-300">
-                    {formatValue(epoch.mAP50 || epoch.map50)}
+                    {formatValue(epoch.mAP50)}
                   </td>
                   <td className="px-4 py-2 text-right font-mono text-gray-300">
-                    {formatValue(epoch.mAP50_95 || epoch.map)}
+                    {formatValue(epoch.mAP50_95)}
                   </td>
                   <td className="px-4 py-2 text-right font-mono text-gray-300">
                     {formatValue(epoch.fitness)}
