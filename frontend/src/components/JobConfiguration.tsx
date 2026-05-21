@@ -1,15 +1,40 @@
 import React, { useState } from 'react';
-import { 
-  Settings, 
-  ChevronDown, 
-  ChevronUp, 
-  Cpu, 
-  Sliders, 
-  Image as ImageIcon, 
-  Server 
+import {
+  Settings,
+  ChevronDown,
+  ChevronUp,
+  Cpu,
+  Sliders,
+  Image as ImageIcon,
+  Server,
+  Layers
 } from 'lucide-react';
 import { TrainConfig } from '../types';
 import { fmtDataset } from '../utils/format';
+
+// ── Arch model field keys registered by arch plugins ──────────────────────────
+const ARCH_FIELD_KEYS = [
+  'training_mode',
+  'cs2ga_lr_sparse',
+  'cs2ga_lr_gamma',
+  'cs2ga_lr_norm',
+  'cs2ga_lr_backbone',
+] as const;
+
+const TRAINING_MODE_LABELS: Record<string, string> = {
+  full:            'Full Training',
+  attention_only:  'Attention Only',
+  joint_finetune:  'Joint Fine-Tune',
+};
+
+/** Format a value for display in the Model column */
+function fmtModelField(key: string, value: unknown): string {
+  if (value === undefined || value === null) return '-';
+  if (key === 'training_mode') return TRAINING_MODE_LABELS[String(value)] ?? String(value);
+  // cs2ga_lr_* are multipliers
+  if (key.startsWith('cs2ga_lr_')) return `${Number(value).toFixed(2)} ×`;
+  return String(value);
+}
 
 interface JobConfigurationProps {
   config: TrainConfig;
@@ -24,6 +49,12 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
   const getValue = (key: string, defaultValue: any = '-') => {
     return config[key] !== undefined ? config[key] : defaultValue;
   };
+
+  // Collect arch-specific model fields that are actually set in this config
+  const archFields = ARCH_FIELD_KEYS.filter(k => config[k] !== undefined && config[k] !== null);
+  const hasArchFields = archFields.length > 0;
+  // model_arch tells us which plugin was used (e.g. "yolo26_cs2ga_n")
+  const modelArch = config['model_arch'] as string | undefined;
 
   const formatCacheMode = (value: unknown) => {
     if (value === true) return 'Disk';
@@ -50,7 +81,7 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
       </div>
       
       {showConfig && (
-        <div className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 text-sm border-t border-slate-800 bg-[#0f1117]">
+        <div className={`p-6 grid grid-cols-1 md:grid-cols-2 gap-8 text-sm border-t border-slate-800 bg-[#0f1117] ${hasArchFields ? 'lg:grid-cols-5' : 'lg:grid-cols-4'}`}>
            
            {/* Column 1: Training Basics */}
            <ConfigColumn title="Training" icon={<Cpu size={14} />}>
@@ -140,6 +171,35 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
                 </span>
               </div>
            </ConfigColumn>
+
+           {/* Column 5: Arch Model Config — only shown when arch plugin fields are set */}
+           {hasArchFields && (
+             <ConfigColumn title="Model Config" icon={<Layers size={14} />}>
+               {modelArch && (
+                 <div className="mb-3 pb-2 border-b border-slate-800">
+                   <span className="text-xs text-slate-500 block mb-1">Arch Plugin</span>
+                   <span className="font-mono text-xs text-indigo-400 break-all">{modelArch}</span>
+                 </div>
+               )}
+               {archFields.map(key => {
+                 const labelMap: Record<string, string> = {
+                   training_mode:     'Training Mode',
+                   cs2ga_lr_sparse:   'Projection LR',
+                   cs2ga_lr_gamma:    'LayerScale LR',
+                   cs2ga_lr_norm:     'Norm LR',
+                   cs2ga_lr_backbone: 'Backbone LR',
+                 };
+                 return (
+                   <ConfigItem
+                     key={key}
+                     label={labelMap[key] ?? key}
+                     value={fmtModelField(key, config[key])}
+                     highlight={key === 'training_mode' || key === 'cs2ga_lr_backbone'}
+                   />
+                 );
+               })}
+             </ConfigColumn>
+           )}
 
         </div>
       )}
