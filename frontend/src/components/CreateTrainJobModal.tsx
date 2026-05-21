@@ -431,6 +431,11 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
     }
   }, [selectedModelId, modelScale]);
 
+  // Derive the selected arch family (if any) — must be declared before useEffects that use it
+  const selectedArchFamily = selectedModelId?.startsWith('arch:')
+    ? archFamilies.find(f => `arch:${f.family}` === selectedModelId) ?? null
+    : null;
+
   // Load arch config fields when a plugin is selected.
   // Cached module-level — fetched once per plugin key per page lifetime.
   useEffect(() => {
@@ -481,11 +486,6 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         setConfigFieldsLoading(false);
       });
   }, [selectedModelId, modelScale, selectedArchFamily]);
-  
-  // Derive the selected arch family (if any)
-  const selectedArchFamily = selectedModelId?.startsWith('arch:')
-    ? archFamilies.find(f => `arch:${f.family}` === selectedModelId) ?? null
-    : null;
 
   // Merge official YOLO models, arch family models (one per family), and custom models
   const archFamilyModels = archFamilies.map(archFamilyToModelSummary);
