@@ -277,6 +277,26 @@ class ModelArchPlugin(ABC):
         """
         return None
 
+    def get_config_fields(self) -> "list[TrainingConfigField]":  # type: ignore[name-defined]
+        """Return arch-specific training config fields for dynamic UI rendering.
+
+        The frontend fetches this list when the user selects this arch plugin
+        and renders a "Model" tab with one control per field.  Field values
+        are merged into the training config dict and passed to the trainer.
+
+        Field types
+        -----------
+        ``"select"``  — dropdown / radio group; must provide ``options``
+        ``"int"``     — integer input with optional min/max/step
+        ``"float"``   — float input with optional min/max/step
+        ``"slider"``  — range slider + number input pair
+        ``"bool"``    — toggle switch
+        ``"text"``    — free-text input
+
+        Returns an empty list by default (no custom fields → no "Model" tab).
+        """
+        return []
+
     def get_training_profiles(self) -> "list[TrainingProfile]":  # type: ignore[name-defined]
         """Return named training profiles for this arch plugin.
 

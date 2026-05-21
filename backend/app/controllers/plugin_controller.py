@@ -25,6 +25,24 @@ def list_arch_plugins():
     return arch_families()
 
 
+@router.get("/archs/{plugin_name}/config-fields")
+def get_arch_config_fields(plugin_name: str):
+    """Return arch-specific training config field schema for dynamic UI rendering.
+
+    ``plugin_name`` accepts a concrete plugin name (``yolo26_cs2ga_n``) or
+    a family key (``yolo26_cs2ga``).  Returns an empty list for plugins that
+    have not registered custom fields — the UI omits the "Model" tab in that case.
+    """
+    from ..plugins.loader import resolve_arch_plugin, discover_plugins
+    discover_plugins()
+    plugin = resolve_arch_plugin(plugin_name)
+    if plugin is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"Arch plugin not found: {plugin_name!r}")
+    fields = plugin.get_config_fields()
+    return [f.to_dict() for f in fields]
+
+
 @router.get("/archs/{plugin_name}/profiles")
 def get_arch_training_profiles(plugin_name: str):
     """Return the named training profiles registered by an arch plugin.

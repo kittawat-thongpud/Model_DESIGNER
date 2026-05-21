@@ -1,4 +1,20 @@
-"""Training Profile — named training configuration presets per arch plugin.
+"""Training Profile & Training Config Field — per-arch training configuration system.
+
+TrainingConfigField
+-------------------
+Schema-driven training config fields registered by arch plugins.  Each field
+maps to a UI control (slider, select, number, bool, text) and a key in the
+training config dict that flows all the way to the trainer.
+
+TrainingProfile
+---------------
+Backend-only named training presets that drive parameter freeze and LR group
+overrides.  Not user-facing as radio buttons — they are resolved internally
+from ``config["training_mode"]`` (a "select" config field on each plugin).
+
+---
+
+Training Profile — named training configuration presets per arch plugin.
 
 A TrainingProfile bundles together:
   - Which parameters to freeze (by layer prefix or module class name)
@@ -187,3 +203,108 @@ class TrainingProfile:
             "config_overrides": self.config_overrides,
             "tags": self.tags,
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TrainingConfigField — schema-driven arch-specific training parameter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SelectOption:
+    """One option entry for a ``select`` field."""
+    value: str | int | float
+    label: str
+    description: str = ""
+
+    def to_dict(self) -> dict:
+        return {"value": self.value, "label": self.label, "description": self.description}
+
+
+@dataclass
+class TrainingConfigField:
+    """Schema definition for one arch-specific training parameter.
+
+    Arch plugins return a list of these from ``get_config_fields()``.
+    The frontend uses the list to render a dynamic "Model" tab in the
+    training-job creation modal.  When the user submits the job the
+    field values are merged into the regular ``config`` dict and flow
+    unchanged all the way to the trainer.
+
+    Parameters
+    ----------
+    key : str
+        Config-dict key. The value the user enters will be stored under
+        this key and passed to the trainer. Must not clash with standard
+        Ultralytics keys unless you intentionally want to override them.
+    label : str
+        Human-readable field label shown in the UI.
+    field_type : str
+        One of ``"int"``, ``"float"``, ``"slider"``, ``"select"``,
+        ``"bool"``, ``"text"``.
+    default : Any
+        Default value — pre-filled in the form.
+    description : str
+        Short explanatory text shown below the field (tooltip / hint).
+    group : str
+        Section heading used to group related fields inside the tab.
+        Fields with the same ``group`` are rendered together under a
+        collapsible section header.
+    options : list[SelectOption] | None
+        Required for ``"select"`` fields.  Defines the available choices.
+    min_val / max_val / step : float | None
+        Bounds and increment for ``"int"``, ``"float"``, and ``"slider"``
+        fields.
+    unit : str | None
+        Decorative unit suffix shown next to the value, e.g. ``"×"``,
+        ``"epochs"``, ``"%"``.
+    advanced : bool
+        If True the field is hidden by default and shown only when the
+        user expands an "Advanced" section.
+    required : bool
+        If True the UI prevents job submission when the field is empty.
+    """
+
+    key: str
+    label: str
+    field_type: str          # 'int' | 'float' | 'slider' | 'select' | 'bool' | 'text'
+    default: Any
+
+    description: str = ""
+    group: str = "General"
+
+    # Numeric constraints
+    min_val: float | None = None
+    max_val: float | None = None
+    step: float | None = None
+    unit: str | None = None
+
+    # Select options
+    options: list[SelectOption] = field(default_factory=list)
+
+    # Visibility
+    advanced: bool = False
+    required: bool = False
+
+    def to_dict(self) -> dict:
+        """JSON-serialisable representation for the API."""
+        d: dict = {
+            "key": self.key,
+            "label": self.label,
+            "field_type": self.field_type,
+            "default": self.default,
+            "description": self.description,
+            "group": self.group,
+            "advanced": self.advanced,
+            "required": self.required,
+        }
+        if self.options:
+            d["options"] = [o.to_dict() for o in self.options]
+        if self.min_val is not None:
+            d["min_val"] = self.min_val
+        if self.max_val is not None:
+            d["max_val"] = self.max_val
+        if self.step is not None:
+            d["step"] = self.step
+        if self.unit is not None:
+            d["unit"] = self.unit
+        return d

@@ -367,6 +367,9 @@ class CustomDetectionTrainer(DetectionTrainer):
             'selector_loss_warmup_epochs',
             'enable_query_metrics', 'enable_gt_metrics', 'enable_dam_metrics', 'enable_deep_metrics',
             '_partition_configs', '_dataset_name', '_training_profile',
+            # arch config-field keys (already popped by ultra_trainer; strip here for safety)
+            'training_mode',
+            'cs2ga_lr_sparse', 'cs2ga_lr_gamma', 'cs2ga_lr_norm', 'cs2ga_lr_backbone',
         }
         
         # Build complete config by merging defaults with our overrides

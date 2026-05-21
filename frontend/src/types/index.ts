@@ -253,8 +253,8 @@ export interface ArchScale {
 }
 
 export interface TrainingProfile {
-  name: string;                        // "full", "attention_only"
-  display_name: string;                // "Full Training"
+  name: string;
+  display_name: string;
   description: string;
   is_default: boolean;
   badge_color: 'blue' | 'green' | 'orange' | 'red' | 'purple' | 'gray';
@@ -264,6 +264,28 @@ export interface TrainingProfile {
   lr_group_overrides: Record<string, number>;
   config_overrides: Record<string, unknown>;
   tags: string[];
+}
+
+export interface SelectOption {
+  value: string | number;
+  label: string;
+  description?: string;
+}
+
+export interface TrainingConfigField {
+  key: string;
+  label: string;
+  field_type: 'int' | 'float' | 'slider' | 'select' | 'bool' | 'text';
+  default: unknown;
+  description?: string;
+  group?: string;
+  options?: SelectOption[];
+  min_val?: number;
+  max_val?: number;
+  step?: number;
+  unit?: string;
+  advanced?: boolean;
+  required?: boolean;
 }
 
 export interface ArchFamily {

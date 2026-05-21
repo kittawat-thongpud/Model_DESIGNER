@@ -20,7 +20,7 @@ import torch
 
 from ..base import ModelArchPlugin
 from ..loader import register_arch
-from ..training_profile import TrainingProfile
+from ..training_profile import TrainingProfile, TrainingConfigField, SelectOption
 
 
 _CONFIGS_DIR = Path(__file__).resolve().parents[3] / "hsg_detr" / "configs"
@@ -132,6 +132,117 @@ class YOLO26CS2GAPlugin(ModelArchPlugin):
             "bgr": 0.106,
             "close_mosaic": 10,
         }
+
+    # ------------------------------------------------------------------ #
+
+    def get_config_fields(self) -> list[TrainingConfigField]:
+        """Arch-specific config fields rendered as a "Model" tab in the UI.
+
+        Values flow into the training config dict unchanged and are read by
+        the trainer (training_mode → profile resolution + freeze,
+        cs2ga_lr_* → build_optimizer LR multipliers).
+        """
+        return [
+            # ── Training Mode ─────────────────────────────────────────────
+            TrainingConfigField(
+                key="training_mode",
+                label="Training Mode",
+                field_type="select",
+                default="full",
+                description=(
+                    "Controls which parts of the model are trained. "
+                    "'full' trains everything end-to-end; 'attention_only' freezes the "
+                    "YOLO26 backbone/neck so only CS²GA learns; 'joint_finetune' lets "
+                    "backbone adapt slowly while CS²GA drives the gradient."
+                ),
+                group="Training Mode",
+                options=[
+                    SelectOption("full", "Full Training",
+                                 "All layers unfrozen — standard end-to-end training"),
+                    SelectOption("attention_only", "Attention-Only",
+                                 "Freeze backbone + neck (layers 0-22); train only CS²GA + Detect head. "
+                                 "Isolates CS²GA contribution."),
+                    SelectOption("joint_finetune", "Joint Fine-Tune",
+                                 "All layers unfrozen; backbone gets 0.2× LR, CS²GA gets 15×. "
+                                 "Best as phase-2 after Attention-Only."),
+                ],
+            ),
+
+            # ── CS²GA Learning Rate multipliers ──────────────────────────
+            TrainingConfigField(
+                key="cs2ga_lr_sparse",
+                label="Projection LR ×",
+                field_type="slider",
+                default=10.0,
+                description=(
+                    "LR multiplier for CS²GA projection layers (q/k/v/out_proj, scale_embed) "
+                    "relative to base lr0. Higher values compensate for backbone gradient dominance."
+                ),
+                group="CS²GA Learning Rate",
+                min_val=1.0, max_val=50.0, step=0.5, unit="×",
+            ),
+            TrainingConfigField(
+                key="cs2ga_lr_gamma",
+                label="LayerScale LR ×",
+                field_type="slider",
+                default=20.0,
+                description=(
+                    "LR multiplier for LayerScale (ls_p3/p4/p5) parameters. "
+                    "LayerScale gates how much attention contributes to the residual — "
+                    "needs higher LR to grow from the small init value."
+                ),
+                group="CS²GA Learning Rate",
+                min_val=1.0, max_val=50.0, step=0.5, unit="×",
+            ),
+            TrainingConfigField(
+                key="cs2ga_lr_norm",
+                label="Norm LR ×",
+                field_type="slider",
+                default=5.0,
+                description=(
+                    "LR multiplier for CS²GA pre-norm and output-norm layers. "
+                    "Elevated so norms adapt at the same rate as the attention projections."
+                ),
+                group="CS²GA Learning Rate",
+                min_val=1.0, max_val=20.0, step=0.5, unit="×",
+            ),
+            TrainingConfigField(
+                key="cs2ga_lr_backbone",
+                label="Backbone LR ×",
+                field_type="slider",
+                default=1.0,
+                description=(
+                    "LR multiplier for the backbone/neck base layers. "
+                    "Set below 1.0 in joint_finetune mode to slow backbone adaptation "
+                    "and let CS²GA drive the gradient."
+                ),
+                group="CS²GA Learning Rate",
+                min_val=0.01, max_val=1.0, step=0.01, unit="×",
+            ),
+
+            # ── Training Schedule ─────────────────────────────────────────
+            TrainingConfigField(
+                key="epochs",
+                label="Epochs",
+                field_type="int",
+                default=150,
+                description="Total training epochs.",
+                group="Training Schedule",
+                min_val=10, max_val=600, step=10, unit="epochs",
+            ),
+            TrainingConfigField(
+                key="lr0",
+                label="Base LR",
+                field_type="float",
+                default=0.0054,
+                description=(
+                    "Initial learning rate (lr0). The official YOLO26-N recipe uses 0.0054. "
+                    "Lower this when using attention_only mode (~0.001)."
+                ),
+                group="Training Schedule",
+                min_val=0.00001, max_val=0.1, step=0.0001,
+            ),
+        ]
 
     # ------------------------------------------------------------------ #
 

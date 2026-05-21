@@ -6,16 +6,16 @@
  */
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
-import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily, TrainingProfile } from '../types';
+import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily, TrainingConfigField } from '../types';
 import { Play, Settings, Loader2, Search, Layers, X, Download, CheckCircle2 } from 'lucide-react';
 
-// ── Module-level cache for arch training profiles ────────────────────────────
+// ── Module-level cache for arch config fields ────────────────────────────────
 // Keyed by concrete plugin name (e.g. "yolo26_cs2ga_n").
 // Lives outside the component so it survives modal open/close cycles for the
 // lifetime of the page — no re-fetch unless the user hard-reloads.
 // A Set tracks in-flight requests to prevent duplicate concurrent fetches.
-const _profileCache = new Map<string, TrainingProfile[]>();
-const _profileFetchingKeys = new Set<string>();
+const _configFieldsCache = new Map<string, TrainingConfigField[]>();
+const _configFieldsFetchingKeys = new Set<string>();
 
 interface Props {
   isOpen: boolean;
@@ -93,7 +93,7 @@ const DEFAULT_CONFIG: TrainConfig = {
   sample_per_class: 0,
 };
 
-type Tab = 'general' | 'optimizer' | 'loss' | 'augmentation' | 'validation';
+type Tab = 'general' | 'model' | 'optimizer' | 'loss' | 'augmentation' | 'validation';
 
 // Official YOLO model families (scale selected via scale selector)
 const OFFICIAL_YOLO_MODELS: ModelSummary[] = [
@@ -193,6 +193,157 @@ function withFrontendArchFallbacks(families: ArchFamily[]): ArchFamily[] {
   );
 }
 
+// ── ArchConfigFieldRow ────────────────────────────────────────────────────────
+// Renders one arch config field with the correct input control for its type.
+
+interface FieldRowProps {
+  field: TrainingConfigField;
+  value: unknown;
+  onChange: (val: unknown) => void;
+}
+
+function ArchConfigFieldRow({ field, value, onChange }: FieldRowProps) {
+  const baseInput = 'bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:border-emerald-500 focus:outline-none';
+  const unitSpan = field.unit
+    ? <span className="text-xs text-slate-400 ml-2 shrink-0">{field.unit}</span>
+    : null;
+
+  let control: React.ReactNode;
+
+  if (field.field_type === 'select') {
+    control = (
+      <select
+        value={String(value ?? field.default)}
+        onChange={e => onChange(e.target.value)}
+        className={`w-full px-3 py-2.5 ${baseInput}`}
+      >
+        {(field.options ?? []).map(opt => (
+          <option key={String(opt.value)} value={String(opt.value)}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    );
+    // Show selected option description as hint
+    const selectedOpt = (field.options ?? []).find(o => String(o.value) === String(value ?? field.default));
+    if (selectedOpt?.description) {
+      control = (
+        <>
+          {control}
+          <p className="mt-1.5 text-xs text-slate-500 leading-relaxed">{selectedOpt.description}</p>
+        </>
+      );
+    }
+  } else if (field.field_type === 'bool') {
+    const checked = Boolean(value ?? field.default);
+    control = (
+      <button
+        type="button"
+        onClick={() => onChange(!checked)}
+        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+          checked ? 'bg-emerald-600' : 'bg-slate-700'
+        }`}
+      >
+        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-6' : 'translate-x-1'
+        }`} />
+      </button>
+    );
+  } else if (field.field_type === 'slider') {
+    const numVal = Number(value ?? field.default);
+    const min = field.min_val ?? 0;
+    const max = field.max_val ?? 100;
+    const step = field.step ?? 1;
+    control = (
+      <div className="flex items-center gap-3">
+        <input
+          type="range"
+          min={min} max={max} step={step}
+          value={numVal}
+          onChange={e => onChange(Number(e.target.value))}
+          className="flex-1 h-2 rounded-lg appearance-none cursor-pointer accent-emerald-500 bg-slate-700"
+        />
+        <div className="flex items-center gap-1.5 shrink-0">
+          <input
+            type="number"
+            min={min} max={max} step={step}
+            value={numVal}
+            onChange={e => {
+              const v = Number(e.target.value);
+              if (!isNaN(v)) onChange(Math.min(max, Math.max(min, v)));
+            }}
+            className={`w-20 px-2 py-1.5 text-right ${baseInput}`}
+          />
+          {unitSpan}
+        </div>
+      </div>
+    );
+  } else if (field.field_type === 'int') {
+    const numVal = Number(value ?? field.default);
+    control = (
+      <div className="flex items-center gap-2">
+        <input
+          type="number"
+          min={field.min_val ?? undefined}
+          max={field.max_val ?? undefined}
+          step={field.step ?? 1}
+          value={numVal}
+          onChange={e => onChange(parseInt(e.target.value, 10))}
+          className={`w-40 px-3 py-2 ${baseInput}`}
+        />
+        {unitSpan}
+      </div>
+    );
+  } else if (field.field_type === 'float') {
+    const numVal = Number(value ?? field.default);
+    control = (
+      <div className="flex items-center gap-2">
+        <input
+          type="number"
+          min={field.min_val ?? undefined}
+          max={field.max_val ?? undefined}
+          step={field.step ?? 0.0001}
+          value={numVal}
+          onChange={e => onChange(parseFloat(e.target.value))}
+          className={`w-40 px-3 py-2 ${baseInput}`}
+        />
+        {unitSpan}
+      </div>
+    );
+  } else {
+    // text
+    control = (
+      <input
+        type="text"
+        value={String(value ?? field.default ?? '')}
+        onChange={e => onChange(e.target.value)}
+        className={`w-full px-3 py-2.5 ${baseInput}`}
+      />
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1.5">
+        <label className="text-sm font-medium text-slate-200">{field.label}</label>
+        {field.field_type !== 'bool' && field.field_type !== 'select' && (
+          <button
+            type="button"
+            onClick={() => onChange(field.default)}
+            className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+          >
+            reset
+          </button>
+        )}
+      </div>
+      {control}
+      {field.description && field.field_type !== 'select' && (
+        <p className="mt-1.5 text-xs text-slate-500 leading-relaxed">{field.description}</p>
+      )}
+    </div>
+  );
+}
+
 export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: Props) {
   const [customModels, setCustomModels] = useState<ModelSummary[]>([]);
   const [archFamilies, setArchFamilies] = useState<ArchFamily[]>([]);
@@ -215,10 +366,10 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
   // YOLOv8 backbone warm-start selector (for custom/arch models only)
   const [yolov8Backbone, setYolov8Backbone] = useState<string>('');  // '' = disabled, 'yolov8n' etc = enabled
 
-  // Training profile selector (arch plugins only)
-  const [trainingProfiles, setTrainingProfiles] = useState<TrainingProfile[]>([]);
-  const [selectedProfileName, setSelectedProfileName] = useState<string | null>(null);
-  const [profilesLoading, setProfilesLoading] = useState(false);
+  // Arch-specific config fields (loaded once per plugin key, cached module-level)
+  const [archConfigFields, setArchConfigFields] = useState<TrainingConfigField[]>([]);
+  const [archConfigValues, setArchConfigValues] = useState<Record<string, unknown>>({});
+  const [configFieldsLoading, setConfigFieldsLoading] = useState(false);
 
   // ── selective_scan install polling ────────────────────────────────────────
   const isMambaSelected = selectedModelId?.startsWith('arch:') && selectedModelId?.includes('mamba');
@@ -280,53 +431,54 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
     }
   }, [selectedModelId, modelScale]);
 
-  // Load training profiles when an arch family + scale is selected.
-  // Uses a module-level cache (_profileCache) so each plugin key is fetched
-  // at most once per page lifetime — no re-fetch on scale change or modal re-open.
+  // Load arch config fields when a plugin is selected.
+  // Cached module-level — fetched once per plugin key per page lifetime.
   useEffect(() => {
     if (!selectedModelId?.startsWith('arch:') || !selectedArchFamily) {
-      setTrainingProfiles([]);
-      setSelectedProfileName(null);
+      setArchConfigFields([]);
+      setArchConfigValues({});
       return;
     }
 
-    // Build the concrete plugin name, e.g. "yolo26_cs2ga_n"
     const familyKey = selectedModelId.replace('arch:', '');
     const pluginName = modelScale ? `${familyKey}_${modelScale}` : familyKey;
 
-    // ── Cache hit: apply immediately, no loading state, no network call ──
-    if (_profileCache.has(pluginName)) {
-      const cached = _profileCache.get(pluginName)!;
-      setTrainingProfiles(cached);
-      // Re-select the default on every new selection (user may have changed model)
-      const def = cached.find(p => p.is_default) ?? cached[0] ?? null;
-      setSelectedProfileName(def?.name ?? null);
+    const applyFields = (fields: TrainingConfigField[]) => {
+      setArchConfigFields(fields);
+      // Reset values to defaults whenever the plugin/scale changes
+      const defaults: Record<string, unknown> = {};
+      for (const f of fields) defaults[f.key] = f.default;
+      setArchConfigValues(defaults);
+      // If fields exist, switch to 'model' tab automatically
+      if (fields.length > 0) setActiveTab('model');
+    };
+
+    // ── Cache hit ────────────────────────────────────────────────────────
+    if (_configFieldsCache.has(pluginName)) {
+      applyFields(_configFieldsCache.get(pluginName)!);
       return;
     }
 
-    // ── Deduplicate concurrent fetches for the same key ───────────────────
-    if (_profileFetchingKeys.has(pluginName)) return;
+    // ── Deduplicate concurrent fetches ───────────────────────────────────
+    if (_configFieldsFetchingKeys.has(pluginName)) return;
 
-    // ── Cache miss: fetch once, populate cache, then set state ───────────
-    _profileFetchingKeys.add(pluginName);
-    setProfilesLoading(true);
-    api.getArchTrainingProfiles(pluginName)
-      .then((profiles) => {
-        const list = profiles ?? [];
-        _profileCache.set(pluginName, list);          // store in module cache
-        setTrainingProfiles(list);
-        const def = list.find(p => p.is_default) ?? list[0] ?? null;
-        setSelectedProfileName(def?.name ?? null);
+    // ── Cache miss: fetch once ───────────────────────────────────────────
+    _configFieldsFetchingKeys.add(pluginName);
+    setConfigFieldsLoading(true);
+    api.getArchConfigFields(pluginName)
+      .then((fields) => {
+        const list = fields ?? [];
+        _configFieldsCache.set(pluginName, list);
+        applyFields(list);
       })
       .catch(() => {
-        // On error keep an empty-list entry so we don't retry on every re-render
-        _profileCache.set(pluginName, []);
-        setTrainingProfiles([]);
-        setSelectedProfileName(null);
+        _configFieldsCache.set(pluginName, []);
+        setArchConfigFields([]);
+        setArchConfigValues({});
       })
       .finally(() => {
-        _profileFetchingKeys.delete(pluginName);
-        setProfilesLoading(false);
+        _configFieldsFetchingKeys.delete(pluginName);
+        setConfigFieldsLoading(false);
       });
   }, [selectedModelId, modelScale, selectedArchFamily]);
   
@@ -429,8 +581,9 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
           test: splits.test
         }));
       
-      // Detect if official YOLO model is selected
-      const finalConfig = { ...config };
+      // Merge arch-specific config-field values into the regular config dict.
+      // These values end up in the training config dict and are read by the trainer.
+      const finalConfig = { ...config, ...archConfigValues };
       if (selectedModelId.startsWith('yolo:')) {
         const family = selectedModelId.split(':')[1]; // e.g., 'yolov8', 'yolov5', 'rtdetr'
         let yoloKey: string;
@@ -464,7 +617,6 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         model_scale: modelScale,
         config: finalConfig,
         partitions: partitionConfigs,
-        training_profile: selectedProfileName ?? undefined,
       });
       onJobCreated(res.job_id);
       onClose();
@@ -476,8 +628,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       setSearchQuery('');
       setPartitionSplitConfig({});
       setYolov8Backbone('');
-      setTrainingProfiles([]);
-      setSelectedProfileName(null);
+      setArchConfigFields([]);
+      setArchConfigValues({});
     } catch (err: any) {
       setStartError(err?.message || String(err));
     } finally {
@@ -753,17 +905,20 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
 
                   {/* Tabs */}
                   <div className="flex border-b border-slate-800 px-6">
-                    {(['general', 'optimizer', 'loss', 'augmentation', 'validation'] as Tab[]).map(tab => (
+                    {((['general', ...(archConfigFields.length > 0 ? ['model'] : []), 'optimizer', 'loss', 'augmentation', 'validation']) as Tab[]).map(tab => (
                       <button
                         key={tab}
                         onClick={() => setActiveTab(tab)}
-                        className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+                        className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors relative ${
                           activeTab === tab
                             ? 'border-emerald-500 text-emerald-400'
                             : 'border-transparent text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                        {tab === 'model' ? 'Model' : tab.charAt(0).toUpperCase() + tab.slice(1)}
+                        {tab === 'model' && configFieldsLoading && (
+                          <Loader2 size={10} className="animate-spin absolute -top-0.5 -right-1 text-slate-400" />
+                        )}
                       </button>
                     ))}
                   </div>
@@ -901,82 +1056,6 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                                 </div>
                               </label>
                             </div>
-                          </div>
-                        )}
-
-                        {/* Training Profile Selector (arch plugins with registered profiles) */}
-                        {selectedModelId?.startsWith('arch:') && (trainingProfiles.length > 0 || profilesLoading) && (
-                          <div className="col-span-2">
-                            <div className="flex items-center gap-2 mb-2">
-                              <label className="text-xs font-medium text-violet-400">Training Profile</label>
-                              {profilesLoading && <Loader2 className="w-3 h-3 animate-spin text-slate-400" />}
-                            </div>
-                            {!profilesLoading && trainingProfiles.length > 0 && (
-                              <div className="space-y-2">
-                                {trainingProfiles.map(profile => {
-                                  const badgeColors: Record<string, string> = {
-                                    blue:   'bg-blue-500/20 border-blue-500/40 text-blue-300',
-                                    green:  'bg-emerald-500/20 border-emerald-500/40 text-emerald-300',
-                                    orange: 'bg-amber-500/20 border-amber-500/40 text-amber-300',
-                                    red:    'bg-red-500/20 border-red-500/40 text-red-300',
-                                    purple: 'bg-violet-500/20 border-violet-500/40 text-violet-300',
-                                    gray:   'bg-slate-500/20 border-slate-500/40 text-slate-300',
-                                  };
-                                  const isSelected = selectedProfileName === profile.name;
-                                  return (
-                                    <label
-                                      key={profile.name}
-                                      className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-all border-2 ${
-                                        isSelected
-                                          ? 'bg-violet-500/10 border-violet-500/50 shadow-[0_0_10px_rgba(139,92,246,0.1)]'
-                                          : 'bg-slate-800/50 border-slate-700 hover:border-slate-600'
-                                      }`}
-                                    >
-                                      <input
-                                        type="radio"
-                                        name="training_profile"
-                                        checked={isSelected}
-                                        onChange={() => setSelectedProfileName(profile.name)}
-                                        className="w-4 h-4 mt-0.5 text-violet-500 focus:ring-violet-500 flex-shrink-0"
-                                      />
-                                      <div className="flex-1 min-w-0">
-                                        <div className="flex items-center gap-2 flex-wrap">
-                                          <span className="text-sm font-medium text-white">{profile.display_name}</span>
-                                          {profile.is_default && (
-                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/60 text-slate-300 border border-slate-500/30">
-                                              default
-                                            </span>
-                                          )}
-                                          {profile.tags.map(tag => (
-                                            <span
-                                              key={tag}
-                                              className={`text-[10px] px-1.5 py-0.5 rounded border ${badgeColors[profile.badge_color] ?? badgeColors.blue}`}
-                                            >
-                                              {tag}
-                                            </span>
-                                          ))}
-                                        </div>
-                                        <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">{profile.description}</p>
-                                        {isSelected && Object.keys(profile.lr_group_overrides).length > 0 && (
-                                          <div className="mt-1.5 flex flex-wrap gap-1">
-                                            {Object.entries(profile.lr_group_overrides).map(([group, mult]) => (
-                                              <span key={group} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-300 border border-slate-600/40">
-                                                {group}: {mult}×
-                                              </span>
-                                            ))}
-                                          </div>
-                                        )}
-                                        {isSelected && Object.keys(profile.config_overrides).length > 0 && (
-                                          <div className="mt-1 text-[10px] text-slate-500">
-                                            Config: {Object.entries(profile.config_overrides).map(([k, v]) => `${k}=${v}`).join(', ')}
-                                          </div>
-                                        )}
-                                      </div>
-                                    </label>
-                                  );
-                                })}
-                              </div>
-                            )}
                           </div>
                         )}
 
@@ -1351,6 +1430,43 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                             </div>
                           </div>
                         </div>
+                      </div>
+                    )}
+
+                    {/* MODEL TAB — dynamic arch-specific config fields */}
+                    {activeTab === 'model' && (
+                      <div className="max-w-2xl space-y-8">
+                        {archConfigFields.length === 0 ? (
+                          <div className="text-slate-500 text-sm py-8 text-center">
+                            No model-specific config fields registered for this plugin.
+                          </div>
+                        ) : (() => {
+                          // Group fields by their `group` property
+                          const groups: Record<string, TrainingConfigField[]> = {};
+                          for (const f of archConfigFields) {
+                            const g = f.group ?? 'General';
+                            if (!groups[g]) groups[g] = [];
+                            groups[g].push(f);
+                          }
+                          return Object.entries(groups).map(([groupName, fields]) => (
+                            <div key={groupName}>
+                              <div className="flex items-center gap-3 mb-4">
+                                <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">{groupName}</span>
+                                <div className="flex-1 h-px bg-slate-800" />
+                              </div>
+                              <div className="space-y-5">
+                                {fields.map(field => (
+                                  <ArchConfigFieldRow
+                                    key={field.key}
+                                    field={field}
+                                    value={archConfigValues[field.key] ?? field.default}
+                                    onChange={(val) => setArchConfigValues(prev => ({ ...prev, [field.key]: val }))}
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          ));
+                        })()}
                       </div>
                     )}
 

@@ -1647,33 +1647,77 @@ def _training_worker(
                 # Profile config_overrides are injected AFTER plugin_defaults and
                 # BEFORE user config, so the user can still override individual
                 # keys via the UI sliders even when a profile is active.
+                # ── Resolve training mode → backend profile ─────────────
+                # Priority:
+                #  1. config["training_mode"]  — from arch config field (UI)
+                #  2. training_profile argument — from TrainRequest.training_profile (legacy)
+                # Both map to a TrainingProfile name for freeze / LR-group logic.
                 resolved_profile = None
-                if training_profile:
+                _mode_key = config.pop("training_mode", None) or training_profile
+
+                if _mode_key:
                     profiles = arch_plugin.get_training_profiles()
                     resolved_profile = next(
-                        (p for p in profiles if p.name == training_profile), None
+                        (p for p in profiles if p.name == _mode_key), None
                     )
                     if resolved_profile is None:
                         job_storage.append_job_log(
                             job_id, "WARNING",
-                            f"Training profile '{training_profile}' not found in plugin "
+                            f"Training mode/profile '{_mode_key}' not found in plugin "
                             f"'{arch_plugin.name}'. Available: "
-                            f"{[p.name for p in profiles]}. Ignoring profile.",
+                            f"{[p.name for p in profiles]}. Using defaults.",
                         )
                     else:
                         job_storage.append_job_log(
                             job_id, "INFO",
-                            f"Training profile '{resolved_profile.display_name}' active — "
-                            f"config_overrides={resolved_profile.config_overrides}, "
-                            f"lr_group_overrides={resolved_profile.lr_group_overrides}, "
-                            f"freeze_param_prefixes={resolved_profile.freeze_param_prefixes}",
+                            f"Training mode '{resolved_profile.display_name}' active — "
+                            f"freeze_prefixes={len(resolved_profile.freeze_param_prefixes)}, "
+                            f"base_lr_overrides={resolved_profile.lr_group_overrides}",
                         )
-                        # Apply profile's config_overrides into config
-                        # (user values from UI are already in config; we only
-                        # inject profile overrides for keys the user has not set)
+                        # Apply profile's config_overrides for keys not set by the user
                         for k, v in resolved_profile.config_overrides.items():
                             if k not in config:
                                 config[k] = v
+
+                # ── Override LR group multipliers from cs2ga_lr_* config fields ──
+                # User-supplied cs2ga_lr_* keys take precedence over profile defaults.
+                # They are popped from config (not valid Ultralytics kwargs) and stored
+                # in the profile dict so custom_trainer.build_optimizer can read them.
+                _cs2ga_lr_overrides: dict[str, float] = {}
+                for _cfg_key, _group_key in (
+                    ("cs2ga_lr_sparse",   "sgb_sparse"),
+                    ("cs2ga_lr_gamma",    "sgb_gamma"),
+                    ("cs2ga_lr_norm",     "sgb_norm_group"),
+                    ("cs2ga_lr_backbone", "base"),
+                ):
+                    _val = config.pop(_cfg_key, None)
+                    if _val is not None:
+                        try:
+                            _cs2ga_lr_overrides[_group_key] = float(_val)
+                        except (TypeError, ValueError):
+                            pass
+
+                # Merge user LR overrides on top of resolved profile's overrides
+                if resolved_profile is not None and _cs2ga_lr_overrides:
+                    import copy as _copy
+                    resolved_profile = _copy.copy(resolved_profile)
+                    resolved_profile.lr_group_overrides = {
+                        **resolved_profile.lr_group_overrides,
+                        **_cs2ga_lr_overrides,
+                    }
+                    job_storage.append_job_log(
+                        job_id, "INFO",
+                        f"CS²GA LR overrides from config fields: {_cs2ga_lr_overrides}",
+                    )
+                elif _cs2ga_lr_overrides:
+                    # No profile active but user set LR fields — wrap in a minimal profile
+                    from ..plugins.training_profile import TrainingProfile as _TP
+                    resolved_profile = _TP(
+                        name="_config_fields_lr",
+                        display_name="Config-field LR overrides",
+                        description="Auto-created from cs2ga_lr_* config fields",
+                        lr_group_overrides=_cs2ga_lr_overrides,
+                    )
 
                 # Inject resolved profile into config so custom_trainer can access it
                 if resolved_profile is not None:
