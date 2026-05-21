@@ -146,6 +146,7 @@ async def start_training(req: TrainRequest):
         config=config,
         partition_configs=partition_configs,
         model_scale=req.model_scale,
+        training_profile=req.training_profile or None,
     )
 
     return {"job_id": job_id, "message": "Training started"}

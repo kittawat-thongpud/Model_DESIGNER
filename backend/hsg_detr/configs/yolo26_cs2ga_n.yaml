@@ -18,7 +18,7 @@
 #   Detect  (24)  : YOLO26 E2E head       — init from yolo26n layer-23 weights
 #
 # Warm-start: layers 0–22 + Detect copied from yolo26n.pt (100% backbone/neck)
-#             CS²GA layer-23 init fresh with LayerScale=1e-4
+#             CS²GA layer-23 init fresh with LayerScale=0.1 (was 1e-4 — too small)
 #
 # N-scale channels (width=0.25): P3=64, P4=128, P5=256
 # Token budget @ 640×640: P3 5%→320, P4 10%→160, P5 25%→100 = 580 total
@@ -61,8 +61,10 @@ head:
   - [-1, 1, C3k2, [1024, True, 0.5, True]]       # 22  P5 ← 256ch @ N
 
   # CS²GA: cross-scale attention on P3/P4/P5 simultaneously
-  # c1=[64,128,256], shared_dim=256, ratios=5%/10%/25%, LayerScale init=1e-4
-  - [[16, 19, 22], 1, CrossScaleSGA, [256, 0.05, 0.10, 0.25]]  # 23
+  # c1=[64,128,256], shared_dim=256, ratios=5%/10%/25%, LayerScale init=0.1
+  # ls_init=0.1: attention contributes ~10% from epoch 1 so gradient flows.
+  # Original 1e-4 (DeiT default) starved attention gradient behind strong FPN path.
+  - [[16, 19, 22], 1, CrossScaleSGA, [256, 0.05, 0.10, 0.25, 0.1]]  # 23
 
   # YOLO26 E2E detect head (accepts list[Tensor] from CS²GA)
   - [-1, 1, Detect, [nc]]                        # 24

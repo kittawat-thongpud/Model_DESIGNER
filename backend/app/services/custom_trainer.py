@@ -335,6 +335,13 @@ class CustomDetectionTrainer(DetectionTrainer):
         self.hsg_enable_query_metrics = bool(_get('enable_query_metrics', True))
         self.hsg_enable_gt_metrics = bool(_get('enable_gt_metrics', False))
         self.hsg_enable_dam_metrics = bool(_get('enable_dam_metrics', False))
+
+        # Training profile (serialised dict from arch plugin) — used to apply
+        # parameter freeze and LR group overrides during setup.
+        _raw_profile = _get('_training_profile', None)
+        self._training_profile_dict: dict | None = (
+            _raw_profile if isinstance(_raw_profile, dict) else None
+        )
         
         # _partition_configs / _dataset_name no longer needed — TXT splits in data.yaml handle partition filtering
         clean_overrides.pop('_partition_configs', None)
@@ -359,7 +366,7 @@ class CustomDetectionTrainer(DetectionTrainer):
             'lambda_selector', 'T_teacher', 'T_student', 'selector_loss_start_epoch',
             'selector_loss_warmup_epochs',
             'enable_query_metrics', 'enable_gt_metrics', 'enable_dam_metrics', 'enable_deep_metrics',
-            '_partition_configs', '_dataset_name',
+            '_partition_configs', '_dataset_name', '_training_profile',
         }
         
         # Build complete config by merging defaults with our overrides
@@ -702,11 +709,15 @@ class CustomDetectionTrainer(DetectionTrainer):
         """Build optimizer with selected-token SGB-aware param groups.
 
         Param groups:
-          - base model:             lr=lr0,        wd=decay
-          - SGB/CS²GA projections:  lr=lr0 x 2.0,  wd=decay
-          - SGB gamma / LayerScale: lr=lr0 x 5.0,  wd=0
-          - norm / bias:            lr=lr0,        wd=0
-          - decoder:                lr=lr0 x 1.5,  wd=decay
+          - base model:             lr=lr0,         wd=decay
+          - SGB/CS²GA projections:  lr=lr0 x 10.0,  wd=decay
+          - SGB gamma / LayerScale: lr=lr0 x 20.0,  wd=0
+          - SGB norms (pre/attn):   lr=lr0 x 5.0,   wd=0
+          - norm / bias:            lr=lr0,         wd=0
+          - decoder:                lr=lr0 x 1.5,   wd=decay
+
+        CS²GA gets 10-20× base LR because backbone gradient dominates by ~20-50×,
+        starving attention of effective training signal at equal LR.
         """
         lr0 = lr if lr is not None else self.args.lr0
         wd = decay
@@ -750,6 +761,14 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "scale_embed",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
+                    elif local_name.startswith((
+                        "pre_norm_p",
+                        "norm.",
+                        "norm_",
+                    )) or local_name == "norm":
+                        # CS²GA norm layers get elevated LR (5×) so they
+                        # adapt at the same rate as the attention projections.
+                        sgb_roles[id(param)] = "sgb_norm_group"
                     else:
                         sgb_roles[id(param)] = "norm_bias"
             elif cls_name in {"RTDETRDecoderSGB", "RTDETRDecoderV2"}:
@@ -759,7 +778,7 @@ class CustomDetectionTrainer(DetectionTrainer):
 
         # ── Partition parameters ──────────────────────────────────────────
         pg_base, pg_sgb_sparse, pg_sgb_gamma = [], [], []
-        pg_norm_bias, pg_decoder = [], []
+        pg_sgb_norm_group, pg_norm_bias, pg_decoder = [], [], []
         assigned: set[int] = set()
 
         for n, p in model.named_parameters():
@@ -774,6 +793,10 @@ class CustomDetectionTrainer(DetectionTrainer):
                 continue
             if role == "sgb_sparse":
                 pg_sgb_sparse.append(p)
+                assigned.add(pid)
+                continue
+            if role == "sgb_norm_group":
+                pg_sgb_norm_group.append(p)
                 assigned.add(pid)
                 continue
             if role == "norm_bias":
@@ -796,14 +819,34 @@ class CustomDetectionTrainer(DetectionTrainer):
             pg_base.append(p)
             assigned.add(pid)
 
+        # ── Apply training-profile LR overrides ───────────────────────────
+        _default_lr_mults = {
+            'base':           1.0,
+            'sgb_sparse':     10.0,
+            'sgb_gamma':      20.0,
+            'sgb_norm_group':  5.0,
+            'norm_bias':       1.0,
+            'decoder':         1.5,
+        }
+        if self._training_profile_dict:
+            _profile_lr_overrides = self._training_profile_dict.get('lr_group_overrides', {})
+            _default_lr_mults.update(_profile_lr_overrides)
+            if self.job_id and _profile_lr_overrides:
+                job_storage.append_job_log(
+                    self.job_id, 'INFO',
+                    f'Training profile LR overrides applied: {_profile_lr_overrides}',
+                )
+
         groups = []
-        for name, params, lr_mult, use_wd in [
-            ('base',       pg_base,       1.0, True),
-            ('sgb_sparse', pg_sgb_sparse, 2.0, True),
-            ('sgb_gamma',  pg_sgb_gamma,  5.0, False),
-            ('norm_bias',  pg_norm_bias,  1.0, False),
-            ('decoder',    pg_decoder,    1.5, True),
+        for name, params, use_wd in [
+            ('base',           pg_base,           True),
+            ('sgb_sparse',     pg_sgb_sparse,     True),
+            ('sgb_gamma',      pg_sgb_gamma,      False),
+            ('sgb_norm_group', pg_sgb_norm_group, False),
+            ('norm_bias',      pg_norm_bias,      False),
+            ('decoder',        pg_decoder,        True),
         ]:
+            lr_mult = _default_lr_mults.get(name, 1.0)
             if not params:
                 continue
             g = {
@@ -921,6 +964,9 @@ class CustomDetectionTrainer(DetectionTrainer):
         finally:
             done.set()
 
+        # ── Apply training profile freeze (after model is fully built) ────
+        self._apply_training_profile_freeze()
+
         # Auto-disable removed - AMP enabled by default for HSG-DETR
         self._disable_deterministic_for_hsg_detr()
         self._lower_amp_initial_scale_for_hsg_detr()
@@ -930,6 +976,72 @@ class CustomDetectionTrainer(DetectionTrainer):
             "INFO",
         )
         return result
+
+    def _apply_training_profile_freeze(self) -> None:
+        """Freeze / unfreeze model parameters according to the active training profile.
+
+        Called once after ``_setup_train`` completes so the model's full
+        parameter tree is available.  If no profile is set or the profile has
+        no freeze rules this is a no-op.
+        """
+        if not self._training_profile_dict:
+            return
+
+        freeze_prefixes   = self._training_profile_dict.get('freeze_param_prefixes', [])
+        freeze_modules    = self._training_profile_dict.get('freeze_module_names', [])
+        unfreeze_prefixes = self._training_profile_dict.get('unfreeze_param_prefixes', [])
+        profile_name      = self._training_profile_dict.get('display_name', '?')
+
+        if not freeze_prefixes and not freeze_modules:
+            return  # profile has no freeze rules
+
+        model = unwrap_model(self.model)
+
+        # Collect unfreeze ids first (highest priority)
+        unfreeze_ids: set[int] = set()
+        for pfx in unfreeze_prefixes:
+            for n, p in model.named_parameters():
+                if n.startswith(pfx):
+                    unfreeze_ids.add(id(p))
+
+        # Collect ids to freeze via module class names
+        freeze_ids: set[int] = set()
+        if freeze_modules:
+            module_set = set(freeze_modules)
+            for module in model.modules():
+                if module.__class__.__name__ in module_set:
+                    for p in module.parameters():
+                        freeze_ids.add(id(p))
+
+        # Collect ids to freeze via param name prefixes
+        for pfx in freeze_prefixes:
+            for n, p in model.named_parameters():
+                if n.startswith(pfx):
+                    freeze_ids.add(id(p))
+
+        frozen = trainable = 0
+        for p in model.parameters():
+            pid = id(p)
+            if pid in freeze_ids and pid not in unfreeze_ids:
+                p.requires_grad_(False)
+                frozen += 1
+            else:
+                p.requires_grad_(True)
+                trainable += 1
+
+        self.log(
+            f"Training profile '{profile_name}': "
+            f"{frozen} params frozen, {trainable} params trainable.",
+            "INFO",
+        )
+        if self.job_id:
+            job_storage.append_job_log(
+                self.job_id, 'INFO',
+                f"Training profile freeze applied: frozen={frozen}, trainable={trainable}",
+                {'type': 'training_profile_freeze',
+                 'profile': profile_name,
+                 'frozen': frozen, 'trainable': trainable},
+            )
 
     def _disable_deterministic_for_hsg_detr(self) -> None:
         """Avoid deterministic CUDA paths that RT-DETR/HSG-DETR cannot fully support."""

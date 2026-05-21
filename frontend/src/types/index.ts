@@ -252,12 +252,27 @@ export interface ArchScale {
   plugin_name: string; // "mamba_yolo_t"
 }
 
+export interface TrainingProfile {
+  name: string;                        // "full", "attention_only"
+  display_name: string;                // "Full Training"
+  description: string;
+  is_default: boolean;
+  badge_color: 'blue' | 'green' | 'orange' | 'red' | 'purple' | 'gray';
+  freeze_module_names: string[];
+  freeze_param_prefixes: string[];
+  unfreeze_param_prefixes: string[];
+  lr_group_overrides: Record<string, number>;
+  config_overrides: Record<string, unknown>;
+  tags: string[];
+}
+
 export interface ArchFamily {
   family: string;            // "mamba_yolo", "rtdetr", "hsg_det"
   display_name: string;      // "Mamba-YOLO", "RT-DETR"
   task_type: string;
   description: string;
   supported_scales: ArchScale[];
+  training_profiles?: TrainingProfile[];  // populated on demand via API
 }
 
 export interface JobRecord {
@@ -326,6 +341,7 @@ export interface TrainRequest {
   model_scale?: string;  // Model scale (n, s, m, l, x)
   config: Partial<TrainConfig>;
   partitions?: PartitionSplitConfig[];  // Partition split configuration
+  training_profile?: string;            // Named training profile key
 }
 
 // ─── Datasets ────────────────────────────────────────────────────────────────

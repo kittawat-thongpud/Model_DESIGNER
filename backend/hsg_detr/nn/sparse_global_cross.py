@@ -8,10 +8,14 @@ with LayerScale residuals.
 
 Residual design — LayerScale (DeiT/CaiT pattern):
     out = input + layer_scale * delta
-    layer_scale: per-channel Parameter(C, 1, 1), init=1e-4
-    Starts near-identity, grows freely with no sigmoid saturation.
-    Fixes the chicken-and-egg collapse observed with sigmoid gates where
-    gate → 0 because delta is noisy early → gradient stops → delta never learns.
+    layer_scale: per-channel Parameter(C, 1, 1), init=0.1
+    Starts at 10% contribution so attention receives meaningful gradients
+    from epoch 1. Grows freely without sigmoid saturation.
+    Note: original DeiT uses 1e-4 for pure-transformer stability, but YOLO+CS²GA
+    has a strong FPN residual path — 1e-4 starves attention of gradient entirely.
+
+    delta_norm removed: GroupNorm on delta was suppressing delta magnitude even as
+    gradients tried to grow it. tanh clamp (±6) still prevents explosion.
 
 AMP-safe: all numerically sensitive operations run inside _fp32_context
 (autocast disabled), matching the pattern in sparse_global_token.py.
@@ -85,7 +89,7 @@ class CrossScaleSGA(nn.Module):
         ratio_p3: float = 0.05,
         ratio_p4: float = 0.10,
         ratio_p5: float = 0.25,
-        ls_init: float = 1e-4,
+        ls_init: float = 0.1,
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
         attn_scale_mult: float = 8.0,
@@ -160,14 +164,9 @@ class CrossScaleSGA(nn.Module):
         self.pre_norm_p4 = _make_gn(self.c1[1])
         self.pre_norm_p5 = _make_gn(self.c1[2])
 
-        # Delta norms (after out_proj)
-        self.delta_norm_p3 = _make_gn(self.c1[0])
-        self.delta_norm_p4 = _make_gn(self.c1[1])
-        self.delta_norm_p5 = _make_gn(self.c1[2])
-
-        # LayerScale — per-channel (C, 1, 1), init=ls_init ≈ 1e-4
-        # Grows freely without sigmoid saturation. Gradient flows proportionally
-        # to ls value itself — small but non-zero from epoch 1.
+        # LayerScale — per-channel (C, 1, 1), init=ls_init (default 0.1)
+        # Attention contributes ~10% from epoch 1, grows freely from there.
+        # 1e-4 (DeiT default) starves gradient in YOLO+FPN context — use 0.1.
         self.ls_p3 = nn.Parameter(torch.full((self.c1[0], 1, 1), ls_init))
         self.ls_p4 = nn.Parameter(torch.full((self.c1[1], 1, 1), ls_init))
         self.ls_p5 = nn.Parameter(torch.full((self.c1[2], 1, 1), ls_init))
@@ -302,7 +301,7 @@ class CrossScaleSGA(nn.Module):
             p4_mask = self._scatter_mask(p4_idx, B, H4, W4)
             p5_mask = self._scatter_mask(p5_idx, B, H5, W5)
 
-            # tanh clamp before out_proj
+            # tanh clamp before out_proj — prevents explosion without capping gradient
             p3_delta = 6.0 * torch.tanh(p3_delta / 6.0)
             p4_delta = 6.0 * torch.tanh(p4_delta / 6.0)
             p5_delta = 6.0 * torch.tanh(p5_delta / 6.0)
@@ -312,12 +311,10 @@ class CrossScaleSGA(nn.Module):
             p4_delta = F.conv2d(p4_delta, self.out_proj_p4.weight.float())
             p5_delta = F.conv2d(p5_delta, self.out_proj_p5.weight.float())
 
-            # delta norm
-            # GroupNorm can turn zero canvas locations non-zero; mask again so
-            # the sparse branch remains sparse by contract.
-            p3_delta = self._gn_fp32(p3_delta, self.delta_norm_p3) * p3_mask
-            p4_delta = self._gn_fp32(p4_delta, self.delta_norm_p4) * p4_mask
-            p5_delta = self._gn_fp32(p5_delta, self.delta_norm_p5) * p5_mask
+            # Re-apply sparse mask (no delta_norm — removed to let delta grow freely)
+            p3_delta = p3_delta * p3_mask
+            p4_delta = p4_delta * p4_mask
+            p5_delta = p5_delta * p5_mask
 
             # LayerScale residual: out = input + ls * delta
             # ls_p* shape (C, 1, 1) broadcasts over (B, C, H, W)

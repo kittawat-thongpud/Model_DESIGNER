@@ -24,6 +24,7 @@ import {
   Crosshair,
   Cpu,
   Timer,
+  Eye,
 } from 'lucide-react';
 import { EpochMetrics } from '../types';
 
@@ -438,6 +439,146 @@ const JobCharts: React.FC<JobChartsProps> = ({ history, isDetection, isSelfSuper
           </div>
         </div>
       )}
+
+      {/* SECTION 6: CS²GA DEBUG METRICS (conditional) */}
+      {history.some(h => (h.hsg_detr as any)?.['cs2ga/0/ls_p3'] != null) && (() => {
+        const cs2gaHistory = history.map(h => {
+          const d = (h.hsg_detr || {}) as Record<string, number>;
+          return {
+            epoch: h.epoch,
+            ls_p3: d['cs2ga/0/ls_p3'],
+            ls_p4: d['cs2ga/0/ls_p4'],
+            ls_p5: d['cs2ga/0/ls_p5'],
+            delta_p3: d['cs2ga/0/delta_abs_p3'],
+            delta_p4: d['cs2ga/0/delta_abs_p4'],
+            delta_p5: d['cs2ga/0/delta_abs_p5'],
+            attn_cross: d['cs2ga/0/attn_cross_frac'],
+            attn_within: d['cs2ga/0/attn_within_frac'],
+            attn_entropy: d['cs2ga/0/attn_entropy'],
+            grad_backbone: d['grad/backbone_norm'],
+            grad_neck: d['grad/neck_norm'],
+            grad_sgb: d['grad/sgb_norm'],
+            grad_sgb_sparse: d['grad/sgb_sparse_norm'],
+            grad_sgb_gamma: d['grad/sgb_gamma_norm'],
+          };
+        }).filter(h => h.ls_p3 != null);
+        const latestCs2ga = cs2gaHistory[cs2gaHistory.length - 1];
+        return (
+          <div>
+            <h3 className="text-white font-semibold flex items-center gap-2 mb-4">
+              <Eye size={18} className="text-violet-400" /> CS²GA Attention Debug
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+
+              {/* LayerScale */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-slate-400 uppercase">LayerScale (ls_p*)</span>
+                  <span className="text-xs text-violet-400 font-mono">
+                    p3:{latestCs2ga?.ls_p3?.toFixed(3)} p4:{latestCs2ga?.ls_p4?.toFixed(3)} p5:{latestCs2ga?.ls_p5?.toFixed(3)}
+                  </span>
+                </div>
+                <div className="h-[120px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={cs2gaHistory} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                      <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 9}} minTickGap={20} />
+                      <YAxis stroke="#475569" tick={{fontSize: 9}} width={40} tickFormatter={v => v.toFixed(3)} domain={[0, 'auto']} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                      <Line type="monotone" dataKey="ls_p3" name="ls_p3" stroke="#a78bfa" strokeWidth={1.5} dot={false} />
+                      <Line type="monotone" dataKey="ls_p4" name="ls_p4" stroke="#7c3aed" strokeWidth={1.5} dot={false} />
+                      <Line type="monotone" dataKey="ls_p5" name="ls_p5" stroke="#5b21b6" strokeWidth={1.5} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">Should grow over epochs if attention is useful</p>
+              </div>
+
+              {/* Delta abs */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-slate-400 uppercase">Delta Magnitude (ls × Δ)</span>
+                  <span className="text-xs text-cyan-400 font-mono">
+                    p5:{((latestCs2ga?.ls_p5 ?? 0) * (latestCs2ga?.delta_p5 ?? 0)).toExponential(2)}
+                  </span>
+                </div>
+                <div className="h-[120px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={cs2gaHistory} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                      <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 9}} minTickGap={20} />
+                      <YAxis stroke="#475569" tick={{fontSize: 9}} width={45} tickFormatter={v => v.toExponential(1)} domain={[0, 'auto']} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                      <Line type="monotone" dataKey="delta_p3" name="Δ_p3" stroke="#22d3ee" strokeWidth={1.5} dot={false} />
+                      <Line type="monotone" dataKey="delta_p4" name="Δ_p4" stroke="#0891b2" strokeWidth={1.5} dot={false} />
+                      <Line type="monotone" dataKey="delta_p5" name="Δ_p5" stroke="#164e63" strokeWidth={1.5} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">Should grow as attention contributes more</p>
+              </div>
+
+              {/* Cross-scale attention fraction */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-slate-400 uppercase">Attention Mix</span>
+                  <span className="text-xs text-emerald-400 font-mono">
+                    cross: {(latestCs2ga?.attn_cross != null ? (latestCs2ga.attn_cross * 100).toFixed(1) : '—')}%
+                  </span>
+                </div>
+                <div className="h-[120px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={cs2gaHistory} margin={{ top: 5, right: 5, left: 0, bottom: 0 }} stackOffset="expand">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                      <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 9}} minTickGap={20} />
+                      <YAxis stroke="#475569" tick={{fontSize: 9}} width={30} tickFormatter={v => `${(v*100).toFixed(0)}%`} domain={[0, 1]} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend iconType="square" wrapperStyle={{fontSize: '10px'}} />
+                      <Area type="monotone" dataKey="attn_cross" name="Cross-scale" stackId="1" stroke="#10b981" fill="#10b981" fillOpacity={0.4} />
+                      <Area type="monotone" dataKey="attn_within" name="Within-scale" stackId="1" stroke="#6b7280" fill="#6b7280" fillOpacity={0.3} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">Cross &gt; 50% = healthy mixing. If drops below 40% = collapse</p>
+              </div>
+
+              {/* Gradient norms comparison */}
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 md:col-span-2 xl:col-span-3">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs font-bold text-slate-400 uppercase">Gradient Norms — Backbone vs Neck vs CS²GA</span>
+                  <span className="text-xs text-slate-500 font-mono">
+                    ratio sgb/backbone: {latestCs2ga?.grad_backbone && latestCs2ga?.grad_sgb
+                      ? (latestCs2ga.grad_sgb / latestCs2ga.grad_backbone).toFixed(3)
+                      : '—'}×
+                  </span>
+                </div>
+                <div className="h-[160px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={cs2gaHistory} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} opacity={0.5} />
+                      <XAxis dataKey="epoch" stroke="#475569" tick={{fontSize: 9}} minTickGap={20} />
+                      <YAxis stroke="#475569" tick={{fontSize: 9}} width={40} tickFormatter={v => v.toFixed(3)} domain={[0, 'auto']} />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                      <Line type="monotone" dataKey="grad_backbone" name="Backbone" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="grad_neck" name="Neck" stroke="#3b82f6" strokeWidth={1.5} dot={false} />
+                      <Line type="monotone" dataKey="grad_sgb" name="CS²GA (total)" stroke="#a78bfa" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="grad_sgb_sparse" name="CS²GA proj" stroke="#7c3aed" strokeWidth={1} strokeDasharray="3 3" dot={false} />
+                      <Line type="monotone" dataKey="grad_sgb_gamma" name="CS²GA ls" stroke="#ec4899" strokeWidth={1} strokeDasharray="3 3" dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  Goal: CS²GA gradient should grow to be within 5× of neck (not 50×). After LR fix expect ratio to increase.
+                </p>
+              </div>
+
+            </div>
+          </div>
+        );
+      })()}
 
       {/* SECTION 5: INFERENCE LATENCY (conditional — only when data exists) */}
       {history.some(h => h.inference_latency_ms != null) && (

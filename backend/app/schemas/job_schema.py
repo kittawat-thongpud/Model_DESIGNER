@@ -305,6 +305,7 @@ class TrainRequest(BaseModel):
     model_scale: str | None = None  # Scale char: n, s, m, l, x
     config: TrainConfig = Field(default_factory=TrainConfig)
     partitions: list[PartitionSplitConfig] = Field(default_factory=list)  # Partition split configuration
+    training_profile: str | None = None  # Named training profile key (e.g. "full", "attention_only")
 
 
 class JobLogEntry(BaseModel):

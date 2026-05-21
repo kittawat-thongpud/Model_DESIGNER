@@ -25,6 +25,24 @@ def list_arch_plugins():
     return arch_families()
 
 
+@router.get("/archs/{plugin_name}/profiles")
+def get_arch_training_profiles(plugin_name: str):
+    """Return the named training profiles registered by an arch plugin.
+
+    ``plugin_name`` is the concrete plugin name (e.g. ``yolo26_cs2ga_n``) or
+    the family key (e.g. ``yolo26_cs2ga``).  If the plugin has no profiles an
+    empty list is returned — the caller should fall back to standard training.
+    """
+    from ..plugins.loader import resolve_arch_plugin, discover_plugins
+    discover_plugins()
+    plugin = resolve_arch_plugin(plugin_name)
+    if plugin is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"Arch plugin not found: {plugin_name!r}")
+    profiles = plugin.get_training_profiles()
+    return [p.to_dict() for p in profiles]
+
+
 # ── MambaYOLO selective_scan ──────────────────────────────────────────────────
 
 @router.get("/mamba_yolo/install-status")

@@ -182,7 +182,8 @@ def _launch_thread(job_id: str, job: dict) -> None:
         args=(job_id, yaml_path, job.get("task", str(_MODEL_DEFAULTS.get("task", "detect"))),
               dict(job.get("config", {})),
               job.get("partition_configs") or [],
-              job.get("model_scale")),
+              job.get("model_scale"),
+              job.get("training_profile") or None),
         daemon=False,
     )
     with _lock:
@@ -215,6 +216,7 @@ def _start_training_subprocess(
     config: dict[str, Any],
     partition_configs: list[dict[str, Any]] | None,
     model_scale: str | None,
+    training_profile: str | None = None,
 ) -> subprocess.Popen:
     """Start the real trainer in a separate Python process.
 
@@ -231,6 +233,7 @@ def _start_training_subprocess(
         "config": config,
         "partition_configs": partition_configs or [],
         "model_scale": model_scale,
+        "training_profile": training_profile,
     }
     args_path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -448,6 +451,7 @@ def _training_process_supervisor(
     config: dict[str, Any],
     partition_configs: list[dict[str, Any]] | None = None,
     model_scale: str | None = None,
+    training_profile: str | None = None,
 ) -> None:
     """Parent-side supervisor for the isolated training subprocess."""
     proc: subprocess.Popen | None = None
@@ -457,7 +461,10 @@ def _training_process_supervisor(
         while True:
             # Kill orphaned DataLoader workers and log available VRAM before each attempt
             _gpu_pre_training_cleanup(job_id)
-            proc = _start_training_subprocess(job_id, yaml_path, task, config, partition_configs, model_scale)
+            proc = _start_training_subprocess(
+                job_id, yaml_path, task, config, partition_configs, model_scale,
+                training_profile=training_profile,
+            )
             with _lock:
                 info = _active_jobs.get(job_id)
                 if info is not None:
@@ -757,6 +764,7 @@ def start_training(
     config: dict[str, Any],
     partition_configs: list[dict[str, Any]] | None = None,
     model_scale: str | None = None,
+    training_profile: str | None = None,
 ) -> str:
     """Start an Ultralytics training job in a background thread.
 
@@ -814,6 +822,7 @@ def start_training(
         "dataset_name": _dataset_name,
         "partition_configs": partition_configs,
         "model_scale": model_scale,
+        "training_profile": training_profile,  # named training profile key
         "queue_task_id": queue_task_id,  # link to SQLite queue entry
         "status": "pending",
         "epoch": 0,
@@ -836,7 +845,8 @@ def start_training(
             _active_jobs[job_id] = _active_entry()
         t = threading.Thread(
             target=_training_process_supervisor,
-            args=(job_id, yaml_path, task, config, partition_configs, model_scale),
+            args=(job_id, yaml_path, task, config, partition_configs, model_scale,
+                  training_profile),
             daemon=False,
         )
         with _lock:
@@ -1006,9 +1016,12 @@ def _restart_job(job_id: str, config: dict) -> None:
     if admitted:
         with _lock:
             _active_jobs[job_id] = _active_entry()
+        # Preserve the training profile from the original job
+        _profile_for_restart = job.get("training_profile") or None
         t = threading.Thread(
             target=_training_process_supervisor,
-            args=(job_id, yaml_arg, task_arg, config, partition_configs_arg, model_scale_arg),
+            args=(job_id, yaml_arg, task_arg, config, partition_configs_arg, model_scale_arg,
+                  _profile_for_restart),
             daemon=False,
         )
         with _lock:
@@ -1447,6 +1460,7 @@ def _training_worker(
     config: dict,
     partition_configs: list[dict],
     model_scale: float,
+    training_profile: str | None = None,
 ) -> None:
     """Training worker with enhanced error handling and cleanup."""
     import os
@@ -1628,6 +1642,42 @@ def _training_worker(
                 plugin_defaults = {}
                 if hasattr(arch_plugin, 'get_config_options'):
                     plugin_defaults = arch_plugin.get_config_options()
+
+                # ── Training profile: apply config_overrides (if any) ───────
+                # Profile config_overrides are injected AFTER plugin_defaults and
+                # BEFORE user config, so the user can still override individual
+                # keys via the UI sliders even when a profile is active.
+                resolved_profile = None
+                if training_profile:
+                    profiles = arch_plugin.get_training_profiles()
+                    resolved_profile = next(
+                        (p for p in profiles if p.name == training_profile), None
+                    )
+                    if resolved_profile is None:
+                        job_storage.append_job_log(
+                            job_id, "WARNING",
+                            f"Training profile '{training_profile}' not found in plugin "
+                            f"'{arch_plugin.name}'. Available: "
+                            f"{[p.name for p in profiles]}. Ignoring profile.",
+                        )
+                    else:
+                        job_storage.append_job_log(
+                            job_id, "INFO",
+                            f"Training profile '{resolved_profile.display_name}' active — "
+                            f"config_overrides={resolved_profile.config_overrides}, "
+                            f"lr_group_overrides={resolved_profile.lr_group_overrides}, "
+                            f"freeze_param_prefixes={resolved_profile.freeze_param_prefixes}",
+                        )
+                        # Apply profile's config_overrides into config
+                        # (user values from UI are already in config; we only
+                        # inject profile overrides for keys the user has not set)
+                        for k, v in resolved_profile.config_overrides.items():
+                            if k not in config:
+                                config[k] = v
+
+                # Inject resolved profile into config so custom_trainer can access it
+                if resolved_profile is not None:
+                    config["_training_profile"] = resolved_profile.to_dict()
 
                 # Extract enable_deep_metrics from plugin defaults for all custom arch plugins
                 if "enable_deep_metrics" not in config and "enable_deep_metrics" in plugin_defaults:
@@ -2160,6 +2210,9 @@ def _training_worker(
             'enable_gt_metrics': config.pop('enable_gt_metrics', False),
             'enable_dam_metrics': config.pop('enable_dam_metrics', False),
             'enable_deep_metrics': config.pop('enable_deep_metrics', False),
+            # Training profile (serialised dict) — used by CustomDetectionTrainer
+            # to apply freeze and LR group overrides without re-importing the plugin.
+            '_training_profile': config.pop('_training_profile', None),
         }
 
         # ── Pop Model Designer fields that are NOT valid Ultralytics kwargs ───
@@ -3795,6 +3848,7 @@ def _run_worker_from_args_file(args_path: str) -> int:
         dict(payload.get("config") or {}),
         list(payload.get("partition_configs") or []),
         payload.get("model_scale"),
+        training_profile=payload.get("training_profile") or None,
     )
     return 0
 

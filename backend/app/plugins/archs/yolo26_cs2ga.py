@@ -20,6 +20,7 @@ import torch
 
 from ..base import ModelArchPlugin
 from ..loader import register_arch
+from ..training_profile import TrainingProfile
 
 
 _CONFIGS_DIR = Path(__file__).resolve().parents[3] / "hsg_detr" / "configs"
@@ -131,6 +132,96 @@ class YOLO26CS2GAPlugin(ModelArchPlugin):
             "bgr": 0.106,
             "close_mosaic": 10,
         }
+
+    # ------------------------------------------------------------------ #
+
+    def get_training_profiles(self) -> list[TrainingProfile]:
+        """Named training profiles for YOLO26-CS²GA.
+
+        Profile descriptions
+        --------------------
+        full (default)
+            Standard end-to-end training with all layers unfrozen.
+            Uses the official YOLO26-N recipe + elevated CS²GA LR groups
+            (10-20× base) to compensate for backbone-gradient dominance.
+
+        attention_only
+            Freeze YOLO26 backbone + neck (layers 0-22); train ONLY the
+            CS²GA block (layer 23) and the Detect head (layer 24).
+            This isolates the CS²GA contribution: any mAP delta from a
+            run with this profile is attributable exclusively to CS²GA.
+            Useful as a first phase before joint fine-tuning.
+
+        joint_finetune
+            All layers unfrozen, but backbone/neck get 0.2× LR while
+            CS²GA projections get 15× LR.  Allows gradual backbone
+            adaptation while letting CS²GA drive the gradient.  Ideal
+            as a second phase after attention_only.
+        """
+        # Backbone + neck layers in the YAML are indices 0-22.
+        # Ultralytics stores them as model.{i}.* in state_dict / named_parameters.
+        backbone_neck_prefixes = [f"model.model.{i}." for i in range(23)]
+
+        return [
+            TrainingProfile(
+                name="full",
+                display_name="Full Training",
+                description=(
+                    "Train all layers end-to-end with the official YOLO26-N recipe. "
+                    "CS²GA projections and LayerScale params get 10-20× elevated LR to "
+                    "compensate for backbone gradient dominance."
+                ),
+                is_default=True,
+                badge_color="blue",
+                tags=["all layers", "recommended"],
+            ),
+            TrainingProfile(
+                name="attention_only",
+                display_name="Attention-Only",
+                description=(
+                    "Freeze the YOLO26 backbone and neck (layers 0-22); train only the "
+                    "CS²GA attention block (layer 23) and the Detect head (layer 24). "
+                    "Use this to isolate the CS²GA contribution — any mAP gain comes "
+                    "exclusively from the attention mechanism."
+                ),
+                is_default=False,
+                badge_color="orange",
+                freeze_param_prefixes=backbone_neck_prefixes,
+                unfreeze_param_prefixes=["model.model.23.", "model.model.24."],
+                lr_group_overrides={
+                    "sgb_sparse":     15.0,   # CS²GA projections
+                    "sgb_gamma":      25.0,   # LayerScale params
+                    "sgb_norm_group": 8.0,    # CS²GA pre_norm layers
+                },
+                config_overrides={
+                    "lr0": 0.001,            # lower base LR — backbone frozen, CS²GA drives
+                    "lrf": 0.05,
+                    "warmup_epochs": 0.5,    # shorter warmup when backbone is fixed
+                    "epochs": 50,            # shorter run — only attention block trains
+                },
+                tags=["freeze backbone", "attention isolation", "fast"],
+            ),
+            TrainingProfile(
+                name="joint_finetune",
+                display_name="Joint Fine-Tune",
+                description=(
+                    "All layers unfrozen. Backbone/neck get 0.2× LR to adapt slowly "
+                    "while CS²GA projections get 15× LR to drive the gradient. "
+                    "Use this as phase-2 after an attention_only run, or as the main "
+                    "training mode when you want both backbone and attention to co-adapt."
+                ),
+                is_default=False,
+                badge_color="green",
+                lr_group_overrides={
+                    "base":           0.2,    # slow backbone adaptation
+                    "sgb_sparse":     15.0,   # CS²GA projections lead
+                    "sgb_gamma":      25.0,   # LayerScale
+                    "sgb_norm_group": 8.0,    # CS²GA norms
+                    "norm_bias":      0.5,    # backbone norms — slightly slower
+                },
+                tags=["co-adapt", "phase 2"],
+            ),
+        ]
 
     # ------------------------------------------------------------------ #
 

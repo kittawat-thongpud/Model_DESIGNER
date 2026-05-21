@@ -14,7 +14,7 @@ import type {
   LogEntry, DashboardStats,
   InferenceResult, InferenceHistoryEntry, InferResult,
   BenchmarkResult, JobCheckpoint,
-  ArchFamily,
+  ArchFamily, TrainingProfile,
 } from '../types';
 
 const API = '';
@@ -78,6 +78,7 @@ export const api = {
 
   // ── Arch Plugins ───────────────────────────────────────────────────────
   listArchPlugins: () => get<ArchFamily[]>('/api/plugins/archs'),
+  getArchTrainingProfiles: (pluginName: string) => get<TrainingProfile[]>(`/api/plugins/archs/${pluginName}/profiles`),
   getMambaInstallStatus: () => get<{ ok: boolean; status: string; started_at: string | null; finished_at: string | null; error: string | null; log_tail: string[] }>('/api/plugins/mamba_yolo/install-status'),
   triggerMambaInstall: () => post<{ ok: boolean; status: string; message: string }>('/api/plugins/mamba_yolo/install'),
   triggerMambaRebuild: () => post<{ ok: boolean; status: string; message: string }>('/api/plugins/mamba_yolo/install?rebuild=true'),

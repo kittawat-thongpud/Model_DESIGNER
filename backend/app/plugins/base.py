@@ -277,6 +277,31 @@ class ModelArchPlugin(ABC):
         """
         return None
 
+    def get_training_profiles(self) -> "list[TrainingProfile]":  # type: ignore[name-defined]
+        """Return named training profiles for this arch plugin.
+
+        Each profile defines a self-contained training mode: which layers to
+        freeze, per-group LR multiplier overrides, and hyperparameter overrides.
+        The user selects a profile in the UI before starting a job.
+
+        If the list is empty (default) the trainer falls back to standard
+        Ultralytics behaviour — no freezing, default LR groups.
+
+        Example profiles for YOLO26-CS²GA:
+          - "full"           – standard end-to-end training (default)
+          - "attention_only" – freeze backbone/neck, train only CS²GA + head
+          - "joint_finetune" – all layers, backbone at 0.1× LR, CS²GA at 10×
+        """
+        return []
+
+    def get_default_profile(self) -> "TrainingProfile | None":  # type: ignore[name-defined]
+        """Return the default training profile, or None if no profiles are defined."""
+        profiles = self.get_training_profiles()
+        for p in profiles:
+            if p.is_default:
+                return p
+        return profiles[0] if profiles else None
+
     def warm_start(self, model, log_fn=None, model_scale: str | None = None) -> dict:
         """Optional: transfer pretrained weights into model before training.
 

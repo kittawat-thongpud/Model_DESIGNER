@@ -6,7 +6,7 @@
  */
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
-import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily } from '../types';
+import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily, TrainingProfile } from '../types';
 import { Play, Settings, Loader2, Search, Layers, X, Download, CheckCircle2 } from 'lucide-react';
 
 interface Props {
@@ -207,6 +207,11 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
   // YOLOv8 backbone warm-start selector (for custom/arch models only)
   const [yolov8Backbone, setYolov8Backbone] = useState<string>('');  // '' = disabled, 'yolov8n' etc = enabled
 
+  // Training profile selector (arch plugins only)
+  const [trainingProfiles, setTrainingProfiles] = useState<TrainingProfile[]>([]);
+  const [selectedProfileName, setSelectedProfileName] = useState<string | null>(null);
+  const [profilesLoading, setProfilesLoading] = useState(false);
+
   // ── selective_scan install polling ────────────────────────────────────────
   const isMambaSelected = selectedModelId?.startsWith('arch:') && selectedModelId?.includes('mamba');
 
@@ -266,6 +271,31 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       setYolov8Backbone('');
     }
   }, [selectedModelId, modelScale]);
+
+  // Fetch training profiles when an arch family + scale is selected
+  useEffect(() => {
+    if (!selectedModelId?.startsWith('arch:') || !selectedArchFamily) {
+      setTrainingProfiles([]);
+      setSelectedProfileName(null);
+      return;
+    }
+    // Build the concrete plugin name, e.g. "yolo26_cs2ga_n"
+    const familyKey = selectedModelId.replace('arch:', '');
+    const pluginName = modelScale ? `${familyKey}_${modelScale}` : familyKey;
+    setProfilesLoading(true);
+    api.getArchTrainingProfiles(pluginName)
+      .then((profiles) => {
+        setTrainingProfiles(profiles ?? []);
+        // Auto-select the default profile (or first profile)
+        const defaultProfile = profiles?.find(p => p.is_default) ?? profiles?.[0] ?? null;
+        setSelectedProfileName(defaultProfile?.name ?? null);
+      })
+      .catch(() => {
+        setTrainingProfiles([]);
+        setSelectedProfileName(null);
+      })
+      .finally(() => setProfilesLoading(false));
+  }, [selectedModelId, modelScale, selectedArchFamily]);
   
   // Derive the selected arch family (if any)
   const selectedArchFamily = selectedModelId?.startsWith('arch:')
@@ -401,6 +431,7 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
         model_scale: modelScale,
         config: finalConfig,
         partitions: partitionConfigs,
+        training_profile: selectedProfileName ?? undefined,
       });
       onJobCreated(res.job_id);
       onClose();
@@ -412,6 +443,8 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
       setSearchQuery('');
       setPartitionSplitConfig({});
       setYolov8Backbone('');
+      setTrainingProfiles([]);
+      setSelectedProfileName(null);
     } catch (err: any) {
       setStartError(err?.message || String(err));
     } finally {
@@ -835,6 +868,82 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
                                 </div>
                               </label>
                             </div>
+                          </div>
+                        )}
+
+                        {/* Training Profile Selector (arch plugins with registered profiles) */}
+                        {selectedModelId?.startsWith('arch:') && (trainingProfiles.length > 0 || profilesLoading) && (
+                          <div className="col-span-2">
+                            <div className="flex items-center gap-2 mb-2">
+                              <label className="text-xs font-medium text-violet-400">Training Profile</label>
+                              {profilesLoading && <Loader2 className="w-3 h-3 animate-spin text-slate-400" />}
+                            </div>
+                            {!profilesLoading && trainingProfiles.length > 0 && (
+                              <div className="space-y-2">
+                                {trainingProfiles.map(profile => {
+                                  const badgeColors: Record<string, string> = {
+                                    blue:   'bg-blue-500/20 border-blue-500/40 text-blue-300',
+                                    green:  'bg-emerald-500/20 border-emerald-500/40 text-emerald-300',
+                                    orange: 'bg-amber-500/20 border-amber-500/40 text-amber-300',
+                                    red:    'bg-red-500/20 border-red-500/40 text-red-300',
+                                    purple: 'bg-violet-500/20 border-violet-500/40 text-violet-300',
+                                    gray:   'bg-slate-500/20 border-slate-500/40 text-slate-300',
+                                  };
+                                  const isSelected = selectedProfileName === profile.name;
+                                  return (
+                                    <label
+                                      key={profile.name}
+                                      className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-all border-2 ${
+                                        isSelected
+                                          ? 'bg-violet-500/10 border-violet-500/50 shadow-[0_0_10px_rgba(139,92,246,0.1)]'
+                                          : 'bg-slate-800/50 border-slate-700 hover:border-slate-600'
+                                      }`}
+                                    >
+                                      <input
+                                        type="radio"
+                                        name="training_profile"
+                                        checked={isSelected}
+                                        onChange={() => setSelectedProfileName(profile.name)}
+                                        className="w-4 h-4 mt-0.5 text-violet-500 focus:ring-violet-500 flex-shrink-0"
+                                      />
+                                      <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                          <span className="text-sm font-medium text-white">{profile.display_name}</span>
+                                          {profile.is_default && (
+                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/60 text-slate-300 border border-slate-500/30">
+                                              default
+                                            </span>
+                                          )}
+                                          {profile.tags.map(tag => (
+                                            <span
+                                              key={tag}
+                                              className={`text-[10px] px-1.5 py-0.5 rounded border ${badgeColors[profile.badge_color] ?? badgeColors.blue}`}
+                                            >
+                                              {tag}
+                                            </span>
+                                          ))}
+                                        </div>
+                                        <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">{profile.description}</p>
+                                        {isSelected && Object.keys(profile.lr_group_overrides).length > 0 && (
+                                          <div className="mt-1.5 flex flex-wrap gap-1">
+                                            {Object.entries(profile.lr_group_overrides).map(([group, mult]) => (
+                                              <span key={group} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-300 border border-slate-600/40">
+                                                {group}: {mult}×
+                                              </span>
+                                            ))}
+                                          </div>
+                                        )}
+                                        {isSelected && Object.keys(profile.config_overrides).length > 0 && (
+                                          <div className="mt-1 text-[10px] text-slate-500">
+                                            Config: {Object.entries(profile.config_overrides).map(([k, v]) => `${k}=${v}`).join(', ')}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         )}
 
