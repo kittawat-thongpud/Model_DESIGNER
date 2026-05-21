@@ -1,176 +1,307 @@
+/**
+ * JobConfiguration — dynamic training config display.
+ *
+ * Fields are grouped into Training / Optimizer / Augmentation / Inference
+ * via FIELD_GROUP_MAP. A conditional "Model Config" column surfaces
+ * arch-specific fields (training_mode, cs2ga_lr_*) from three sources:
+ *   1. Direct config keys
+ *   2. Underscore-prefixed copies (_training_mode, _cs2ga_lr_*)
+ *   3. Fallback from config._training_profile.lr_group_overrides
+ *
+ * Any config key not in FIELD_GROUP_MAP or SKIP_FIELDS is appended to
+ * the Training column so new fields are never silently dropped.
+ */
 import React, { useState } from 'react';
 import {
-  Settings,
-  ChevronDown,
-  ChevronUp,
-  Cpu,
-  Sliders,
-  Image as ImageIcon,
-  Server,
-  Layers
+  Settings, ChevronDown, ChevronUp,
+  Cpu, Sliders, Image as ImageIcon, Server, Layers,
 } from 'lucide-react';
-import { TrainConfig } from '../types';
-import { fmtDataset } from '../utils/format';
+import type { TrainConfig } from '../types';
 
-// ── Arch model field keys registered by arch plugins ──────────────────────────
-const ARCH_FIELD_KEYS = [
-  'training_mode',
-  'cs2ga_lr_sparse',
-  'cs2ga_lr_gamma',
-  'cs2ga_lr_norm',
-  'cs2ga_lr_backbone',
-] as const;
+// ── Field classification ─────────────────────────────────────────────────────
 
-const TRAINING_MODE_LABELS: Record<string, string> = {
-  full:            'Full Training',
-  attention_only:  'Attention Only',
-  joint_finetune:  'Joint Fine-Tune',
+type GroupName = 'Training' | 'Optimizer' | 'Augmentation' | 'Inference';
+
+const FIELD_GROUP_MAP: Record<string, GroupName> = {
+  // Training
+  epochs: 'Training', patience: 'Training', batch: 'Training',
+  imgsz: 'Training', workers: 'Training', cache: 'Training',
+  device: 'Training', seed: 'Training', deterministic: 'Training',
+  amp: 'Training', ema: 'Training', pin_memory: 'Training',
+  close_mosaic: 'Training', freeze: 'Training', resume: 'Training',
+  save_period: 'Training', val: 'Training', plots: 'Training',
+  rect: 'Training', single_cls: 'Training', overlap_mask: 'Training',
+  mask_ratio: 'Training', kobj: 'Training', sample_per_class: 'Training',
+  pretrained: 'Training', use_yolo_pretrained: 'Training',
+  // Optimizer & Loss
+  optimizer: 'Optimizer', lr0: 'Optimizer', lrf: 'Optimizer',
+  momentum: 'Optimizer', weight_decay: 'Optimizer',
+  warmup_epochs: 'Optimizer', warmup_momentum: 'Optimizer',
+  warmup_bias_lr: 'Optimizer', cos_lr: 'Optimizer', nbs: 'Optimizer',
+  box: 'Optimizer', cls: 'Optimizer', dfl: 'Optimizer', pose: 'Optimizer',
+  // Augmentation
+  mosaic: 'Augmentation', mixup: 'Augmentation', copy_paste: 'Augmentation',
+  erasing: 'Augmentation', crop_fraction: 'Augmentation',
+  fliplr: 'Augmentation', flipud: 'Augmentation',
+  degrees: 'Augmentation', translate: 'Augmentation', scale: 'Augmentation',
+  shear: 'Augmentation', perspective: 'Augmentation',
+  hsv_h: 'Augmentation', hsv_s: 'Augmentation', hsv_v: 'Augmentation',
+  bgr: 'Augmentation', auto_augment: 'Augmentation',
+  // Inference
+  conf: 'Inference', iou: 'Inference', max_det: 'Inference',
+  agnostic_nms: 'Inference',
 };
 
-/** Format a value for display in the Model column */
-function fmtModelField(key: string, value: unknown): string {
-  if (value === undefined || value === null) return '-';
-  if (key === 'training_mode') return TRAINING_MODE_LABELS[String(value)] ?? String(value);
-  // cs2ga_lr_* are multipliers
-  if (key.startsWith('cs2ga_lr_')) return `${Number(value).toFixed(2)} ×`;
-  return String(value);
+/** Preferred display order within each group (unlisted extras appended at end) */
+const GROUP_FIELD_ORDER: Record<GroupName, string[]> = {
+  Training: [
+    'epochs', 'patience', 'batch', 'imgsz', 'workers', 'cache', 'device',
+    'amp', 'ema', 'pin_memory', 'seed', 'deterministic',
+    'close_mosaic', 'freeze', 'resume', 'save_period',
+    'val', 'plots', 'rect', 'single_cls',
+    'overlap_mask', 'mask_ratio', 'kobj', 'sample_per_class',
+    'pretrained', 'use_yolo_pretrained',
+  ],
+  Optimizer: [
+    'optimizer', 'lr0', 'lrf', 'momentum', 'weight_decay',
+    'warmup_epochs', 'warmup_momentum', 'warmup_bias_lr', 'cos_lr', 'nbs',
+    'box', 'cls', 'dfl', 'pose',
+  ],
+  Augmentation: [
+    'mosaic', 'mixup', 'copy_paste', 'erasing', 'crop_fraction',
+    'fliplr', 'flipud', 'degrees', 'translate', 'scale',
+    'shear', 'perspective', 'hsv_h', 'hsv_s', 'hsv_v', 'bgr', 'auto_augment',
+  ],
+  Inference: ['conf', 'iou', 'max_det', 'agnostic_nms'],
+};
+
+/** Human-readable label overrides (fallback: snake_case → Title Case) */
+const LABEL_MAP: Record<string, string> = {
+  lr0: 'LR₀', lrf: 'LR Final', cos_lr: 'Cos LR', nbs: 'NBS',
+  amp: 'AMP', ema: 'EMA', iou: 'IoU', bgr: 'BGR',
+  hsv_h: 'HSV-H', hsv_s: 'HSV-S', hsv_v: 'HSV-V',
+  warmup_epochs: 'Warmup Epochs', warmup_momentum: 'Warmup Mom',
+  warmup_bias_lr: 'Warmup Bias LR', weight_decay: 'Wt Decay',
+  close_mosaic: 'Close Mosaic', save_period: 'Save Period',
+  pin_memory: 'Pin Mem', single_cls: 'Single Cls',
+  agnostic_nms: 'Agnostic NMS', copy_paste: 'Copy-Paste',
+  crop_fraction: 'Crop Frac', auto_augment: 'Auto-Aug',
+  max_det: 'Max Det', overlap_mask: 'Overlap Mask',
+  mask_ratio: 'Mask Ratio', use_yolo_pretrained: 'YOLO Pretrain',
+  sample_per_class: 'Samp/Class',
+  // Model (arch) fields
+  training_mode:     'Training Mode',
+  cs2ga_lr_sparse:   'Projection LR',
+  cs2ga_lr_gamma:    'LayerScale LR',
+  cs2ga_lr_norm:     'Norm LR',
+  cs2ga_lr_backbone: 'Backbone LR',
+};
+
+const HIGHLIGHT_FIELDS = new Set([
+  'lr0', 'lrf', 'box', 'cls', 'dfl', 'training_mode', 'cs2ga_lr_backbone',
+]);
+
+/** Fields to completely skip in regular columns (internal, metadata, or shown elsewhere) */
+const SKIP_FIELDS = new Set([
+  'data', 'class_names', 'dataset_name', 'enable_deep_metrics', 'nan_retries',
+  'model_arch', 'yolo_model', '_training_profile',
+  // Ultralytics internal
+  'cfg', 'project', 'name', 'exist_ok',
+]);
+
+const ARCH_FIELD_KEYS = [
+  'training_mode', 'cs2ga_lr_sparse', 'cs2ga_lr_gamma',
+  'cs2ga_lr_norm', 'cs2ga_lr_backbone',
+] as const;
+type ArchFieldKey = typeof ARCH_FIELD_KEYS[number];
+
+const TRAINING_MODE_LABELS: Record<string, string> = {
+  full:           'Full Training',
+  attention_only: 'Attention Only',
+  joint_finetune: 'Joint Fine-Tune',
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function toLabel(key: string): string {
+  return LABEL_MAP[key] ?? key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
+
+function formatCache(value: unknown): string {
+  if (value === true)  return 'Disk';
+  if (value === false) return 'None';
+  if (typeof value !== 'string') return '-';
+  const v = value.trim().toLowerCase();
+  return v === 'auto' ? 'Auto' : v === 'ram' ? 'RAM' : v === 'disk' ? 'Disk'
+       : (v === 'none' || v === 'off') ? 'None' : value;
+}
+
+function fmtValue(key: string, value: unknown): string {
+  if (value === undefined || value === null) return 'Auto';
+  if (key === 'cache')          return formatCache(value);
+  if (key === 'training_mode')  return TRAINING_MODE_LABELS[String(value)] ?? String(value);
+  if (key.startsWith('cs2ga_lr_')) return `${Number(value).toFixed(2)} ×`;
+  if (key === 'device')         return String(value) || 'Auto';
+  if (key === 'pretrained') {
+    const s = String(value);
+    // weight_id (short hash) or empty
+    return s.length > 20 ? s.slice(0, 18) + '…' : (s || 'None');
+  }
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number')  return Number.isInteger(value) ? String(value)
+    : parseFloat(value.toPrecision(5)).toString();
+  if (Array.isArray(value))       return value.join(', ');
+  const s = String(value);
+  return s.length > 28 ? s.slice(0, 26) + '…' : s;
+}
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 interface JobConfigurationProps {
   config: TrainConfig;
   datasetName?: string | null;
-  partitions?: Array<{partition_id: string; train: boolean; val: boolean; test: boolean; dataset_name?: string; partition_name?: string}>;
+  partitions?: Array<{
+    partition_id: string; train: boolean; val: boolean; test: boolean;
+    dataset_name?: string; partition_name?: string;
+  }>;
   modelScale?: string;
 }
 
-const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName, partitions, modelScale }) => {
+// ── Component ────────────────────────────────────────────────────────────────
+
+const JobConfiguration: React.FC<JobConfigurationProps> = ({
+  config, datasetName, modelScale,
+}) => {
   const [showConfig, setShowConfig] = useState(false);
 
-  const getValue = (key: string, defaultValue: any = '-') => {
-    return config[key] !== undefined ? config[key] : defaultValue;
+  // ── Resolve arch model fields (3-level fallback) ─────────────────────────
+  const _profile    = config['_training_profile'] as Record<string, any> | undefined;
+  const _lrOverride = _profile?.lr_group_overrides as Record<string, number> | undefined;
+
+  const resolvedArch: Record<ArchFieldKey, unknown> = {
+    training_mode:     config['training_mode']     ?? config['_training_mode']     ?? _profile?.name,
+    cs2ga_lr_sparse:   config['cs2ga_lr_sparse']   ?? config['_cs2ga_lr_sparse']   ?? _lrOverride?.['sgb_sparse'],
+    cs2ga_lr_gamma:    config['cs2ga_lr_gamma']     ?? config['_cs2ga_lr_gamma']    ?? _lrOverride?.['sgb_gamma'],
+    cs2ga_lr_norm:     config['cs2ga_lr_norm']      ?? config['_cs2ga_lr_norm']     ?? _lrOverride?.['sgb_norm_group'],
+    cs2ga_lr_backbone: config['cs2ga_lr_backbone']  ?? config['_cs2ga_lr_backbone'] ?? _lrOverride?.['base'],
   };
-
-  // Build a resolved view of arch fields:
-  // 1. Direct keys (training_mode, cs2ga_lr_*) — present before Pydantic fix
-  // 2. Underscore-prefixed keys (_training_mode, _cs2ga_lr_*) — preserved by backend after pop
-  // 3. Fallback from _training_profile for older records
-  const _profile = config['_training_profile'] as Record<string, any> | undefined;
-  const _lrOverrides = _profile?.lr_group_overrides as Record<string, number> | undefined;
-
-  const resolvedArchValues: Record<string, unknown> = {
-    training_mode:     config['training_mode']      ?? config['_training_mode']      ?? _profile?.name,
-    cs2ga_lr_sparse:   config['cs2ga_lr_sparse']    ?? config['_cs2ga_lr_sparse']    ?? _lrOverrides?.['sgb_sparse'],
-    cs2ga_lr_gamma:    config['cs2ga_lr_gamma']     ?? config['_cs2ga_lr_gamma']     ?? _lrOverrides?.['sgb_gamma'],
-    cs2ga_lr_norm:     config['cs2ga_lr_norm']      ?? config['_cs2ga_lr_norm']      ?? _lrOverrides?.['sgb_norm_group'],
-    cs2ga_lr_backbone: config['cs2ga_lr_backbone']  ?? config['_cs2ga_lr_backbone']  ?? _lrOverrides?.['base'],
-  };
-
-  // Only show arch fields that have a resolved value
-  const archFields = ARCH_FIELD_KEYS.filter(k => resolvedArchValues[k] !== undefined && resolvedArchValues[k] !== null);
+  const archFields   = ARCH_FIELD_KEYS.filter(k => resolvedArch[k] != null);
   const hasArchFields = archFields.length > 0;
-  // model_arch tells us which plugin was used (e.g. "yolo26_cs2ga_n")
-  const modelArch = config['model_arch'] as string | undefined;
+  const modelArch    = config['model_arch'] as string | undefined;
 
-  const formatCacheMode = (value: unknown) => {
-    if (value === true) return 'Disk';
-    if (value === false) return 'None';
-    if (typeof value !== 'string') return '-';
-    const normalized = value.trim().toLowerCase();
-    if (normalized === 'auto') return 'Auto';
-    if (normalized === 'ram') return 'RAM';
-    if (normalized === 'disk') return 'Disk';
-    if (normalized === 'none' || normalized === 'off') return 'None';
-    return value;
+  // ── Build dynamic groups from actual config keys ─────────────────────────
+  const grouped: Record<GroupName, string[]> = {
+    Training: [], Optimizer: [], Augmentation: [], Inference: [],
   };
+  const extraKeys: string[] = [];  // keys not in FIELD_GROUP_MAP
+
+  for (const key of Object.keys(config)) {
+    if (SKIP_FIELDS.has(key))         continue;  // metadata / internal
+    if (key.startsWith('_'))          continue;  // underscore-prefixed internal
+    if (key in resolvedArch)          continue;  // arch fields → Model column
+    const v = config[key];
+    if (v === undefined || v === null || v === '') continue;  // empty
+
+    const group = FIELD_GROUP_MAP[key];
+    if (group) {
+      grouped[group].push(key);
+    } else {
+      extraKeys.push(key);  // unknown → appended to Training
+    }
+  }
+
+  // Sort each group by preferred order; unknown keys within a group go last
+  const GROUPS: GroupName[] = ['Training', 'Optimizer', 'Augmentation', 'Inference'];
+  for (const g of GROUPS) {
+    const order = GROUP_FIELD_ORDER[g];
+    grouped[g].sort((a, b) => {
+      const ia = order.indexOf(a);
+      const ib = order.indexOf(b);
+      if (ia === -1 && ib === -1) return a.localeCompare(b);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
+  }
+  // Append truly unknown keys to Training
+  grouped['Training'].push(...extraKeys.sort());
+
+  const gridCols = hasArchFields ? 'lg:grid-cols-5' : 'lg:grid-cols-4';
 
   return (
     <div className="bg-[#0f1117] border border-slate-800 rounded-xl overflow-hidden shadow-sm mt-6">
-      <div 
+      <div
         className="px-6 py-4 flex justify-between items-center cursor-pointer bg-slate-900/50 hover:bg-slate-900 transition-colors"
         onClick={() => setShowConfig(!showConfig)}
       >
-         <h3 className="text-white font-semibold flex items-center gap-2">
-            <Settings size={18} className="text-slate-400" /> Training Configuration
-         </h3>
-         {showConfig ? <ChevronUp size={18} className="text-slate-500" /> : <ChevronDown size={18} className="text-slate-500" />}
+        <h3 className="text-white font-semibold flex items-center gap-2">
+          <Settings size={18} className="text-slate-400" /> Training Configuration
+        </h3>
+        {showConfig
+          ? <ChevronUp size={18} className="text-slate-500" />
+          : <ChevronDown size={18} className="text-slate-500" />}
       </div>
-      
+
       {showConfig && (
-        <div className={`p-6 grid grid-cols-1 md:grid-cols-2 gap-8 text-sm border-t border-slate-800 bg-[#0f1117] ${hasArchFields ? 'lg:grid-cols-5' : 'lg:grid-cols-4'}`}>
-           
-           {/* Column 1: Training Basics */}
-           <ConfigColumn title="Training" icon={<Cpu size={14} />}>
-              <ConfigItem label="Epochs" value={getValue('epochs')} />
-              <ConfigItem label="Batch Size" value={getValue('batch')} />
-              <ConfigItem label="Image Size" value={getValue('imgsz')} />
-              <ConfigItem label="Workers" value={getValue('workers')} />
-              <ConfigItem label="Dataset Cache" value={formatCacheMode(getValue('cache', '-'))} />
-              <ConfigItem label="Device" value={getValue('device') || 'Auto'} />
-              <ConfigItem label="Patience" value={getValue('patience')} />
-              <ConfigItem label="Freeze" value={getValue('freeze')} />
-              <ConfigItem label="Close Mosaic" value={getValue('close_mosaic')} />
-              <ConfigItem label="Save Period" value={getValue('save_period')} />
-              <ConfigItem label="Samples/Class" value={getValue('sample_per_class')} />
-              <ConfigItem label="Resume" value={String(getValue('resume'))} />
-              <ConfigItem label="AMP" value={String(getValue('amp'))} />
-              <ConfigItem label="Rect" value={String(getValue('rect'))} />
-              <ConfigItem label="Single Cls" value={String(getValue('single_cls'))} />
-           </ConfigColumn>
+        <div className={`p-6 grid grid-cols-1 md:grid-cols-2 ${gridCols} gap-8 text-sm border-t border-slate-800 bg-[#0f1117]`}>
 
-           {/* Column 2: Optimizer + Loss */}
-           <ConfigColumn title="Optimizer & Loss" icon={<Sliders size={14} />}>
-              <ConfigItem label="Optimizer" value={getValue('optimizer')} />
-              <ConfigItem label="lr0" value={getValue('lr0')} highlight />
-              <ConfigItem label="lrf" value={getValue('lrf')} />
-              <ConfigItem label="Momentum" value={getValue('momentum')} />
-              <ConfigItem label="Weight Decay" value={getValue('weight_decay')} />
-              <ConfigItem label="Warmup Epochs" value={getValue('warmup_epochs')} />
-              <ConfigItem label="Warmup Mom" value={getValue('warmup_momentum')} />
-              <ConfigItem label="Warmup Bias LR" value={getValue('warmup_bias_lr')} />
-              <ConfigItem label="Cos LR" value={String(getValue('cos_lr'))} />
-              <ConfigItem label="NBS" value={getValue('nbs')} />
-              <ConfigItem label="Box Gain" value={getValue('box')} highlight />
-              <ConfigItem label="Cls Gain" value={getValue('cls')} highlight />
-              <ConfigItem label="DFL Gain" value={getValue('dfl')} highlight />
-              <ConfigItem label="Pose Gain" value={getValue('pose')} />
-              <ConfigItem label="kobj" value={getValue('kobj')} />
-              <ConfigItem label="Mask Ratio" value={getValue('mask_ratio')} />
-              <ConfigItem label="Overlap Mask" value={String(getValue('overlap_mask'))} />
-           </ConfigColumn>
+          {/* ── Training ────────────────────────────────────────────── */}
+          <ConfigColumn title="Training" icon={<Cpu size={14} />}>
+            {grouped.Training.map(key => (
+              <ConfigItem
+                key={key}
+                label={toLabel(key)}
+                value={fmtValue(key, config[key])}
+                highlight={HIGHLIGHT_FIELDS.has(key)}
+              />
+            ))}
+          </ConfigColumn>
 
-           {/* Column 3: Augmentation */}
-           <ConfigColumn title="Augmentation" icon={<ImageIcon size={14} />}>
-              <ConfigItem label="Mosaic" value={getValue('mosaic')} />
-              <ConfigItem label="Mixup" value={getValue('mixup')} />
-              <ConfigItem label="Copy Paste" value={getValue('copy_paste')} />
-              <ConfigItem label="Erasing" value={getValue('erasing')} />
-              <ConfigItem label="Crop Frac" value={getValue('crop_fraction')} />
-              <ConfigItem label="Flip LR" value={getValue('fliplr')} />
-              <ConfigItem label="Flip UD" value={getValue('flipud')} />
-              <ConfigItem label="Degrees" value={getValue('degrees')} />
-              <ConfigItem label="Translate" value={getValue('translate')} />
-              <ConfigItem label="Scale" value={getValue('scale')} />
-              <ConfigItem label="Shear" value={getValue('shear')} />
-              <ConfigItem label="Perspective" value={getValue('perspective')} />
-              <ConfigItem label="HSV-H" value={getValue('hsv_h')} />
-              <ConfigItem label="HSV-S" value={getValue('hsv_s')} />
-              <ConfigItem label="HSV-V" value={getValue('hsv_v')} />
-              <ConfigItem label="BGR" value={getValue('bgr')} />
-              {getValue('auto_augment') !== '-' && getValue('auto_augment') && <ConfigItem label="Auto Aug" value={getValue('auto_augment')} />}
-           </ConfigColumn>
+          {/* ── Optimizer & Loss ────────────────────────────────────── */}
+          <ConfigColumn title="Optimizer & Loss" icon={<Sliders size={14} />}>
+            {grouped.Optimizer.map(key => (
+              <ConfigItem
+                key={key}
+                label={toLabel(key)}
+                value={fmtValue(key, config[key])}
+                highlight={HIGHLIGHT_FIELDS.has(key)}
+              />
+            ))}
+          </ConfigColumn>
 
-           {/* Column 4: Inference + System */}
-           <ConfigColumn title="Inference & System" icon={<Server size={14} />}>
-              <ConfigItem label="Conf" value={getValue('conf') ?? 'Auto'} />
-              <ConfigItem label="IoU" value={getValue('iou')} />
-              <ConfigItem label="Max Det" value={getValue('max_det')} />
-              <ConfigItem label="Agnostic NMS" value={String(getValue('agnostic_nms'))} />
-              <ConfigItem label="Seed" value={getValue('seed')} />
-              {typeof modelScale === 'string' && modelScale && <ConfigItem label="Model Scale" value={modelScale.toUpperCase()} highlight />}
+          {/* ── Augmentation ────────────────────────────────────────── */}
+          <ConfigColumn title="Augmentation" icon={<ImageIcon size={14} />}>
+            {grouped.Augmentation.map(key => (
+              <ConfigItem
+                key={key}
+                label={toLabel(key)}
+                value={fmtValue(key, config[key])}
+                highlight={HIGHLIGHT_FIELDS.has(key)}
+              />
+            ))}
+          </ConfigColumn>
+
+          {/* ── Inference & System ──────────────────────────────────── */}
+          <ConfigColumn title="Inference & System" icon={<Server size={14} />}>
+            {grouped.Inference.map(key => (
+              <ConfigItem
+                key={key}
+                label={toLabel(key)}
+                value={fmtValue(key, config[key])}
+                highlight={HIGHLIGHT_FIELDS.has(key)}
+              />
+            ))}
+            {typeof modelScale === 'string' && modelScale && (
+              <ConfigItem label="Model Scale" value={modelScale.toUpperCase()} highlight />
+            )}
+            {/* Model Info */}
+            {(config.layer_count || typeof config.model_params === 'number') && (
               <div className="mt-4 pt-2 border-t border-slate-800">
                 <span className="text-xs text-slate-500 block mb-2">Model Info</span>
                 <div className="space-y-1">
-                  <ConfigItem label="Layers" value={String(config.layer_count || '-')} />
+                  {config.layer_count && (
+                    <ConfigItem label="Layers" value={String(config.layer_count)} />
+                  )}
                   {typeof config.model_params === 'number' && (
                     <ConfigItem label="Params" value={`${(config.model_params / 1e6).toFixed(2)}M`} highlight />
                   )}
@@ -179,42 +310,35 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
                   )}
                 </div>
               </div>
-              <div className="mt-4 pt-2 border-t border-slate-800">
-                <span className="text-xs text-slate-500 block mb-1">Dataset</span>
-                <span className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 block border border-slate-800">
-                  {config.dataset_name || datasetName || 'unknown'}
-                </span>
-              </div>
-           </ConfigColumn>
+            )}
+            {/* Dataset */}
+            <div className="mt-4 pt-2 border-t border-slate-800">
+              <span className="text-xs text-slate-500 block mb-1">Dataset</span>
+              <span className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 block border border-slate-800">
+                {config.dataset_name || datasetName || 'unknown'}
+              </span>
+            </div>
+          </ConfigColumn>
 
-           {/* Column 5: Arch Model Config — only shown when arch plugin fields are set */}
-           {hasArchFields && (
-             <ConfigColumn title="Model Config" icon={<Layers size={14} />}>
-               {modelArch && (
-                 <div className="mb-3 pb-2 border-b border-slate-800">
-                   <span className="text-xs text-slate-500 block mb-1">Arch Plugin</span>
-                   <span className="font-mono text-xs text-indigo-400 break-all">{modelArch}</span>
-                 </div>
-               )}
-               {archFields.map(key => {
-                 const labelMap: Record<string, string> = {
-                   training_mode:     'Training Mode',
-                   cs2ga_lr_sparse:   'Projection LR',
-                   cs2ga_lr_gamma:    'LayerScale LR',
-                   cs2ga_lr_norm:     'Norm LR',
-                   cs2ga_lr_backbone: 'Backbone LR',
-                 };
-                 return (
-                   <ConfigItem
-                     key={key}
-                     label={labelMap[key] ?? key}
-                     value={fmtModelField(key, resolvedArchValues[key])}
-                     highlight={key === 'training_mode' || key === 'cs2ga_lr_backbone'}
-                   />
-                 );
-               })}
-             </ConfigColumn>
-           )}
+          {/* ── Model Config (arch-specific, conditional) ───────────── */}
+          {hasArchFields && (
+            <ConfigColumn title="Model Config" icon={<Layers size={14} />}>
+              {modelArch && (
+                <div className="mb-3 pb-2 border-b border-slate-800">
+                  <span className="text-xs text-slate-500 block mb-1">Arch Plugin</span>
+                  <span className="font-mono text-xs text-indigo-400 break-all">{modelArch}</span>
+                </div>
+              )}
+              {archFields.map(key => (
+                <ConfigItem
+                  key={key}
+                  label={toLabel(key)}
+                  value={fmtValue(key, resolvedArch[key])}
+                  highlight={HIGHLIGHT_FIELDS.has(key)}
+                />
+              ))}
+            </ConfigColumn>
+          )}
 
         </div>
       )}
@@ -222,21 +346,25 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
   );
 };
 
-const ConfigColumn: React.FC<{ title: string; icon: React.ReactNode; children: React.ReactNode }> = ({ title, icon, children }) => (
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+const ConfigColumn: React.FC<{
+  title: string; icon: React.ReactNode; children: React.ReactNode;
+}> = ({ title, icon, children }) => (
   <div>
     <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
       {icon} {title}
     </h4>
-    <div className="space-y-2">
-      {children}
-    </div>
+    <div className="space-y-2">{children}</div>
   </div>
 );
 
-const ConfigItem: React.FC<{ label: string; value: string | number; highlight?: boolean }> = ({ label, value, highlight }) => (
+const ConfigItem: React.FC<{
+  label: string; value: string | number; highlight?: boolean;
+}> = ({ label, value, highlight }) => (
   <div className="flex justify-between border-b border-slate-800/50 pb-1 last:border-0 hover:bg-slate-800/30 px-1 rounded transition-colors">
-    <span className={highlight ? "text-indigo-400" : "text-slate-400"}>{label}</span>
-    <span className="text-slate-300 font-mono">{value}</span>
+    <span className={highlight ? 'text-indigo-400' : 'text-slate-400'}>{label}</span>
+    <span className="text-slate-300 font-mono text-right max-w-[55%] truncate">{value}</span>
   </div>
 );
 
