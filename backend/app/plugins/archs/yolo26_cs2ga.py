@@ -220,28 +220,6 @@ class YOLO26CS2GAPlugin(ModelArchPlugin):
                 min_val=0.01, max_val=1.0, step=0.01, unit="×",
             ),
 
-            # ── Training Schedule ─────────────────────────────────────────
-            TrainingConfigField(
-                key="epochs",
-                label="Epochs",
-                field_type="int",
-                default=150,
-                description="Total training epochs.",
-                group="Training Schedule",
-                min_val=10, max_val=600, step=10, unit="epochs",
-            ),
-            TrainingConfigField(
-                key="lr0",
-                label="Base LR",
-                field_type="float",
-                default=0.0054,
-                description=(
-                    "Initial learning rate (lr0). The official YOLO26-N recipe uses 0.0054. "
-                    "Lower this when using attention_only mode (~0.001)."
-                ),
-                group="Training Schedule",
-                min_val=0.00001, max_val=0.1, step=0.0001,
-            ),
         ]
 
     # ------------------------------------------------------------------ #
