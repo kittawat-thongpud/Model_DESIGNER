@@ -1,6 +1,6 @@
 /**
  * Create Train Job Modal — Comprehensive training configuration modal.
- * 
+ *
  * Extracted from TrainDesignerPage to provide a modal interface for creating
  * training jobs directly from the Training Jobs page.
  */
@@ -8,6 +8,14 @@ import { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
 import type { ModelSummary, DatasetInfo, TrainConfig, ArchFamily, TrainingProfile } from '../types';
 import { Play, Settings, Loader2, Search, Layers, X, Download, CheckCircle2 } from 'lucide-react';
+
+// ── Module-level cache for arch training profiles ────────────────────────────
+// Keyed by concrete plugin name (e.g. "yolo26_cs2ga_n").
+// Lives outside the component so it survives modal open/close cycles for the
+// lifetime of the page — no re-fetch unless the user hard-reloads.
+// A Set tracks in-flight requests to prevent duplicate concurrent fetches.
+const _profileCache = new Map<string, TrainingProfile[]>();
+const _profileFetchingKeys = new Set<string>();
 
 interface Props {
   isOpen: boolean;
@@ -272,29 +280,54 @@ export default function CreateTrainJobModal({ isOpen, onClose, onJobCreated }: P
     }
   }, [selectedModelId, modelScale]);
 
-  // Fetch training profiles when an arch family + scale is selected
+  // Load training profiles when an arch family + scale is selected.
+  // Uses a module-level cache (_profileCache) so each plugin key is fetched
+  // at most once per page lifetime — no re-fetch on scale change or modal re-open.
   useEffect(() => {
     if (!selectedModelId?.startsWith('arch:') || !selectedArchFamily) {
       setTrainingProfiles([]);
       setSelectedProfileName(null);
       return;
     }
+
     // Build the concrete plugin name, e.g. "yolo26_cs2ga_n"
     const familyKey = selectedModelId.replace('arch:', '');
     const pluginName = modelScale ? `${familyKey}_${modelScale}` : familyKey;
+
+    // ── Cache hit: apply immediately, no loading state, no network call ──
+    if (_profileCache.has(pluginName)) {
+      const cached = _profileCache.get(pluginName)!;
+      setTrainingProfiles(cached);
+      // Re-select the default on every new selection (user may have changed model)
+      const def = cached.find(p => p.is_default) ?? cached[0] ?? null;
+      setSelectedProfileName(def?.name ?? null);
+      return;
+    }
+
+    // ── Deduplicate concurrent fetches for the same key ───────────────────
+    if (_profileFetchingKeys.has(pluginName)) return;
+
+    // ── Cache miss: fetch once, populate cache, then set state ───────────
+    _profileFetchingKeys.add(pluginName);
     setProfilesLoading(true);
     api.getArchTrainingProfiles(pluginName)
       .then((profiles) => {
-        setTrainingProfiles(profiles ?? []);
-        // Auto-select the default profile (or first profile)
-        const defaultProfile = profiles?.find(p => p.is_default) ?? profiles?.[0] ?? null;
-        setSelectedProfileName(defaultProfile?.name ?? null);
+        const list = profiles ?? [];
+        _profileCache.set(pluginName, list);          // store in module cache
+        setTrainingProfiles(list);
+        const def = list.find(p => p.is_default) ?? list[0] ?? null;
+        setSelectedProfileName(def?.name ?? null);
       })
       .catch(() => {
+        // On error keep an empty-list entry so we don't retry on every re-render
+        _profileCache.set(pluginName, []);
         setTrainingProfiles([]);
         setSelectedProfileName(null);
       })
-      .finally(() => setProfilesLoading(false));
+      .finally(() => {
+        _profileFetchingKeys.delete(pluginName);
+        setProfilesLoading(false);
+      });
   }, [selectedModelId, modelScale, selectedArchFamily]);
   
   // Derive the selected arch family (if any)
