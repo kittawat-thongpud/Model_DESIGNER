@@ -6,7 +6,7 @@ Monitoring data comes from Ultralytics callbacks.
 """
 from __future__ import annotations
 import os
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from typing import Any, Literal
 
@@ -49,7 +49,11 @@ class TrainConfig(BaseModel):
     Ultralytics model.train() configuration.
     Every field maps 1:1 to a model.train() kwarg.
     See: https://docs.ultralytics.com/modes/train/#train-settings
+
+    extra='allow' lets arch-plugin config-field values (e.g. training_mode,
+    cs2ga_lr_*) pass through without being stripped by Pydantic validation.
     """
+    model_config = ConfigDict(extra='allow')
 
     # ── Data ──────────────────────────────────────────────────────────────────
     data: str = str(_training_default("data", ""))                     # path to data.yaml
