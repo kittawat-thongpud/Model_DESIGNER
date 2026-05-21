@@ -370,6 +370,9 @@ class CustomDetectionTrainer(DetectionTrainer):
             # arch config-field keys (already popped by ultra_trainer; strip here for safety)
             'training_mode',
             'cs2ga_lr_sparse', 'cs2ga_lr_gamma', 'cs2ga_lr_norm', 'cs2ga_lr_backbone',
+            # underscore-prefixed record-only copies (never passed to Ultralytics)
+            '_training_mode',
+            '_cs2ga_lr_sparse', '_cs2ga_lr_gamma', '_cs2ga_lr_norm', '_cs2ga_lr_backbone',
         }
         
         # Build complete config by merging defaults with our overrides

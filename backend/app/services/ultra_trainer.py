@@ -1654,6 +1654,10 @@ def _training_worker(
                 # Both map to a TrainingProfile name for freeze / LR-group logic.
                 resolved_profile = None
                 _mode_key = config.pop("training_mode", None) or training_profile
+                # Preserve the selected training mode in the record (underscore prefix
+                # keeps it out of Ultralytics kwargs while making it visible in the UI).
+                if _mode_key:
+                    config["_training_mode"] = _mode_key
 
                 if _mode_key:
                     profiles = arch_plugin.get_training_profiles()
@@ -1694,6 +1698,8 @@ def _training_worker(
                     if _val is not None:
                         try:
                             _cs2ga_lr_overrides[_group_key] = float(_val)
+                            # Preserve in record with underscore prefix
+                            config[f"_{_cfg_key}"] = float(_val)
                         except (TypeError, ValueError):
                             pass
 

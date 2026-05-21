@@ -50,8 +50,23 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
     return config[key] !== undefined ? config[key] : defaultValue;
   };
 
-  // Collect arch-specific model fields that are actually set in this config
-  const archFields = ARCH_FIELD_KEYS.filter(k => config[k] !== undefined && config[k] !== null);
+  // Build a resolved view of arch fields:
+  // 1. Direct keys (training_mode, cs2ga_lr_*) — present before Pydantic fix
+  // 2. Underscore-prefixed keys (_training_mode, _cs2ga_lr_*) — preserved by backend after pop
+  // 3. Fallback from _training_profile for older records
+  const _profile = config['_training_profile'] as Record<string, any> | undefined;
+  const _lrOverrides = _profile?.lr_group_overrides as Record<string, number> | undefined;
+
+  const resolvedArchValues: Record<string, unknown> = {
+    training_mode:     config['training_mode']      ?? config['_training_mode']      ?? _profile?.name,
+    cs2ga_lr_sparse:   config['cs2ga_lr_sparse']    ?? config['_cs2ga_lr_sparse']    ?? _lrOverrides?.['sgb_sparse'],
+    cs2ga_lr_gamma:    config['cs2ga_lr_gamma']     ?? config['_cs2ga_lr_gamma']     ?? _lrOverrides?.['sgb_gamma'],
+    cs2ga_lr_norm:     config['cs2ga_lr_norm']      ?? config['_cs2ga_lr_norm']      ?? _lrOverrides?.['sgb_norm_group'],
+    cs2ga_lr_backbone: config['cs2ga_lr_backbone']  ?? config['_cs2ga_lr_backbone']  ?? _lrOverrides?.['base'],
+  };
+
+  // Only show arch fields that have a resolved value
+  const archFields = ARCH_FIELD_KEYS.filter(k => resolvedArchValues[k] !== undefined && resolvedArchValues[k] !== null);
   const hasArchFields = archFields.length > 0;
   // model_arch tells us which plugin was used (e.g. "yolo26_cs2ga_n")
   const modelArch = config['model_arch'] as string | undefined;
@@ -193,7 +208,7 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({ config, datasetName
                    <ConfigItem
                      key={key}
                      label={labelMap[key] ?? key}
-                     value={fmtModelField(key, config[key])}
+                     value={fmtModelField(key, resolvedArchValues[key])}
                      highlight={key === 'training_mode' || key === 'cs2ga_lr_backbone'}
                    />
                  );
