@@ -1,0 +1,65 @@
+# =============================================================================
+# YOLO26 + CS²GA-SG — Soft-Gate / Learned-Selection variant (scale N)
+# =============================================================================
+# Identical topology to yolo26_cs2ga_n.yaml. The ONLY difference is the CS²GA
+# block runs in score_mode="hybrid" + gate_mode="soft":
+#
+#   • Selection : standardized L2 + learned correction. Zero-init score head →
+#                 at start the top-k ordering equals the plain-L2 baseline, so a
+#                 warm-started CS²GA checkpoint transfers cleanly. The learned
+#                 head then shifts selection toward semantically useful tokens.
+#   • Soft gate : each selected token is weighted by sigmoid(logit + 4.0) ≈ 0.98
+#                 at init (near no-op). This is the differentiable path that
+#                 actually trains the score head — hard top-k alone passes no
+#                 gradient. Lets CS²GA learn WHICH tokens matter, not just the
+#                 highest-energy ones (energy ≠ task relevance, esp. on IDD).
+#
+# Use this variant to A/B against yolo26_cs2ga_n (l2 / hard) under an identical
+# recipe — it isolates the single variable "selection criterion".
+#
+# N-scale channels (width=0.25): P3=64, P4=128, P5=256
+# CS²GA args: [shared_dim, ratio_p3, ratio_p4, ratio_p5, ls_init, score_mode, gate_mode]
+# =============================================================================
+nc: 80
+end2end: True
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]              # 0  P1/2
+  - [-1, 1, Conv, [128, 3, 2]]             # 1  P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]      # 2
+  - [-1, 1, Conv, [256, 3, 2]]             # 3  P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]      # 4
+  - [-1, 1, Conv, [512, 3, 2]]             # 5  P4/16
+  - [-1, 2, C3k2, [512, True]]             # 6
+  - [-1, 1, Conv, [1024, 3, 2]]            # 7  P5/32
+  - [-1, 2, C3k2, [1024, True]]            # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]]      # 9
+  - [-1, 2, C2PSA, [1024]]                 # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 11
+  - [[-1, 6], 1, Concat, [1]]                    # 12  cat P4
+  - [-1, 2, C3k2, [512, True]]                   # 13  P4-fused
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 14
+  - [[-1, 4], 1, Concat, [1]]                    # 15  cat P3
+  - [-1, 2, C3k2, [256, True]]                   # 16  P3 ← 64ch @ N
+
+  - [-1, 1, Conv, [256, 3, 2]]                   # 17
+  - [[-1, 13], 1, Concat, [1]]                   # 18  cat P4-fused
+  - [-1, 2, C3k2, [512, True]]                   # 19  P4 ← 128ch @ N
+
+  - [-1, 1, Conv, [512, 3, 2]]                   # 20
+  - [[-1, 10], 1, Concat, [1]]                   # 21  cat P5
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]       # 22  P5 ← 256ch @ N
+
+  # CS²GA in hybrid-selection + soft-gate mode.
+  # args: shared_dim=256, ratios=5%/10%/25%, ls_init=0.1, score_mode, gate_mode
+  - [[16, 19, 22], 1, CrossScaleSGA, [256, 0.05, 0.10, 0.25, 0.1, "hybrid", "soft"]]  # 23
+
+  # YOLO26 E2E detect head (accepts list[Tensor] from CS²GA)
+  - [-1, 1, Detect, [nc]]                        # 24

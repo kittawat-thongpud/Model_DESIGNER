@@ -77,7 +77,22 @@ class CrossScaleSGA(nn.Module):
         ratio_p3: Top-k ratio for P3 tokens.
         ratio_p4: Top-k ratio for P4 tokens.
         ratio_p5: Top-k ratio for P5 tokens.
-        ls_init: LayerScale init value. Default 1e-4 (DeiT standard).
+        ls_init: LayerScale init value. Default 0.1 — attention contributes
+            ~10% from epoch 1 so gradient flows behind the strong FPN residual.
+            (DeiT uses 1e-4 for pure transformers, but that starves CS²GA here.)
+        score_mode: Token-selection criterion. Default "l2" reproduces the
+            original behaviour exactly (rank by activation energy ‖t‖₂).
+              • "l2"      — raw activation energy (no learnable params)
+              • "learned" — rank by a learned per-token logit (semantic selection)
+              • "hybrid"  — standardized L2 + learned correction; zero-init head
+                            ⇒ selection == L2 at start, then learns a shift.
+        gate_mode: Selected-token re-weighting. Default "hard" = no gate.
+              • "hard" — selected tokens used as-is (original behaviour)
+              • "soft" — multiply each selected token by sigmoid(logit+gate_init_bias).
+                         This is the differentiable path that trains the score head
+                         (hard top-k alone passes no gradient to it).
+        gate_init_bias: Bias added inside the soft gate so it starts ≈1 (open).
+            sigmoid(4.0)≈0.98 ⇒ near no-op at init for clean checkpoint transfer.
         debug: Enable debug state recording each forward pass.
     """
 
@@ -90,12 +105,15 @@ class CrossScaleSGA(nn.Module):
         ratio_p4: float = 0.10,
         ratio_p5: float = 0.25,
         ls_init: float = 0.1,
+        score_mode: str = "l2",
+        gate_mode: str = "hard",
         debug: bool = False,
         scale_embed_alpha: float = 0.0,
         attn_scale_mult: float = 8.0,
         max_k3: int = 0,
         max_k4: int = 0,
         max_k5: int = 0,
+        gate_init_bias: float = 4.0,
     ) -> None:
         super().__init__()
         if isinstance(c1, int):
@@ -110,6 +128,18 @@ class CrossScaleSGA(nn.Module):
         self.ratio_p4 = float(ratio_p4)
         self.ratio_p5 = float(ratio_p5)
         self.ls_init = float(ls_init)
+        self.score_mode = str(score_mode).lower()
+        self.gate_mode = str(gate_mode).lower()
+        self.gate_init_bias = float(gate_init_bias)
+        assert self.score_mode in ("l2", "learned", "hybrid"), \
+            f"score_mode must be l2|learned|hybrid, got {self.score_mode!r}"
+        assert self.gate_mode in ("hard", "soft"), \
+            f"gate_mode must be hard|soft, got {self.gate_mode!r}"
+        # A learnable score head is needed when selection is learned/hybrid OR
+        # when the soft gate needs a per-token logit to weight selected tokens.
+        self.use_score_head = (
+            self.score_mode in ("learned", "hybrid") or self.gate_mode == "soft"
+        )
         self.debug_enabled: bool = bool(debug)
         self.scale_embed_alpha = float(scale_embed_alpha)
         self.attn_scale_mult = float(attn_scale_mult)
@@ -139,6 +169,7 @@ class CrossScaleSGA(nn.Module):
         self.last_p4_score_std: float | None = None
         self.last_p5_score_std: float | None = None
         self.last_attn_entropy: float | None = None
+        self.last_gate_mean: float | None = None
 
         d = self.shared_dim
 
@@ -170,6 +201,28 @@ class CrossScaleSGA(nn.Module):
         self.ls_p3 = nn.Parameter(torch.full((self.c1[0], 1, 1), ls_init))
         self.ls_p4 = nn.Parameter(torch.full((self.c1[1], 1, 1), ls_init))
         self.ls_p5 = nn.Parameter(torch.full((self.c1[2], 1, 1), ls_init))
+
+        # Learnable per-token score head — maps a shared-dim token → scalar logit.
+        # Used for (a) learned/hybrid top-k selection and (b) the soft gate.
+        # Built only when needed so the default l2/hard path adds zero params and
+        # keeps the state_dict identical to the original module (clean transfer).
+        if self.use_score_head:
+            self.score_p3 = nn.Linear(d, 1)
+            self.score_p4 = nn.Linear(d, 1)
+            self.score_p5 = nn.Linear(d, 1)
+            if self.score_mode == "learned":
+                # Pure learned ranking — keep default (small random) init so the
+                # top-k ordering is non-degenerate from the first step.
+                pass
+            else:
+                # hybrid selection and/or gate-only: zero-init the head so the
+                # logit z≈0 at start. Selection then equals the L2 ranking and
+                # the soft gate equals sigmoid(gate_init_bias)≈1 — i.e. the module
+                # starts ≈ identical to the l2/hard baseline (minimal-impact init,
+                # so a warm-started CS²GA checkpoint transfers cleanly).
+                for _h in (self.score_p3, self.score_p4, self.score_p5):
+                    nn.init.zeros_(_h.weight)
+                    nn.init.zeros_(_h.bias)
 
         self._attn_scale = float(d ** -0.5) * max(1e-3, self.attn_scale_mult)
 
@@ -215,13 +268,43 @@ class CrossScaleSGA(nn.Module):
             p4_tok = p4_proj.view(B, d, -1).transpose(1, 2)
             p5_tok = p5_proj.view(B, d, -1).transpose(1, 2)
 
-            # Top-k by L2 saliency. Do not use _nan_guard here: clamping all
-            # high-energy scores to 20 destroys rank ordering and makes top-k
-            # effectively arbitrary on activated feature maps.
+            # L2 saliency (always computed — used for debug metrics, for the
+            # "l2" selection mode, and as the standardized base of "hybrid").
+            # Do not use _nan_guard here: clamping all high-energy scores to 20
+            # destroys rank ordering and makes top-k arbitrary on activated maps.
             with torch.no_grad():
                 p3_scores = _score_guard(p3_tok.float().norm(dim=-1))
                 p4_scores = _score_guard(p4_tok.float().norm(dim=-1))
                 p5_scores = _score_guard(p5_tok.float().norm(dim=-1))
+
+            # Learnable per-token logit (differentiable — NOT under no_grad so the
+            # soft gate can back-propagate into the score head). Semantic token
+            # scoring replaces / corrects raw activation-energy selection.
+            z3 = z4 = z5 = None
+            if self.use_score_head:
+                z3 = F.linear(p3_tok, self.score_p3.weight.float(), self.score_p3.bias.float()).squeeze(-1)
+                z4 = F.linear(p4_tok, self.score_p4.weight.float(), self.score_p4.bias.float()).squeeze(-1)
+                z5 = F.linear(p5_tok, self.score_p5.weight.float(), self.score_p5.bias.float()).squeeze(-1)
+
+            # Ranking score per mode (used only for top-k ordering — detached).
+            #   l2     : raw activation energy (original behaviour)
+            #   learned: pure learned logit
+            #   hybrid : standardized L2 + learned correction (≈L2 at zero-init →
+            #            preserves warm-start selection, learns a semantic shift)
+            def _std(s: torch.Tensor) -> torch.Tensor:
+                m = s.mean(dim=-1, keepdim=True)
+                sd = s.std(dim=-1, keepdim=True).clamp_min(1e-6)
+                return (s - m) / sd
+
+            if self.score_mode == "l2":
+                rank3, rank4, rank5 = p3_scores, p4_scores, p5_scores
+            elif self.score_mode == "learned":
+                rank3, rank4, rank5 = z3.detach(), z4.detach(), z5.detach()
+            else:  # hybrid
+                with torch.no_grad():
+                    rank3 = _std(p3_scores) + z3.detach()
+                    rank4 = _std(p4_scores) + z4.detach()
+                    rank5 = _std(p5_scores) + z5.detach()
 
             k3_raw = max(1, min(int(self.ratio_p3 * p3_tok.shape[1]), p3_tok.shape[1]))
             k4_raw = max(1, min(int(self.ratio_p4 * p4_tok.shape[1]), p4_tok.shape[1]))
@@ -233,14 +316,32 @@ class CrossScaleSGA(nn.Module):
             k4 = max(1, k4)
             k5 = max(1, k5)
 
-            _, p3_idx = torch.topk(p3_scores, k3, dim=-1)
-            _, p4_idx = torch.topk(p4_scores, k4, dim=-1)
-            _, p5_idx = torch.topk(p5_scores, k5, dim=-1)
+            _, p3_idx = torch.topk(rank3, k3, dim=-1)
+            _, p4_idx = torch.topk(rank4, k4, dim=-1)
+            _, p5_idx = torch.topk(rank5, k5, dim=-1)
 
             # Gather selected tokens
             p3_sel = torch.gather(p3_tok, 1, p3_idx.unsqueeze(-1).expand(-1, -1, d))
             p4_sel = torch.gather(p4_tok, 1, p4_idx.unsqueeze(-1).expand(-1, -1, d))
             p5_sel = torch.gather(p5_tok, 1, p5_idx.unsqueeze(-1).expand(-1, -1, d))
+
+            # Soft gate (differentiable): weight each selected token by
+            # sigmoid(logit + gate_init_bias). This is the gradient path that
+            # trains the score head — the hard top-k itself is non-differentiable.
+            # With zero-init head + gate_init_bias≈4, gates start ≈0.98 (near no-op).
+            self.last_gate_mean = None
+            if self.gate_mode == "soft" and self.use_score_head:
+                g3 = torch.sigmoid(torch.gather(z3, 1, p3_idx) + self.gate_init_bias).unsqueeze(-1)
+                g4 = torch.sigmoid(torch.gather(z4, 1, p4_idx) + self.gate_init_bias).unsqueeze(-1)
+                g5 = torch.sigmoid(torch.gather(z5, 1, p5_idx) + self.gate_init_bias).unsqueeze(-1)
+                p3_sel = p3_sel * g3
+                p4_sel = p4_sel * g4
+                p5_sel = p5_sel * g5
+                if self.debug_enabled:
+                    with torch.no_grad():
+                        self.last_gate_mean = float(
+                            (g3.mean() + g4.mean() + g5.mean()).item() / 3.0
+                        )
 
             # Optional scale embeddings (FP32). Keep them disabled by default:
             # random scale identity vectors dominate Q/K similarity and make
@@ -429,4 +530,5 @@ class CrossScaleSGA(nn.Module):
             "p4_score_std": self.last_p4_score_std,
             "p5_score_std": self.last_p5_score_std,
             "attn_entropy": self.last_attn_entropy,
+            "gate_mean": self.last_gate_mean,
         }

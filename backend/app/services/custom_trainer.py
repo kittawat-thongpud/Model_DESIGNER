@@ -765,6 +765,9 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "out_proj_p4",
                         "out_proj_p5",
                         "scale_embed",
+                        "score_p3",
+                        "score_p4",
+                        "score_p5",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith((
@@ -1869,6 +1872,7 @@ class CustomDetectionTrainer(DetectionTrainer):
                         "proj_",
                         "out_proj_",
                         "scale_embed",
+                        "score_p",
                     )):
                         sgb_roles[id(param)] = "sgb_sparse"
                     elif local_name.startswith((

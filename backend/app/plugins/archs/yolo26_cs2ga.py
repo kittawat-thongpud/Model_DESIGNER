@@ -488,6 +488,55 @@ def _find_or_download(yolo_key: str, log_fn) -> Path | None:
     return None
 
 
+class YOLO26CS2GASoftGatePlugin(YOLO26CS2GAPlugin):
+    """YOLO26-N + CS²GA in hybrid-selection + soft-gate mode.
+
+    Same topology and warm-start as YOLO26CS2GAPlugin; the only difference is
+    the YAML wires CrossScaleSGA with score_mode="hybrid", gate_mode="soft"
+    (learned semantic token selection + differentiable soft gate). CS²GA stays
+    layer 23 so warm-start still skips it and inits it fresh — the new score
+    heads transfer cleanly (or init fresh) exactly like the rest of the block.
+
+    Use this as the A/B counterpart to yolo26_cs2ga_<scale> (l2 / hard) under an
+    identical recipe to isolate the effect of the selection criterion.
+    """
+
+    @property
+    def name(self) -> str:
+        return f"yolo26_cs2ga_sg_{self._scale}"
+
+    @property
+    def display_name(self) -> str:
+        return f"YOLO26-CS²GA-SG {self._scale.upper()}"
+
+    @property
+    def family(self) -> str:
+        return "yolo26_cs2ga_sg"
+
+    @property
+    def family_display_name(self) -> str:
+        return "YOLO26 + CS²GA (soft-gate)"
+
+    @property
+    def scale_label(self) -> str:
+        return f"{self._scale.upper()}-scale — CS²GA learned-selection + soft-gate"
+
+    @property
+    def description(self) -> str:
+        return (
+            "YOLO26 backbone/neck (pretrained) with CS²GA in hybrid-selection + "
+            "soft-gate mode: a learnable per-token score head selects tokens by "
+            "semantic relevance (not raw activation energy) and a differentiable "
+            "soft gate trains that head. Zero-init head + open gate ⇒ starts ≈ the "
+            "plain L2 baseline, so existing CS²GA checkpoints transfer cleanly. "
+            "Intended as the A/B counterpart to the l2/hard variant."
+        )
+
+    def yaml_path(self) -> Path:
+        return _CONFIGS_DIR / f"yolo26_cs2ga_sg_{self._scale}.yaml"
+
+
 # ── Auto-register ─────────────────────────────────────────────────────────────
 for _scale in ("n",):
     register_arch(YOLO26CS2GAPlugin(_scale))
+    register_arch(YOLO26CS2GASoftGatePlugin(_scale))
