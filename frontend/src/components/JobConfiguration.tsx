@@ -227,6 +227,7 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({
   grouped['Training'].push(...extraKeys.sort());
 
   const gridCols = hasArchFields ? 'lg:grid-cols-5' : 'lg:grid-cols-4';
+  const hasLayerCount = typeof config.layer_count === 'number';
 
   return (
     <div className="bg-[#0f1117] border border-slate-800 rounded-xl overflow-hidden shadow-sm mt-6">
@@ -295,11 +296,11 @@ const JobConfiguration: React.FC<JobConfigurationProps> = ({
               <ConfigItem label="Model Scale" value={modelScale.toUpperCase()} highlight />
             )}
             {/* Model Info */}
-            {(config.layer_count || typeof config.model_params === 'number') && (
+            {(hasLayerCount || typeof config.model_params === 'number') && (
               <div className="mt-4 pt-2 border-t border-slate-800">
                 <span className="text-xs text-slate-500 block mb-2">Model Info</span>
                 <div className="space-y-1">
-                  {config.layer_count && (
+                  {hasLayerCount && (
                     <ConfigItem label="Layers" value={String(config.layer_count)} />
                   )}
                   {typeof config.model_params === 'number' && (
